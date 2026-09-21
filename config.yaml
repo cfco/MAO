@@ -1,0 +1,76 @@
+# ============================================
+# 多功能智能体配置 v2 —— 智能体池
+# 所有 OpenAI 兼容 API 都能进池。启动时被选中/指定的那个当主智能体，
+# 其余自动成为工人（子智能体）。免费/慢/弱模型都可以进来当"臭皮匠"。
+# 常见免费档示例（以各厂商当前政策为准）：
+#   智谱 GLM:   base_url=https://open.bigmodel.cn/api/paas/v4   model=glm-4-flash
+#   Kimi:       base_url=https://api.moonshot.cn/v1              model=moonshot-v1-8k
+#   Ollama 本地: base_url=http://localhost:11434/v1               model=本地已下载模型名
+# ============================================
+
+# 智能体池：按"站"组织（一个中转站 = 一组 Endpoint+Key，可挂多个 Model）。
+# name 唯一。models 支持逗号分隔多模型；临时屏蔽某模型 = 在该模型前加 # 或直接删掉
+#（免费模型经常变，注释即下线，不用改代码）。
+agents:
+  - name: node-a                      # 中转站 A
+    base_url: ${NODE_A_ENDPOINT}
+    api_key: ${NODE_A_KEY}
+    models: ${NODE_A_MODELS}          # 例: gpt-4o-mini@128k,claude-3-haiku@200k,#mixtral@32k（@=上下文窗口，#=临时屏蔽）
+    note: 中转站A免费token
+  - name: node-b                      # 中转站 B
+    base_url: ${NODE_B_ENDPOINT}
+    api_key: ${NODE_B_KEY}
+    models: ${NODE_B_MODELS}
+    note: 中转站B免费token
+#  - name: local-qwen                 # 单模型站（models 不填、用 model，兼容旧写法）
+#    base_url: http://localhost:11434/v1
+#    api_key: ""
+#    model: qwen2.5:7b
+#    note: 完全本地免 key
+
+# 兜底单模型：池里的节点全挂了、或想直连官方 API 时用它（solo/兜底路径）。
+# 变量名与 .env.example 一一对应；${VAR:-默认值} 表示「不配就用冒号后的默认」。
+# 也可直接把值写死在这里（注意本文件会进 git，密钥别写在这儿）。
+llm:
+  base_url: ${LLM_ENDPOINT:-https://api.deepseek.com/v1}
+  api_key: ${LLM_API_KEY}          # 必填（在 .env 里配 LLM_API_KEY）
+  model: ${LLM_MODEL:-deepseek-chat}
+  temperature: 0.7
+  max_iterations: 25             # 单个任务最多工具循环轮数，防失控
+  # 免费节点友好：请求超时秒数 / 限流等可重试错误的最大重试次数（指数退避）
+  timeout: 120
+  max_retries: 2
+
+collaboration:
+  max_workers: 3                 # ask_workers 并行派工时的最大并发
+  vote_threshold: 0.5            # ask_vote 达成共识的票数占比（0-1，0.5=过半）
+  cache_size: 32                 # 工人回答 LRU 缓存条数（同工同题不重复调用）
+  cooldown_fails: 2              # 工人连续失败 N 次后进入冷却（暂停调用该节点）
+  cooldown_base: 10              # 冷却时长基数(秒)，连续失败越多冷却越久(基数×次数)
+  inflight_timeout: 120          # 在飞去重兜底：并发同 key 时发起者超过该秒数未返回，
+                                 # 首个超时的跟随者接管重新打网络，避免无限阻塞（默认 120）
+
+server:
+  host: 127.0.0.1
+  port: 8000
+
+tools:
+  shell_timeout: 120             # 单条命令最长执行秒数
+
+# 会话落盘限流：add 一次先入内存并进缓冲，满足条件才真正写盘，
+# 避免 Agent 单轮多工具迭代产生大量零碎磁盘写入。可按部署环境调节。
+# 正常退出由 Agent.close() 兜底刷盘，进程崩溃最多丢失一个限流窗口内的少量消息。
+session:
+  flush_batch: 16               # 待写缓冲累计达到该条数立即落盘（高频场景）
+  flush_interval: 2.0           # 距上次落盘超过该秒数也落盘（低频/跟随者场景）
+
+# MCP server 列表，启动时自动连接并发现工具。示例：
+# mcp_servers:
+#   - name: filesystem
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/Users/Administrator/Desktop"]
+#   - name: remote-demo
+#     transport: http
+#     url: https://mcp.example.com/mcp
+mcp_servers: []

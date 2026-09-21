@@ -1,0 +1,53 @@
+[project]
+name = "mao"
+version = "0.1.0"
+description = "自研多智能体协作系统：多个免费/较弱模型分工协作（三个臭皮匠顶个诸葛亮）"
+readme = "README.md"
+authors = [
+    { name = "minyaohua", email = "minyaohua@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.30.0",
+    "mcp>=1.2.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+mao = "agent.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.14,<0.13.0"]
+build-backend = "uv_build"
+
+# 打包根目录下的 agent 包（src/mao 只是 uv init 占位，不再打包）
+[tool.uv.build-backend]
+module-root = ""
+module-name = "agent"
+
+# ---------- 代码质量门禁 ----------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+lint.select = ["E", "F", "W", "I", "B", "UP"]
+lint.ignore = ["B008", "E501"]
+# 用 extend-exclude（追加到 ruff 默认排除表）而不是 exclude（整体替换）。
+# exclude 会连 .venv/.git/__pycache__/.pytest_cache 等默认排除项一起顶掉，
+# 于是这些目录重新进入扫描范围、只能靠 .gitignore 兜着——而 .gitignore 曾因
+# 行内注释整条失效，两处一起坏就会让 lint 扫到隔离区的旧文件。
+# data/ = 运行时产物与隔离区（会话 JSONL、人工/历史隔离文件），不参与 lint。
+# 旧骨架 examples/archive/multi_ai_orchestrator.py 已移入 data/trash 隔离，不再需要单独排除。
+extend-exclude = ["data"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# 开发依赖（lint / test），不进分发产物
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+    "pytest>=8.0.0",
+]

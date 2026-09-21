@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python
+        # 解释器版本以仓库根的 .python-version 为唯一来源（不带参数时 uv 就读它）。
+        # 别在这里写死版本号：写死会与 .python-version 打架——uv 实际按后者取解释器，
+        # 写死的那个步骤变成误导性的死步骤（曾经写 3.12 而 .python-version 是 3.14）。
+        run: uv python install
+
+      - name: Sync dependencies (incl. dev)
+        run: uv sync
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Pytest
+        run: uv run pytest
