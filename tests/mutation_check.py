@@ -28,10 +28,10 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     with _shared_lock:
         inst = _shared_instances.get(key)
         if inst is None:
-            inst = ModelHealth(key, env_example_path, retire_days=retire_days)
+            inst = ModelHealth(key)
             _shared_instances[key] = inst
         return inst""",
-        """    return ModelHealth(Path(store_path), env_example_path, retire_days=retire_days)""",
+        """    return ModelHealth(Path(store_path))""",
         f"{TESTFILE}::test_get_health_returns_same_instance_per_path",
     ),
     (
@@ -41,10 +41,10 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     with _shared_lock:
         inst = _shared_instances.get(key)
         if inst is None:
-            inst = ModelHealth(key, env_example_path, retire_days=retire_days)
+            inst = ModelHealth(key)
             _shared_instances[key] = inst
         return inst""",
-        """    return ModelHealth(Path(store_path), env_example_path, retire_days=retire_days)""",
+        """    return ModelHealth(Path(store_path))""",
         f"{TESTFILE}::test_shared_health_does_not_lose_each_others_records",
     ),
     (
@@ -69,39 +69,6 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         f"{TESTFILE}::test_mcp_group_shared_and_refcounted",
     ),
     (
-        "M6 collect 恢复冷却预过滤",
-        "agent/core/orchestrator.py",
-        """        valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
-        if not valid:
-            return []
-        got = self._run_parallel(
-            valid, prompt, system, self._effective_timeout(len(valid), timeout)
-        )
-        return [(w, got[w]) for w in valid if got.get(w) and not self._is_error(got[w])]""",
-        """        valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
-        live = [w for w in valid if self._skip_reason(w) is None]
-        if not live:
-            return []
-        got = self._run_parallel(
-            live, prompt, system, self._effective_timeout(len(live), timeout)
-        )
-        return [(w, got[w]) for w in live if got.get(w) and not self._is_error(got[w])]""",
-        f"{TESTFILE}::test_hit_cache_still_usable_when_cooling",
-    ),
-    (
-        "M7 上下文预算不扣 system",
-        "agent/core/session.py",
-        """        budget = max(
-            MAX_HISTORY,
-            int(context_length * CONTEXT_SAFETY) - self._est_tokens(system_prompt),
-        )""",
-        """        budget = max(
-            MAX_HISTORY,
-            int(context_length * CONTEXT_SAFETY),
-        )""",
-        f"{TESTFILE}::test_system_prompt_takes_budget",
-    ),
-    (
         "M8 计票不过滤错误文本",
         "agent/core/orchestrator.py",
         """            if self._is_error(raw):
@@ -115,13 +82,6 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "agent/core/orchestrator.py",
         "        pool = [w for w in dict.fromkeys(workers or self.pick()) if w in self.profiles]",
         "        pool = [w for w in dict.fromkeys(workers or self.names()) if w in self.profiles]",
-        f"{TESTFILE}::test_default_fanout_is_bounded",
-    ),
-    (
-        "M11 pipeline 缺省名单改回全池",
-        "agent/core/pipeline.py",
-        "        return self.pool.pick()",
-        "        return self.pool.names()",
         f"{TESTFILE}::test_default_fanout_is_bounded",
     ),
     (
@@ -144,13 +104,6 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         return out if minimum is None else max(minimum, out)""",
         """        return int(value)""",
         "tests/test_audit2_fixes.py::test_bad_numeric_config_falls_back",
-    ),
-    (
-        "M14 流水线阶段不做裁剪",
-        "agent/core/pipeline.py",
-        "        per = max(_MIN_PER_ITEM_CHARS, budget // len(items))",
-        "        per = 10 ** 9",
-        "tests/test_audit2_fixes.py::test_pipeline_trims_stage_payload",
     ),
     (
         "M15 write_file 覆盖不留档",

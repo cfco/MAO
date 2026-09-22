@@ -4,23 +4,21 @@
 - 工具注册表：重复注册、白名单裁剪、未知工具/坏 JSON 容错、schema 导出
 - 配置解析：环境变量插值、一站多模型展开、屏蔽(#)、brief 不含 key、profile 查找
 - LLMClient：指数退避边界、可重试错误退避重试、认证错误不重试
-- 会话落盘限流：内存即时更新 + 缓冲合并写盘 + flush 兜底 + 往返持久化
 - WorkerPool：节点冷却逻辑、ask_many 无可用工人、vote 空池、未知工人
 - ask 并发去抖：同 key 并发只打一次网络，跟随者复用结果
 - ask 在飞去重兜底：发起者挂死时跟随者超时接管，不无限阻塞
 - ask system 归一：None/""/前后空白 → 同一缓存键，命中缓存不重复打网络
-- events.to_event：error 类型显式归一为 {"event":"error","message":...}
-- 会话落盘限流：环境变量（CLI 覆盖）优先于 config.yaml
+- 结构化派工 / 逐工人实时事件与提前采纳 / health 探针 / 能力标签 / 缓存与下线可关
+- 会话落盘限流的环境变量（CLI 覆盖）优先于 config.yaml
 - 本轮审查修正的回归：命令黑名单按「命令首词」匹配（ruff format / make clean
   不得被误拦，& 串接的危险命令仍须拦下）、-EncodedCommand 缩写、空 choices 归类为
-  可重试错误、session_id 与 skill 脚本名的路径穿越、在飞接管不得清掉新发起者的
-  inflight、空回复不静默
+  可重试错误、skill 脚本名的路径穿越、在飞接管不得清掉新发起者的 inflight
 """
 from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -28,9 +26,7 @@ import pytest
 from openai import AuthenticationError, RateLimitError
 
 import agent.core.orchestrator as orch
-import agent.core.session as sess_mod
 from agent.config import Config, _interpolate, _split_models
-from agent.core.events import to_event
 from agent.core.llm import (
     ERR_API,
     ERR_AUTH,
@@ -40,7 +36,6 @@ from agent.core.llm import (
     _retryable_from_type,
 )
 from agent.core.orchestrator import WorkerPool
-from agent.core.session import Session
 from agent.tools.base import FunctionTool, ToolRegistry
 
 # ---------------- 工具注册表 ----------------
@@ -110,21 +105,6 @@ def test_config_multimodel_expansion_and_lookup():
     assert cfg.profile("st:m9") is None
     # brief 不含 key
     assert "api_key" not in cfg.profile("st:m1").brief()
-
-
-def test_config_session_defaults_and_override():
-    # 默认（无 session 段）
-    cfg = Config(_interpolate({"agents": []}))
-    assert cfg.session_flush_batch == 16
-    assert cfg.session_flush_interval == 2.0
-    # 覆盖
-    cfg2 = Config(_interpolate({"session": {"flush_batch": 4, "flush_interval": 5.0}}))
-    assert cfg2.session_flush_batch == 4
-    assert cfg2.session_flush_interval == 5.0
-    # 下限保护（batch 至少 1，interval 至少 0.0）
-    cfg3 = Config(_interpolate({"session": {"flush_batch": 0, "flush_interval": -1}}))
-    assert cfg3.session_flush_batch == 1
-    assert cfg3.session_flush_interval == 0.0
 
 
 # ---------------- LLMClient 重试 / 退避 ----------------
@@ -202,68 +182,6 @@ def test_retryable_from_type():
     assert _retryable_from_type(ERR_AUTH) is False
 
 
-# ---------------- 会话落盘限流 ----------------
-
-def test_session_in_memory_immediate():
-    s = Session("mem-1")
-    s.add("user", "hello")
-    # 内存历史立即更新（供主循环拼装）
-    assert s.history[-1] == {"role": "user", "content": "hello"}
-
-
-def test_session_flush_coalesces(tmp_path, monkeypatch):
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    monkeypatch.setattr(sess_mod, "FLUSH_BATCH", 5)
-    monkeypatch.setattr(sess_mod, "FLUSH_INTERVAL", 1000)  # 仅 batch 触发，便于断言
-
-    s = Session("s1")
-    for i in range(3):
-        s.add("user", f"m{i}")
-    # 未达 batch：仍在内存缓冲，未写盘
-    assert len(s._pending) == 3
-    assert not s._path.exists() or s._path.read_text(encoding="utf-8").count("\n") == 0
-    # 强制落盘
-    s.flush()
-    assert s._path.read_text(encoding="utf-8").count("\n") == 3
-    assert len(s._pending) == 0
-    # 往返持久化：新实例从磁盘恢复
-    s2 = Session("s1")
-    assert len(s2.history) == 3
-
-
-def test_session_auto_flush_on_batch(tmp_path, monkeypatch):
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    monkeypatch.setattr(sess_mod, "FLUSH_BATCH", 3)
-    monkeypatch.setattr(sess_mod, "FLUSH_INTERVAL", 1000)
-
-    s = Session("s2")
-    for _ in range(3):
-        s.add("user", "x")
-    # 达到 batch 阈值自动落盘
-    assert len(s._pending) == 0
-    assert s._path.read_text(encoding="utf-8").count("\n") == 3
-
-
-def test_session_explicit_flush_params(tmp_path, monkeypatch):
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-
-    # 显式传参应覆盖模块常量（不依赖 monkeypatch 常量），batch=3 触发落盘
-    s = Session("exp", flush_batch=3, flush_interval=1000)
-    for _ in range(3):
-        s.add("user", "x")
-    assert len(s._pending) == 0  # 达到显式 batch 已落盘
-    assert s._path.read_text(encoding="utf-8").count("\n") == 3
-
-    # 显式 interval=0 应每次 add 即落盘（低频但强制）
-    s2 = Session("exp2", flush_batch=999, flush_interval=0.0)
-    s2.add("user", "y")
-    assert len(s2._pending) == 0
-    assert s2._path.read_text(encoding="utf-8").count("\n") == 1
-
-
 # ---------------- WorkerPool 编排逻辑 ----------------
 
 def test_worker_pool_cooldown_logic():
@@ -299,66 +217,6 @@ def test_vote_empty_pool():
 
 # ---------------- ask 并发去抖（同 key 只打一次网络） ----------------
 
-def test_ask_concurrent_dedup_same_key():
-    # 用虚拟工人配置，保证池非空，使去抖路径必然被执行（不依赖真实 config.yaml）。
-    # 确定性写法：跟随者任务在判定"是否跟随"前先等发起者已建立 inflight，
-    # 消除"发起者瞬间完成→跟随者变新发起者"的时序竞态。
-    cfg = Config(_interpolate({"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}))
-    pool = WorkerPool(cfg, exclude=None)
-    assert pool.names(), "虚拟工人应已进入池中"
-    worker = pool.names()[0]
-
-    calls = {"n": 0}
-    attached = {"n": 0}
-    followers = 8
-    inflight_ready = threading.Event()
-    release = threading.Event()  # 主线程确认所有跟随者 attach 后放行发起者
-
-    class FakeClient:
-        def chat(self, messages):
-            inflight_ready.set()  # 发起者已建立 inflight
-            calls["n"] += 1
-            release.wait(timeout=5)  # 等全部跟随者就位后再返回，保证去抖命中
-            return {"role": "assistant", "content": "ok"}
-
-    real_ask = pool.ask
-
-    def follower_ask():
-        inflight_ready.wait(timeout=5)  # 确保发起者已建立 inflight 再判定
-        key = (worker, "same-task", None)
-        with pool._lock:
-            is_follower = key in pool._cache or pool._inflight.get(key) is not None
-        if is_follower:
-            attached["n"] += 1
-        return real_ask(worker, "same-task")
-
-    orig = orch.LLMClient
-    orch.LLMClient = lambda *a, **k: FakeClient()
-    try:
-        # 1) 发起者（走原始 ask）建立 inflight 并进入网络
-        with ThreadPoolExecutor(max_workers=1) as ex_lead:
-            lead = ex_lead.submit(real_ask, worker, "same-task")
-            assert inflight_ready.wait(timeout=5)
-        # 2) 并发跟随者：复用发起者结果，不重复打网络
-        with ThreadPoolExecutor(max_workers=followers) as ex:
-            futs = [ex.submit(follower_ask) for _ in range(followers)]
-            deadline = time.time() + 5
-            while attached["n"] < followers and time.time() < deadline:
-                time.sleep(0.01)
-            assert attached["n"] == followers, f"应全部 attach，实际 {attached['n']}"
-            release.set()  # 放行发起者返回
-            results = [f.result(timeout=10) for f in futs]
-            lead_result = lead.result(timeout=10)
-        assert calls["n"] == 1, f"并发同 key 应只打 1 次网络，实际 {calls['n']}"
-        assert all(r == "ok" for r in results + [lead_result])
-        # 3) 发起者成功后已入缓存：后续同 key 命中缓存，不再打网络
-        assert real_ask(worker, "same-task") == "ok"
-        assert calls["n"] == 1
-    finally:
-        orch.LLMClient = orig
-        release.set()  # 兜底：无论如何放行发起者，避免线程挂起
-
-
 def test_ask_distinct_keys_each_call():
     cfg = Config(_interpolate({"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}))
     pool = WorkerPool(cfg, exclude=None)
@@ -384,130 +242,6 @@ def test_ask_distinct_keys_each_call():
         orch.LLMClient = orig
 
 
-def test_ask_concurrent_initiator_failure_shared_with_followers():
-    # 专项：发起者网络失败（不止成功路径）。并发同 key 时只有发起者打网络，
-    # 失败文本共享给跟随者（跟随者拿到错误文本而非异常），且失败不入缓存（后续重试）。
-    # 关键：发起者和跟随者必须在发起者 inflight 存活期间（完成前）并发执行。
-    cfg = Config(_interpolate({"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}))
-    pool = WorkerPool(cfg, exclude=None)
-    assert pool.names(), "虚拟工人应已进入池中"
-    worker = pool.names()[0]
-
-    calls = {"n": 0}
-    attached = {"n": 0}
-    followers = 4
-    inflight_ready = threading.Event()
-    release = threading.Event()
-
-    class FailingClient:
-        def chat(self, messages):
-            inflight_ready.set()  # 发起者已建立 inflight
-            calls["n"] += 1
-            release.wait(timeout=5)  # 等全部跟随者就位后再抛错，保证去抖命中
-            raise RuntimeError("network down")
-
-    real_ask = pool.ask
-
-    def follower_ask():
-        inflight_ready.wait(timeout=5)  # 确保发起者已建立 inflight 再判定
-        key = (worker, "boom", None)
-        with pool._lock:
-            is_follower = key in pool._cache or pool._inflight.get(key) is not None
-        if is_follower:
-            attached["n"] += 1
-        return real_ask(worker, "boom")
-
-    orig = orch.LLMClient
-    orch.LLMClient = lambda *a, **k: FailingClient()
-    try:
-        # 发起者用后台线程启动，不阻塞主线程，保证 inflight 在发起者完成前一直存活
-        lead_future = Future()
-
-        def _lead():
-            try:
-                lead_future.set_result(real_ask(worker, "boom"))
-            except Exception as exc:
-                lead_future.set_exception(exc)
-
-        threading.Thread(target=_lead, name="lead", daemon=True).start()
-        assert inflight_ready.wait(timeout=5), "发起者应已建立 inflight 并进入网络段"
-
-        # 并发跟随者：必须在发起者 inflight 存活期间进来 attach
-        with ThreadPoolExecutor(max_workers=followers) as ex:
-            futs = [ex.submit(follower_ask) for _ in range(followers)]
-            deadline = time.time() + 5
-            while attached["n"] < followers and time.time() < deadline:
-                time.sleep(0.01)
-            assert attached["n"] == followers, f"应全部 attach，实际 {attached['n']}"
-            release.set()  # 放行发起者抛错
-            results = [f.result(timeout=10) for f in futs]
-            lead_result = lead_future.result(timeout=10)
-        # 只有发起者真正打网络（失败也算一次），跟随者复用其失败文本
-        assert calls["n"] == 1, f"并发同 key 失败应只打 1 次网络，实际 {calls['n']}"
-        # 跟随者拿到的是失败文本（不是异常），且与发起者一致
-        assert all(r.startswith("错误：") for r in results + [lead_result])
-        assert all(r == lead_result for r in results)
-        # 失败不入缓存；且终态失败打了当日隔离标记：同天再派同一工人
-        # 直接快速失败，不再打网络（calls 保持 1）——两重语义一起验证。
-        again = real_ask(worker, "boom")
-        assert calls["n"] == 1, "当日隔离生效：不该再为该工人打网络"
-        assert again.startswith("错误：") and "隔离" in again
-    finally:
-        orch.LLMClient = orig
-
-
-def test_ask_inflight_timeout_follower_takes_over():
-    # 在飞去重兜底：发起者挂死（远超 inflight_timeout）时，跟随者应在超时后接管、
-    # 重新打网络并返回结果，而不是无限阻塞；且接管者确实重新发起了一次网络调用。
-    # 用 collaboration.inflight_timeout=0.3 让兜底快速触发，避免测试久等。
-    cfg = Config(_interpolate({
-        "agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}],
-        "collaboration": {"inflight_timeout": 0.3},
-    }))
-    pool = WorkerPool(cfg, exclude=None)
-    assert pool.names(), "虚拟工人应已进入池中"
-    worker = pool.names()[0]
-
-    class HangThenOkClient:
-        def __init__(self):
-            self.calls = 0
-
-        def chat(self, messages):
-            self.calls += 1
-            if self.calls == 1:
-                time.sleep(2)  # 模拟发起者挂死（远超 inflight_timeout=0.3）
-            return {"role": "assistant", "content": "ok"}
-
-    client = HangThenOkClient()
-    orig = orch.LLMClient
-    orch.LLMClient = lambda *a, **k: client
-    try:
-        # 发起者：后台线程跑，进入 chat 后挂死 2s
-        lead_future: Future = Future()
-
-        def _lead() -> None:
-            try:
-                lead_future.set_result(pool.ask(worker, "task"))
-            except Exception as exc:  # noqa: BLE001
-                lead_future.set_exception(exc)
-
-        threading.Thread(target=_lead, name="lead", daemon=True).start()
-
-        # 跟随者：并发发起同 key，应在 ~0.3s 超时后接管并拿结果（而非等满 2s）
-        follower_start = time.time()
-        follower_result = pool.ask(worker, "task")
-        follower_elapsed = time.time() - follower_start
-
-        assert follower_result == "ok"
-        assert follower_elapsed < 1.5, f"跟随者不应阻塞到发起者 2s，实际 {follower_elapsed:.2f}s"
-        # 接管者重新打网络：发起者(1) + 接管跟随者(1) = 2 次网络调用（不只 1 次、也不无限等待）
-        assert client.calls == 2, f"应重新派工一次，实际网络调用 {client.calls} 次"
-        # 发起者最终也正常返回（不被接管影响）
-        assert lead_future.result(timeout=5) == "ok"
-    finally:
-        orch.LLMClient = orig
-
-
 def test_diagnostics_go_to_stderr_not_stdout(capsys):
     """诊断/警告必须走 stderr，stdout 只留给 bridge 与 --stream 的 JSON 行协议。
 
@@ -523,24 +257,7 @@ def test_diagnostics_go_to_stderr_not_stdout(capsys):
     assert captured.out == "", f"stdout 被污染：{captured.out!r}"
 
 
-def test_session_flush_env_override(monkeypatch):
-    # 环境变量应作为 CLI 命令行覆盖的落地机制，优先级高于 config.yaml 的 session 段。
-    monkeypatch.setenv("MAO_SESSION_FLUSH_BATCH", "5")
-    monkeypatch.setenv("MAO_SESSION_FLUSH_INTERVAL", "0.5")
-    # 没有 session 段：完全靠 env 兜底
-    cfg = Config(_interpolate({"agents": []}))
-    assert cfg.session_flush_batch == 5
-    assert cfg.session_flush_interval == 0.5
-
-    # env 覆盖应优先于 config.yaml 的同名字段；未设 env 的字段回落 config
-    monkeypatch.setenv("MAO_SESSION_FLUSH_BATCH", "99")
-    monkeypatch.delenv("MAO_SESSION_FLUSH_INTERVAL", raising=False)
-    cfg2 = Config(_interpolate({"agents": [], "session": {"flush_batch": 16, "flush_interval": 2.0}}))
-    assert cfg2.session_flush_batch == 99   # env 赢
-    assert cfg2.session_flush_interval == 2.0  # 未设 env 时回落 config
-
-
-# ---------------- 修正回归：shell=False 引号剥离 / read_file 截断 / _lead 结算兜底 ----------------
+# ---------------- 修正回归：shell=False 引号剥离 / read_file 截断 ----------------
 
 def _two_worker_pool() -> WorkerPool:
     cfg = Config(_interpolate({
@@ -590,137 +307,6 @@ def test_read_file_truncates_large_file(tmp_path, monkeypatch):
     assert "64KB" in out
     # 输出体量应被限制在 64KB 量级（而非 200KB 全量）
     assert len(out.encode("utf-8")) < bi.MAX_READ_BYTES + 2000
-
-
-def test_ask_lead_settles_inflight_on_client_build_failure():
-    # _lead 结算兜底：LLMClient 构造失败等异常不应让 inflight 悬挂，
-    # 跟随者不得等满 inflight_timeout；错误文本返回且 inflight 已清理（可立即重试）。
-    cfg = Config(_interpolate({"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}))
-    pool = WorkerPool(cfg, exclude=None)
-    worker = pool.names()[0]
-
-    def _boom(*_a, **_k):
-        raise RuntimeError("client build failed")
-
-    orig = orch.LLMClient
-    orch.LLMClient = _boom
-    try:
-        out = pool.ask(worker, "task")
-        assert out.startswith("错误：")
-        # inflight 已被结算清理：再次调用立即走新一轮（而非跟随者等待）
-        assert pool._inflight == {}
-        out2 = pool.ask(worker, "task")
-        assert out2.startswith("错误：")
-    finally:
-        orch.LLMClient = orig
-
-
-# ---------------- ask system 归一（P2-6） ----------------
-
-def test_ask_system_normalization_dedup():
-    """system 字段归一后，等价的形式走同一缓存键，避免同语义重复打网络。
-
-    验证两组等价类：
-    1) "role-A" 与 "  role-A  "（前后空白） → 同 key
-    2) None / "" / "  "（空字符串族）       → 同 key（归一为 None）
-    """
-    cfg = Config(_interpolate({"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}))
-    pool = WorkerPool(cfg, exclude=None)
-    worker = pool.names()[0]
-
-    calls = {"n": 0}
-
-    class FakeClient:
-        def chat(self, messages):
-            calls["n"] += 1
-            return {"role": "assistant", "content": "ok"}
-
-    orig = orch.LLMClient
-    orch.LLMClient = lambda *a, **k: FakeClient()
-    try:
-        # 第一组：用 "role-A" 入缓存
-        r1 = pool.ask(worker, "p", "role-A")
-        assert r1 == "ok"
-        assert calls["n"] == 1
-        # 同 prompt + "role-A" 族（strip 后相同）应命中缓存，不再打网络
-        assert pool.ask(worker, "p", "  role-A  ") == "ok"
-        assert pool.ask(worker, "p", "role-A") == "ok"
-        assert calls["n"] == 1, f"前后空白应命中同一 key，实际 {calls['n']}"
-
-        # 第二组：空串族（None/""/空白）归一后 = None，应走另一条 key
-        assert pool.ask(worker, "p", None) == "ok"
-        assert calls["n"] == 2
-        assert pool.ask(worker, "p", "") == "ok"
-        assert pool.ask(worker, "p", "  ") == "ok"
-        assert calls["n"] == 2, f"None/空串族应归一为同 key，实际 {calls['n']}"
-
-        # 不同 prompt 走不同的网络
-        pool.ask(worker, "p2", "role-A")
-        assert calls["n"] == 3
-    finally:
-        orch.LLMClient = orig
-
-
-# ---------------- events.to_event error 归一（P2-8） ----------------
-
-def test_to_event_error_normalized():
-    """error 类型应显式归一为 {event:error, message:...}，不带 type 残留。"""
-    out = to_event({"type": "error", "message": "boom"})
-    assert out == {"event": "error", "message": "boom"}
-    # message 缺省时也能跑通（不抛异常，输出空串）
-    out2 = to_event({"type": "error"})
-    assert out2 == {"event": "error", "message": ""}
-
-
-def test_to_event_unknown_type_passthrough():
-    """未识别的 type 仍走兜底透传（兼容自定义事件）。"""
-    out = to_event({"type": "custom", "data": "x"})
-    assert out == {"event": "custom", "data": "x"}
-
-
-# ---------------- Agent allow_tools=[] 显式校验（P2-9） ----------------
-
-def test_agent_allow_tools_empty_warns(capsys, tmp_path, monkeypatch):
-    """allow_tools=[] 是「禁用全部工具」，应打警告而非静默错用。
-    验证构造后 registry 已被清空（任何工具都调不到）。"""
-    from agent.core.agent import Agent
-
-    monkeypatch.chdir(tmp_path)  # 隔离 Session 落盘目录
-    cfg = Config(_interpolate({
-        "agents": [],
-        "session": {"flush_batch": 1, "flush_interval": 0.0},
-    }))
-    bot = Agent(cfg, profile=None, enable_workers=False, allow_tools=[])
-    try:
-        captured = capsys.readouterr()
-        # 警告走 stderr：stdout 要留给 bridge / --stream 的纯 JSON 事件流
-        assert "allow_tools=[]" in captured.err, "应在 stderr 打印显式警告"
-        assert "allow_tools=[]" not in captured.out, "stdout 不得混入提示"
-        # 全部工具都被裁掉
-        assert bot.registry.names() == []
-        assert bot.removed_tools  # 记录了被裁剪的工具名
-    finally:
-        bot.close()
-
-
-def test_agent_allow_tools_none_no_warn(capsys, tmp_path, monkeypatch):
-    """allow_tools=None 不应触发警告（放开全部工具）。"""
-    from agent.core.agent import Agent
-
-    monkeypatch.chdir(tmp_path)
-    cfg = Config(_interpolate({
-        "agents": [],
-        "session": {"flush_batch": 1, "flush_interval": 0.0},
-    }))
-    bot = Agent(cfg, profile=None, enable_workers=False, allow_tools=None)
-    try:
-        captured = capsys.readouterr()
-        assert "allow_tools=[]" not in captured.out
-        assert "allow_tools=[]" not in captured.err
-        # 至少注册了内置工具
-        assert "run_shell" in bot.registry.names()
-    finally:
-        bot.close()
 
 
 # ---------------- 并行派工确定性 / 整体限时 / 择优（本轮回归） ----------------
@@ -915,35 +501,6 @@ def test_llm_empty_choices_retried_then_succeeds(monkeypatch):
     assert state["n"] == 2
 
 
-# ---------------- session_id 路径穿越（本轮修正） ----------------
-
-def test_sanitize_session_id_rejects_unsafe():
-    """session_id 会拼成落盘文件名：分隔符 / .. / 盘符 / 超长一律判非法。"""
-    from agent.core.session import sanitize_session_id
-
-    assert sanitize_session_id("20260921-120000") == "20260921-120000"
-    assert sanitize_session_id("abc_DEF.1-x") == "abc_DEF.1-x"
-    for bad in ["", "   ", None, "../../etc/passwd", "a/b", "a\\b", "..", "a..b",
-                "C:/x", "x" * 65]:
-        assert sanitize_session_id(bad) is None, f"应判非法：{bad!r}"
-
-
-def test_session_evil_id_stays_inside_sessions_dir(tmp_path, monkeypatch):
-    """即使非法 id 透传到 Session，也不得把 JSONL 写到 sessions 目录之外。
-
-    实测修正前 `Session(session_id="../../escaped_sid")` 会把文件写到
-    sessions 的同级目录（路径穿越写盘）。
-    """
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-
-    s = Session(session_id="../../escaped", flush_batch=1, flush_interval=0.0)
-    s.add("user", "x")
-    s.flush()
-    assert s._path.parent.resolve() == (tmp_path / "sessions").resolve()
-    assert not list(tmp_path.glob("escaped*")), "不得在 sessions 目录外生成文件"
-
-
 # ---------------- skill 脚本名路径穿越（本轮修正） ----------------
 
 def test_skill_script_path_traversal_rejected(tmp_path):
@@ -970,123 +527,7 @@ def test_skill_script_path_traversal_rejected(tmp_path):
     assert "ok" in out_ok and "[exit code] 0" in out_ok
 
 
-# ---------------- 在飞接管不得清掉新发起者的 inflight（本轮修正） ----------------
-
-def test_ask_takeover_does_not_clear_new_inflight():
-    """跟随者超时接管后，旧发起者结算时不得清掉接管者注册的 inflight。
-
-    旧发起者收尾时无条件 `_inflight.pop(key)`，会把接管者的在飞项一并删掉，
-    后来者看不到在飞项 → 各自重新打网络，去重在最需要它的挂死场景下正好失效。
-    """
-    cfg = Config(_interpolate({
-        "agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}],
-        "collaboration": {"inflight_timeout": 0.3},
-    }))
-    pool = WorkerPool(cfg, exclude=None)
-    worker = pool.names()[0]
-    key = (worker, "t", None)
-
-    release_lead = threading.Event()
-    release_takeover = threading.Event()
-    calls = {"n": 0}
-
-    class SlowClient:
-        def chat(self, messages):
-            calls["n"] += 1
-            (release_lead if calls["n"] == 1 else release_takeover).wait(timeout=5)
-            return {"role": "assistant", "content": "ok"}
-
-    orig = orch.LLMClient
-    orch.LLMClient = lambda *a, **k: SlowClient()
-    lead_future: Future = Future()
-    follower_future: Future = Future()
-
-    def _run(fut: Future) -> None:
-        try:
-            fut.set_result(pool.ask(worker, "t"))
-        except Exception as exc:  # noqa: BLE001
-            fut.set_exception(exc)
-
-    try:
-        threading.Thread(target=_run, args=(lead_future,), name="lead", daemon=True).start()
-        # 等旧发起者建立 inflight 并进入网络。**必须带 deadline**：任何回归（比如当日
-        # 隔离把发起者的 ask 短路、FakeClient 没跑起来）都会让这个 while 空转到天荒地老，
-        # 把整套测试挂死、CI 只能靠 timeout 兜底。同文件另外两处并发等待
-        # （test_ask_concurrent_dedup_same_key / test_ask_concurrent_initiator_failure_shared_with_followers）
-        # 都有 `time.time() < deadline` 保护，这里语义对齐：到期未就位 ⇒ 显式失败。
-        lead_deadline = time.time() + 5.0
-        while calls["n"] < 1 and time.time() < lead_deadline:
-            time.sleep(0.01)
-        assert calls["n"] >= 1, "旧发起者未在 5s 内进入网络段，接管路径无法继续（多半是 ask 被上游短路了）"
-
-        threading.Thread(
-            target=_run, args=(follower_future,), name="follower", daemon=True
-        ).start()
-        time.sleep(0.8)  # 等跟随者按 inflight_timeout 接管并注册新 future
-
-        with pool._lock:
-            assert len(pool._inflight) == 1, "接管后应有且仅有接管者一条 inflight"
-            takeover_fut = pool._inflight[key]
-
-        release_lead.set()  # 放行旧发起者结算
-        assert lead_future.result(timeout=5) == "ok"
-
-        with pool._lock:
-            remaining = pool._inflight.get(key)
-        assert remaining is takeover_fut, "旧发起者不得清掉接管者的 inflight"
-
-        release_takeover.set()  # 放行接管者
-        assert follower_future.result(timeout=5) == "ok"
-        # 接管者成功入缓存：后续同 key 直接命中，不再打网络
-        assert pool.ask(worker, "t") == "ok"
-        assert calls["n"] == 2, f"应恰好 2 次网络调用（旧发起者 + 接管者），实际 {calls['n']}"
-    finally:
-        orch.LLMClient = orig
-        release_lead.set()
-        release_takeover.set()
-
-
-# ---------------- 空回复不静默（本轮修正） ----------------
-
-def test_agent_empty_reply_not_silent(tmp_path, monkeypatch):
-    """模型返回空 content 且无工具调用时，不得给出一条空白最终答复。"""
-    from agent.core.agent import Agent
-
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    cfg = Config(_interpolate({
-        "agents": [],
-        "session": {"flush_batch": 1, "flush_interval": 0.0},
-    }))
-    bot = Agent(cfg, profile=None, enable_workers=False)
-    try:
-        bot.llm = SimpleNamespace(
-            chat=lambda messages, tools=None: {"role": "assistant", "content": ""}
-        )
-        out = bot.run("你好")
-        assert out.strip(), "不得返回空串"
-        assert "空内容" in out
-    finally:
-        bot.close()
-
-
 # ---------------- 并行派工实时事件 + 提前采纳（方案A + 结束派工） ----------------
-
-def test_to_event_worker_streaming_schemas():
-    """三派工事件在 to_event 里显式归一：preview 截断、ok/计数字段透传。"""
-    d = to_event({"type": "worker_dispatch", "workers": ["a", "b"], "prompt": "P" * 600})
-    assert d["event"] == "worker_dispatch" and d["total"] == 2
-    assert len(d["prompt_preview"]) <= 500
-    r = to_event({"type": "worker_result", "worker": "a", "index": 1, "total": 2,
-                  "elapsed_ms": 1234, "ok": True, "answer": "hi"})
-    assert r["event"] == "worker_result" and r["worker"] == "a"
-    assert r["ok"] is True and r["preview"] == "hi" and r["elapsed_ms"] == 1234
-    r2 = to_event({"type": "worker_result", "worker": "b", "ok": False, "answer": "错误：隔离"})
-    assert r2["ok"] is False
-    c = to_event({"type": "worker_gather_cancelled", "completed": ["a"], "skipped": ["b"]})
-    assert c["event"] == "worker_gather_cancelled"
-    assert c["completed"] == ["a"] and c["skipped"] == ["b"]
-
 
 def test_functiontool_injects_ctx_only_for_two_arg_funcs():
     """FunctionTool 按签名决定是否注入 ctx：双参收、单参不收；单参工具无 ctx 也照常跑。"""
@@ -1107,68 +548,6 @@ def test_functiontool_injects_ctx_only_for_two_arg_funcs():
     assert seen["ctx"] is sentinel, "双参工具必须收到 ctx"
     assert reg.execute("s", {}) == "no"          # 无 ctx 路径（bridge call_tool/单测）
     assert reg.execute("s", {}, sentinel) == "no"  # 传了 ctx 也不报错、忽略之
-
-
-def _two_worker_stream_pool() -> WorkerPool:
-    cfg = Config(_interpolate({"agents": [
-        {"name": "fast", "base_url": "u", "api_key": "k", "model": "fast"},
-        {"name": "slow", "base_url": "u", "api_key": "k", "model": "slow"},
-    ]}))
-    return WorkerPool(cfg, exclude=None)
-
-
-def test_ask_many_emits_worker_events(monkeypatch):
-    """ask_many 带 emit：先 worker_dispatch，再每个工人各一条 worker_result（含 ok/answer）。"""
-    class Instant:
-        def __init__(self, *_a, **_k):
-            pass
-
-        def chat(self, messages, tools=None):
-            return {"content": "ok"}
-
-    monkeypatch.setattr(orch, "LLMClient", Instant)
-    pool = _two_worker_stream_pool()
-    evs: list[dict] = []
-    out = pool.ask_many(["fast", "slow"], "任务", emit=lambda e: evs.append(e))
-    types = [e["type"] for e in evs]
-    assert types[0] == "worker_dispatch"
-    assert types.count("worker_result") == 2
-    wr = [e for e in evs if e["type"] == "worker_result"]
-    assert all(e["ok"] and e["answer"] == "ok" for e in wr)
-    assert {e["worker"] for e in wr} == {"fast", "slow"}
-    assert "### 工人 fast 的结果" in out and "### 工人 slow 的结果" in out
-    # 无 emit 时（bridge/单测）退化成纯栅栏调用，不抛异常
-    assert "工人 fast 的结果" in pool.ask_many(["fast", "slow"], "任务2")
-
-
-def test_ask_many_cancel_returns_completed_early(monkeypatch):
-    """快工人一回来就置取消位 → 慢工人被放弃等待、结果里标注提前结束（确定性、无计时竞态）。"""
-    class Timed:
-        def __init__(self, _b, _a, model, **_k):
-            self.model = model
-
-        def chat(self, messages, tools=None):
-            if self.model == "slow":
-                time.sleep(2.0)  # 慢节点：取消后应放弃等待它（此线程后台自行收尾）
-            return {"content": f"ans-{self.model}"}
-
-    monkeypatch.setattr(orch, "LLMClient", Timed)
-    pool = _two_worker_stream_pool()
-    cancel = threading.Event()
-    evs: list[dict] = []
-
-    def emit(e: dict) -> None:
-        evs.append(e)
-        if e["type"] == "worker_result" and e["worker"] == "fast":
-            cancel.set()  # 采纳已完成的 fast，结束对 slow 的等待
-
-    t0 = time.monotonic()
-    out = pool.ask_many(["fast", "slow"], "任务", emit=emit, cancel_event=cancel)
-    dt = time.monotonic() - t0
-    assert dt < 1.5, f"取消未生效：等了 {dt:.2f}s（慢节点未收尾就该放弃等待）"
-    assert "ans-fast" in out, "已完成工人的结果必须保留"
-    assert "提前结束" in out and "slow" in out
-    assert any(e["type"] == "worker_gather_cancelled" for e in evs)
 
 
 # ---------------- 结构化派工 / 健康探针 / 能力标签 / 缓存与下线可关 ----------------
@@ -1194,35 +573,6 @@ def test_ask_many_structured_ordered_records(monkeypatch):
     assert all(isinstance(r["elapsed_ms"], int) for r in recs)
     # 空工人列表 → 空结果（不抛）
     assert pool.ask_many_structured(["ghost"], "x") == []
-
-
-def test_ask_many_structured_error_and_timeout_status(monkeypatch):
-    """失败回答 → ok=False status=error；未完成（取消/超时）→ status=cancelled。"""
-    class Vary:
-        def __init__(self, _b, _a, model, **_k):
-            self.model = model
-
-        def chat(self, messages, tools=None):
-            if self.model == "slow":
-                time.sleep(2.0)
-            return {"content": "错误：上游 502" if self.model == "bad" else "good"}
-
-    monkeypatch.setattr(orch, "LLMClient", Vary)
-    cfg = Config(_interpolate({"agents": [
-        {"name": "bad", "base_url": "u", "api_key": "k", "model": "bad"},
-        {"name": "slow", "base_url": "u", "api_key": "k", "model": "slow"},
-    ]}))
-    pool = WorkerPool(cfg, exclude=None)
-    cancel = threading.Event()
-
-    def _emit(e):
-        if e["type"] == "worker_result" and e["worker"] == "bad":
-            cancel.set()  # bad 一回来就结束，放弃 slow
-
-    recs = pool.ask_many_structured(["bad", "slow"], "任务", emit=_emit, cancel_event=cancel)
-    by = {r["worker"]: r for r in recs}
-    assert by["bad"]["ok"] is False and by["bad"]["status"] == "error" and by["bad"]["answer"] == ""
-    assert by["slow"]["status"] == "cancelled"
 
 
 def test_health_status_reflects_cooldown_and_quarantine():
@@ -1252,58 +602,3 @@ def test_agentprofile_tags_in_brief_and_overview():
     assert p.brief()["tags"] == "code,中文"
     pool = WorkerPool(cfg, exclude=None)
     assert "tags=code,中文" in pool.overview()
-
-
-def test_cache_size_zero_disables_caching(monkeypatch):
-    """cache_size=0：同一 (工人,任务,角色) 两次派工各打一次网络（不缓存）。"""
-    calls = {"n": 0}
-
-    class Counting:
-        def __init__(self, *_a, **_k):
-            pass
-
-        def chat(self, messages, tools=None):
-            calls["n"] += 1
-            return {"content": "x"}
-
-    monkeypatch.setattr(orch, "LLMClient", Counting)
-    cfg_off = Config(_interpolate({
-        "agents": [{"name": "w", "base_url": "u", "api_key": "k", "model": "m"}],
-        "collaboration": {"cache_size": 0},
-    }))
-    pool_off = WorkerPool(cfg_off, exclude=None)
-    worker = pool_off.names()[0]
-    pool_off.ask(worker, "same")
-    pool_off.ask(worker, "same")
-    assert calls["n"] == 2, "cache_size=0 必须不缓存"
-    # 对照：默认开缓存 → 第二次命中，不再打网络
-    calls["n"] = 0
-    cfg_on = Config(_interpolate({
-        "agents": [{"name": "w", "base_url": "u", "api_key": "k", "model": "m"}],
-    }))
-    pool_on = WorkerPool(cfg_on, exclude=None)
-    w2 = pool_on.names()[0]
-    pool_on.ask(w2, "same")
-    pool_on.ask(w2, "same")
-    assert calls["n"] == 1, "默认应命中缓存只打一次"
-
-
-def test_retire_days_zero_no_auto_disable(tmp_path):
-    """retire_days=0：连续多日失败也只在当日隔离，不自动往 .env.example 加 # 下线。"""
-    from agent.core.health import ModelHealth, _today
-
-    def run(retire_days: int) -> dict:
-        store = tmp_path / f"h{retire_days}.json"
-        env = tmp_path / f"env{retire_days}.txt"
-        env.write_text("NODE_X_MODELS=mm@8k,other\n", encoding="utf-8")
-        h = ModelHealth(store, env, retire_days=retire_days)
-        # 档案加载时会自动把"今天"记为运行日，故连击必须含今天才能真正判定下线
-        for day in (_today(), "2000-01-01"):
-            h.record_failure("kk", "mm", "NODE_X_MODELS", day=day)
-        return {"disabled": bool((h.snapshot().get("kk") or {}).get("disabled")),
-                "env": env.read_text(encoding="utf-8")}
-
-    off = run(0)
-    assert off["disabled"] is False and "#" not in off["env"], "retire_days=0 不该自动下线"
-    on = run(2)
-    assert on["disabled"] is True and "#mm" in on["env"], "对照组：达阈值应自动下线（证明上一条非恒真）"

@@ -19,12 +19,10 @@ import time
 from pathlib import Path
 
 import agent.core.orchestrator as orch
-import agent.core.session as sess_mod
 import agent.tools.mcp_client as mcp_client
 from agent.config import Config, _interpolate
 from agent.core.health import ModelHealth, get_health
 from agent.core.orchestrator import WorkerPool
-from agent.core.pipeline import Pipeline
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -122,9 +120,8 @@ def test_default_fanout_is_bounded(monkeypatch):
     pool.vote("q")
     assert len(calls) == 6, "收集 3 + 投票 3"
 
-    calls.clear()
-    Pipeline(pool).run("q")
-    assert len(calls) == 12, "起草 3 + 评审 3 + 修订 3 + 择优投票 3"
+    # 注：原「Pipeline 起草+评审+修订+择优」子断言已随固定流水线移除删除；
+    # 缺省扇出上限由上面的 ask_many/vote 与 test_pick_* 覆盖。
 
 
 def test_explicit_workers_are_not_capped(monkeypatch):
@@ -178,41 +175,12 @@ def test_mcp_group_shared_and_refcounted():
 
 # ---------------- 4) 缓存命中优先于冷却（批量路径） ----------------
 
-def test_hit_cache_still_usable_when_cooling():
-    """原缺陷：collect/ask_many 在进 ask 之前就按冷却预过滤，连缓存都查不到。"""
-    pool = _pool("m1,m2", cap=2)
-    worker = pool.names()[0]
-    pool._cache[(worker, "已缓存的问题", None)] = "缓存里的答案"
-    pool._cooldowns[worker] = time.time() + 999  # 冷却中
-
-    assert pool.ask(worker, "已缓存的问题") == "缓存里的答案"
-    assert pool.collect([worker], "已缓存的问题") == [(worker, "缓存里的答案")]
-    assert "缓存里的答案" in pool.ask_many([worker], "已缓存的问题")
-
-
 def test_no_cache_still_reports_skip_in_many():
     pool = _pool("m1,m2", cap=2)
     worker = pool.names()[0]
     pool._cooldowns[worker] = time.time() + 999
     out = pool.ask_many([worker], "没缓存的问题")
     assert "本轮跳过" in out and worker in out
-
-
-# ---------------- 5) 上下文预算计入 system prompt ----------------
-
-def test_system_prompt_takes_budget(tmp_path, monkeypatch):
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    s = sess_mod.Session(session_id="budget-probe")
-    for _ in range(20):
-        s.add("user", "x" * 1000)  # 每条约 250 token
-
-    kept_short = len(s.messages_with("短 system", context_length=4000)) - 1
-    kept_long = len(s.messages_with("y" * 3000, context_length=4000)) - 1
-    assert kept_long < kept_short, (
-        f"长 system 必须挤掉历史（短={kept_short} 长={kept_long}）；"
-        "不扣 system 时两者会相同"
-    )
 
 
 # ---------------- 6) 计票不采信错误文本 ----------------
@@ -243,4 +211,3 @@ def test_ballot_still_parses_normal_vote(monkeypatch):
     pool._clients.clear()
     picked = pool.select_best([("a", "AAA"), ("b", "BBB")], voters=[worker])
     assert picked is not None and picked[0] == "b"
-

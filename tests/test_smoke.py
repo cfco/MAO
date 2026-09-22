@@ -22,7 +22,6 @@ def test_config_loads():
     assert isinstance(cfg.agent_profiles, list)
     # collaboration 默认值应可读、合法
     assert cfg.max_workers >= 1
-    assert cfg.max_iterations >= 1
 
 
 def test_builtin_tools_registered():

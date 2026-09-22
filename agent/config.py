@@ -129,8 +129,9 @@ class AgentProfile:
     note: str = ""
     # 能力标签（逗号分隔，如 "code,中文,长上下文"）：外部主据此决定把哪类活派给谁。
     tags: str = ""
-    # 该模型清单来自哪个环境变量（如 NODE_A_MODELS）；模型健康下线时
-    # 据此精确改写 .env.example 对应行。值写死在 config.yaml（非 ${VAR}）时为空。
+    # 该模型清单来自哪个环境变量（如 NODE_A_MODELS），便于诊断"这批模型挂在哪一站"。
+    # （历史上供"连续失败自动改写 .env.example 下线"精确定位用，该机制已移除，字段保留。）
+    # 值写死在 config.yaml（非 ${VAR}）时为空。
     models_env: str = ""
 
     def brief(self) -> dict:
@@ -154,10 +155,8 @@ class Config:
         """
         self.raw = data
         self.llm_cfg: dict = data.get("llm", {}) or {}
-        self.server: dict = data.get("server", {}) or {}
         self.tools_cfg: dict = data.get("tools", {}) or {}
         self.collab_cfg: dict = data.get("collaboration", {}) or {}
-        self.session_cfg: dict = data.get("session", {}) or {}
         self.mcp_servers: list = data.get("mcp_servers", []) or []
 
         # 站名 → 插值前的原始条目（只为提取 models_env，其余字段不依赖）
@@ -274,20 +273,6 @@ class Config:
         p = Path(rel)
         return p if p.is_absolute() else ROOT / p
 
-    @property
-    def env_example_path(self) -> Path:
-        """模型清单所在的分层配置基础层（健康下线时改写此文件）。"""
-        return ROOT / ".env.example"
-
-    @property
-    def health_retire_days(self) -> int:
-        """连续多少个"运行日"（程序实际启动过的天）都失败后自动给模型标 # 下线。
-        0 = 关闭自动改写 .env.example（只当日隔离、不再自动下线，适合外部主按需驱动
-        的场景——主每轮自己判断节点好坏，不需要 MAO 静默改配置）。最小 0。"""
-        return self.as_int(
-            self.collab_cfg.get("retire_days", 7), "collaboration.retire_days", 7, minimum=0
-        )
-
     # ---------- 兼容旧配置的兜底单模型 ----------
 
     @property
@@ -301,56 +286,6 @@ class Config:
         return self.as_int(
             self.tools_cfg.get("shell_timeout", 120), "tools.shell_timeout", 120, minimum=1
         )
-
-    # ---------- 会话落盘限流（session.*） ----------
-
-    @property
-    def session_flush_batch(self) -> int:
-        """待写缓冲累计达到该条数立即落盘（高频场景）。最小 1。
-
-        优先级：环境变量 MAO_SESSION_FLUSH_BATCH > config.yaml 的 session.flush_batch > 默认 16。
-        环境变量兜底用于 CLI 命令行覆盖（uv run mao chat --session-flush-batch N），
-        同一进程内对 bridge（含其持久会话）各路径生效。
-        """
-        env = os.environ.get("MAO_SESSION_FLUSH_BATCH")
-        if env is not None:
-            try:
-                return max(1, int(env))
-            except ValueError:
-                pass
-        return self.as_int(
-            self.session_cfg.get("flush_batch", 16), "session.flush_batch", 16, minimum=1
-        )
-
-    @property
-    def session_flush_interval(self) -> float:
-        """距上次落盘超过该秒数才落盘（低频/跟随者场景）。最小 0.0。
-
-        优先级：环境变量 MAO_SESSION_FLUSH_INTERVAL > config.yaml 的 session.flush_interval > 默认 2.0。
-        """
-        env = os.environ.get("MAO_SESSION_FLUSH_INTERVAL")
-        if env is not None:
-            try:
-                return max(0.0, float(env))
-            except ValueError:
-                pass
-        return self.as_float(
-            self.session_cfg.get("flush_interval", 2.0), "session.flush_interval", 2.0, minimum=0.0
-        )
-
-    @property
-    def max_iterations(self) -> int:
-        return self.as_int(
-            self.llm_cfg.get("max_iterations", 25), "llm.max_iterations", 25, minimum=1
-        )
-
-    @property
-    def host(self) -> str:
-        return str(self.server.get("host", "127.0.0.1"))
-
-    @property
-    def port(self) -> int:
-        return self.as_int(self.server.get("port", 8000), "server.port", 8000, minimum=1)
 
 
 def _load_dotenv(path: Path) -> list[str]:

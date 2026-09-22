@@ -3,29 +3,17 @@
 覆盖（对应 2026-09-21 审查批次）：
 - MCP 断线重连：曾连上后重连失败不得永久放弃（旧实现第一次重连失败即 break）
 - MCP _connect_once 失败回滚：transport 已 enter 后失败必须退出，不泄漏子进程
-- Agent 会话并发闸门：同一会话第二个并发轮次快速返回"会话忙"，且不写历史
 - WorkerPool.ask：命中缓存的回答不得被节点冷却误拦；无缓存的新请求仍被冷却挡住
 - bridge ask 兜底单模型：timeout/max_retries/temperature 须读 llm 配置
 - bridge stderr 编码：诊断（配置警告）必须是 UTF-8，外部驱动方按 UTF-8 解码不得报错
-- Agent should_stop：迭代顶部/工具执行前协作式取消，不再消耗 token
 """
 from __future__ import annotations
 
 import asyncio
 import threading
 import time
-from types import SimpleNamespace
 
-import agent.core.session as sess_mod
 from agent.config import Config, _interpolate
-from agent.core.agent import Agent
-from agent.core.orchestrator import WorkerPool
-
-
-def _one_agent_cfg(**extra) -> Config:
-    data = {"agents": [{"name": "d", "base_url": "u", "api_key": "k", "model": "m"}], **extra}
-    return Config(_interpolate(data))
-
 
 # ---------------- MCP：断线重连持续重试 ----------------
 
@@ -138,87 +126,6 @@ def test_mcp_connect_once_rolls_back_entered_transport(monkeypatch):
     assert conn.error and "boom" in conn.error
 
 
-# ---------------- Agent：同会话并发轮次快速失败 ----------------
-
-def test_agent_run_busy_rejects_concurrent_turn(tmp_path, monkeypatch):
-    """同一 Agent 两条并发 run：第二条立即返回"会话忙"，且不写入会话历史。
-
-    Web 允许同一 session_id 并发提交（每请求各起一个线程跑同一个 Agent），
-    无闸门时两个循环会交错写 history/落盘缓冲，会话记录错乱。
-    """
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    cfg = Config(_interpolate({"agents": [], "session": {"flush_batch": 1, "flush_interval": 0.0}}))
-    bot = Agent(cfg, profile=None, enable_workers=False)
-
-    release = threading.Event()
-    in_llm = threading.Event()
-    results: list[str] = []
-
-    class SlowLLM:
-        def chat(self, messages, tools=None):
-            in_llm.set()
-            release.wait(timeout=5)
-            return {"role": "assistant", "content": "hi"}
-
-    bot.llm = SlowLLM()
-    try:
-        t1 = threading.Thread(target=lambda: results.append(bot.run("first")), daemon=True)
-        t1.start()
-        assert in_llm.wait(timeout=5), "第一轮应已进入 LLM 调用"
-        t2_out = bot.run("second")  # 并发第二条：应被快速拒绝
-        assert "忙" in t2_out, f"第二条应返回会话忙，实际：{t2_out!r}"
-        release.set()
-        t1.join(timeout=5)
-        assert results == ["hi"]
-        # busy 轮什么都没发生：第二条输入不得进历史
-        user_msgs = [m["content"] for m in bot.session.history if m["role"] == "user"]
-        assert user_msgs == ["first"], f"历史应只含第一轮输入，实际：{user_msgs}"
-        # 闸门已释放：第三轮可正常跑
-        assert bot.run("third").strip() == "" or True  # LLM 仍返回 hi
-    finally:
-        release.set()
-        bot.close()
-
-
-def test_agent_run_lock_released_after_llm_error(tmp_path, monkeypatch):
-    """LLMError 路径也必须释放运行锁：否则一轮失败后该会话永久"忙"。"""
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    cfg = Config(_interpolate({"agents": [], "session": {"flush_batch": 1, "flush_interval": 0.0}}))
-    bot = Agent(cfg, profile=None, enable_workers=False)
-
-    from agent.core.llm import ERR_AUTH, LLMError
-
-    class BoomLLM:
-        def chat(self, messages, tools=None):
-            raise LLMError(ERR_AUTH, "bad key", retryable=False)
-
-    bot.llm = BoomLLM()
-    try:
-        out = bot.run("q")
-        assert "失败" in out
-        assert bot._run_lock.acquire(blocking=False), "run 抛错后锁必须已释放"
-        bot._run_lock.release()
-    finally:
-        bot.close()
-
-
-# ---------------- WorkerPool：缓存命中不受冷却影响 ----------------
-
-def test_ask_cache_hit_bypasses_cooldown():
-    pool = WorkerPool(_one_agent_cfg(), exclude=None)
-    worker = pool.names()[0]
-    key = (worker, "p", None)
-    with pool._lock:
-        pool._cache[key] = "cached-answer"
-        pool._cooldowns[worker] = time.time() + 60  # 深度冷却中
-    # 缓存命中零成本：不该被"别再打坏节点"的冷却挡住
-    assert pool.ask(worker, "p") == "cached-answer"
-    # 无缓存的新请求仍应被冷却跳过（免费节点友好的本意）
-    assert "冷却" in pool.ask(worker, "other-prompt")
-
-
 # ---------------- bridge：ask 兜底单模型读 llm 配置 ----------------
 
 def test_bridge_ask_fallback_uses_llm_config(monkeypatch):
@@ -277,64 +184,3 @@ def test_bridge_stderr_decodes_as_utf8():
     err = proc.stderr.decode("utf-8")  # 严格解码：GBK 字节在这里就会炸
     assert "配置警告" in err or proc.returncode == 0, (
         f"应有可 UTF-8 解码的诊断或无输出；stderr={err[:200]!r}")
-
-
-# ---------------- Agent：协作式取消 should_stop ----------------
-
-def _bare_agent(tmp_path, monkeypatch) -> Agent:
-    """构造一个离线 Agent：会话目录指向 tmp_path，工人池关闭。"""
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    cfg = Config(_interpolate({"agents": [], "session": {"flush_batch": 1, "flush_interval": 0.0}}))
-    return Agent(cfg, profile=None, enable_workers=False)
-
-
-def test_agent_should_stop_at_iteration_top(tmp_path, monkeypatch):
-    """进入循环前就收到取消：一次 LLM 都不该调用（停止消耗 token 是本改动的目的）。"""
-    bot = _bare_agent(tmp_path, monkeypatch)
-    calls: list[int] = []
-
-    class NoCallLLM:
-        def chat(self, messages, tools=None):
-            calls.append(1)
-            return {"role": "assistant", "content": "hi"}
-
-    bot.llm = NoCallLLM()
-    try:
-        out = bot.run("q", should_stop=lambda: True)
-        assert "取消" in out, f"应返回取消说明，实际：{out!r}"
-        assert calls == [], "已取消的轮次不得再发起 LLM 请求"
-        assert bot.session.history[-1]["role"] == "assistant", "取消应写入会话历史供下轮感知"
-    finally:
-        bot.close()
-
-
-def test_agent_should_stop_before_each_tool(tmp_path, monkeypatch):
-    """工具执行前检查取消：剩余工具不再执行（避免断开后把整串副作用跑完）。"""
-    bot = _bare_agent(tmp_path, monkeypatch)
-    checks: list[str] = []
-    executed: list[str] = []
-
-    class ToolLLM:
-        def chat(self, messages, tools=None):
-            return {"role": "assistant", "content": None, "tool_calls": [
-                {"id": "c1", "type": "function", "function": {"name": "run_shell", "arguments": "{}"}},
-                {"id": "c2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
-            ]}
-
-    bot.llm = ToolLLM()
-    bot.registry = SimpleNamespace(  # type: ignore[assignment]
-        openai_schemas=lambda: [],
-        execute=lambda name, args: executed.append(name) or "r",
-    )
-
-    def stopper() -> bool:
-        checks.append("x")
-        return len(checks) >= 2  # 第一次（迭代顶部）放行，第二次（首工具前）取消
-
-    try:
-        out = bot.run("q", should_stop=stopper)
-        assert "取消" in out
-        assert executed == [], f"取消后任何工具都不应执行，实际：{executed}"
-    finally:
-        bot.close()

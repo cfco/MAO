@@ -29,7 +29,6 @@ from agent.config import Config, _interpolate
 from agent.core.health import get_health
 from agent.core.llm import LLMClient
 from agent.core.orchestrator import WorkerPool
-from agent.core.pipeline import Pipeline
 
 
 def _pool(models: str, cap: int = 5, **collab) -> WorkerPool:
@@ -114,7 +113,7 @@ def test_concurrent_record_failure_keeps_store_parsable(tmp_path):
     import json
 
     store = tmp_path / "h.json"
-    h = get_health(store, tmp_path / "env.example", retire_days=7)
+    h = get_health(store)
 
     def writer(idx: int) -> None:
         for j in range(20):
@@ -136,10 +135,7 @@ def test_concurrent_record_failure_keeps_store_parsable(tmp_path):
 @pytest.mark.parametrize(("attr", "data", "expected"), [
     ("max_participants", {"collaboration": {"max_participants": "five"}}, 5),
     ("max_workers", {"collaboration": {"max_workers": "many"}}, 3),
-    ("max_iterations", {"llm": {"max_iterations": "lots"}}, 25),
-    ("port", {"server": {"port": "八零零零"}}, 8000),
     ("shell_timeout", {"tools": {"shell_timeout": "soon"}}, 120),
-    ("session_flush_interval", {"session": {"flush_interval": "fast"}}, 2.0),
 ])
 def test_bad_numeric_config_falls_back(attr, data, expected, capsys):
     """类型写错不得抛异常：回退默认值并在 stderr 给一次明确告警。"""
@@ -148,55 +144,12 @@ def test_bad_numeric_config_falls_back(attr, data, expected, capsys):
 
 
 def test_valid_numeric_config_untouched():
-    cfg = Config({"collaboration": {"max_participants": 9}, "llm": {"max_iterations": 7}})
+    cfg = Config({"collaboration": {"max_participants": 9}, "tools": {"shell_timeout": 30}})
     assert cfg.max_participants == 9
-    assert cfg.max_iterations == 7
+    assert cfg.shell_timeout == 30
 
 
-# ---------------- 4) 流水线阶段间长度预算 ----------------
-
-def test_pipeline_trims_stage_payload(monkeypatch):
-    """4k 窗口的工人：初稿/评审必须被裁到预算内，不能全量拼进下一阶段 prompt。"""
-    # 两个 4k 窗口的工人 → _budget_for = max(2000, 4096*0.5-2000) = 2000
-    pool = _pool("m1@4k,m2@4k", cap=2)
-    seen: dict[str, int] = {}
-
-    def spy(worker, prompt, system=None):
-        role = "review"
-        if system:
-            if "起草者" in system:
-                role = "draft"
-            elif "修订者" in system:
-                role = "revise"
-        seen[role] = max(seen.get(role, 0), len(prompt))
-        return "草稿内容" * 1500  # 每份 6000 字
-
-    monkeypatch.setattr(pool, "ask", spy)
-    Pipeline(pool).run("写一份方案")
-
-    assert seen.get("draft", 0) < 200, f"起草 prompt 不该含素材：{seen}"
-    assert seen.get("review", 0) < 3000, f"评审 prompt 应被裁到预算内（实际 {seen.get('review')}）"
-    assert seen.get("revise", 0) < 5000, f"修订 prompt 应被裁到预算内（实际 {seen.get('revise')}）"
-
-
-def test_pipeline_budget_scales_with_window():
-    """预算随消费方窗口伸缩：大窗口不裁剪，小窗口才收紧。"""
-    big = _pool("m1@128k,m2@128k", cap=2)
-    small = _pool("m1@4k,m2@4k", cap=2)
-    assert Pipeline(big)._budget_for(big.names()) > 40000, "128k 窗口应给足素材额度"
-    assert Pipeline(small)._budget_for(small.names()) == 2000, "4k 窗口应收到下限预算"
-
-
-def test_join_capped_evenly_splits_across_items():
-    """均分而非整段截尾：排在后面的工人不能整份消失。"""
-    items = [("w1", "甲" * 5000), ("w2", "乙" * 5000), ("w3", "丙" * 5000)]
-    text = Pipeline._join_capped(items, 3000, "初稿")
-    for worker in ("w1", "w2", "w3"):
-        assert f"（{worker}）" in text, f"{worker} 的素材不该被整份丢掉"
-    assert "已截断" in text
-
-
-# ---------------- 5) write_file 覆盖前留档 ----------------
+# ---------------- 4) write_file 覆盖前留档 ----------------
 
 def test_write_file_backs_up_existing_file(tmp_path, monkeypatch):
     monkeypatch.setattr(builtin, "ROOT", tmp_path)

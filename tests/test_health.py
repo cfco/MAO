@@ -11,7 +11,6 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import time
 from datetime import date, timedelta
@@ -21,9 +20,7 @@ import pytest
 
 import agent.config as ac
 import agent.core.orchestrator as orch
-import agent.core.session as sess_mod
 from agent.config import Config, _interpolate, load_config
-from agent.core.agent import Agent
 from agent.core.health import ModelHealth, _today
 from agent.core.llm import LLMError
 from agent.core.orchestrator import WorkerPool
@@ -176,12 +173,8 @@ def test_real_env_example_never_carries_key_values():
 # ---------------- 2) ModelHealth 单元 ----------------
 
 
-def _health(tmp_path, retire_days=7):
-    return ModelHealth(
-        tmp_path / "data" / "model_health.json",
-        tmp_path / ".env.example",
-        retire_days=retire_days,
-    )
+def _health(tmp_path):
+    return ModelHealth(tmp_path / "data" / "model_health.json")
 
 
 def test_failure_marks_today_only(tmp_path):
@@ -196,75 +189,6 @@ def test_failure_marks_today_only(tmp_path):
     assert not h.quarantined("other")
 
 
-def test_weekend_gap_still_retires(tmp_path):
-    """运行日语义的核心诉求：隔了整个周末（自然日断档）也不打断连击。
-
-    周一、周二各失败一次后周末没开机；下周一再失败 → 最近 3 个运行日
-    （周一/周二/今天）全失败 → 下线。旧"自然日连续"实现会在断档处清零。
-    """
-    h = _health(tmp_path, retire_days=3)
-    assert h.record_failure("w", "m-w", "", day=_day(-8)) is None  # 上上周六？不重要，重要的是运行日
-    assert h.record_failure("w", "m-w", "", day=_day(-7)) is None
-    assert h.record_failure("w", "m-w", "") is not None  # 今天：第 3 个运行日，触发下线
-
-
-def test_active_day_without_failure_breaks_streak(tmp_path):
-    """打断连击的只能是"开过机但该模型没失败"的运行日（比如当天它成功了）。"""
-    h = _health(tmp_path, retire_days=3)
-    assert h.record_failure("w", "m-w", "", day=_day(-8)) is None
-    assert h.record_failure("w", "m-w", "", day=_day(-7)) is None
-    h.note_active(_day(-1))  # 昨天开过程序、这个模型没失败 → 窗口被它撑破
-    assert h.record_failure("w", "m-w", "") is None, "存在没失败的运行日 → 连击重新起算"
-
-
-def test_streak_below_active_day_count_does_not_retire(tmp_path):
-    """运行日样本不足 retire_days 个时不判下线（刚装好程序不该当天就下线模型）。"""
-    h = _health(tmp_path, retire_days=3)
-    assert h.record_failure("w", "m-w", "", day=_day(-1)) is None
-    assert h.record_failure("w", "m-w", "") is None, "只有 2 个运行日样本，不足 3"
-
-
-def test_v1_store_reads_and_restart_streak(tmp_path):
-    """旧版档案（无 active_dates）可读：隔离照旧，连击从当天重新积累。"""
-    store = tmp_path / "data" / "model_health.json"
-    store.parent.mkdir(parents=True)
-    store.write_text(
-        json.dumps({"version": 1, "models": {"w": {"fail_dates": [_day(-2), _day(-1)]}}}),
-        encoding="utf-8",
-    )
-    h = ModelHealth(store, None, retire_days=2)
-    assert h.record_failure("w", "m-w", "") is None, "历史运行日未知，不该直接判下线"
-    text = store.read_text(encoding="utf-8")
-    assert '"version": 2' in text and _day(-2) in text, "回写升级为 v2 且保留历史失败记录"
-
-
-def test_retire_rewrites_env_example(tmp_path):
-    (tmp_path / ".env.example").write_text(
-        "NODE_A_MODELS=m-one@128k,m-two@256k,#m-three@64k\n"
-        "NODE_B_MODELS=m-two@512k,other@256k\n"
-        "NODE_A_KEY=sk-fake-not-a-real-key\n"
-        "LLM_MODEL=m-one\n",
-        encoding="utf-8",
-    )
-    h = _health(tmp_path, retire_days=3)
-    assert h.record_failure("node-a:m-two", "m-two", "NODE_A_MODELS", day=_day(-2)) is None
-    assert h.record_failure("node-a:m-two", "m-two", "NODE_A_MODELS", day=_day(-1)) is None
-    notice = h.record_failure("node-a:m-two", "m-two", "NODE_A_MODELS")
-    assert notice and "下线" in notice
-    text = (tmp_path / ".env.example").read_text(encoding="utf-8")
-    lines = dict(kv.split("=", 1) for kv in text.splitlines() if kv)
-    # 命中的模型加 #；同模型多站一起下线；未命中的条目与 LLM_MODEL 兜底行原样
-    assert lines["NODE_A_MODELS"] == "m-one@128k,#m-two@256k,#m-three@64k"
-    assert lines["NODE_B_MODELS"] == "#m-two@512k,other@256k"
-    assert lines["LLM_MODEL"] == "m-one"
-    # key 行永不参与下线改写（匹配范围只限 *_MODELS，不含 *_KEY）
-    assert lines["NODE_A_KEY"] == "sk-fake-not-a-real-key"
-    # 已 disabled 后继续失败：不再重复提示、不再重复加 #
-    assert h.record_failure("node-a:m-two", "m-two", "NODE_A_MODELS") is None
-    text2 = (tmp_path / ".env.example").read_text(encoding="utf-8")
-    assert text2 == text
-
-
 def test_store_persists_across_instances(tmp_path):
     h = _health(tmp_path)
     h.record_failure("w", "m-w", "")
@@ -276,18 +200,10 @@ def test_corrupt_store_file_recovers(tmp_path):
     store = tmp_path / "data" / "model_health.json"
     store.parent.mkdir(parents=True)
     store.write_text("{ not json", encoding="utf-8")
-    h = ModelHealth(store, None)
+    h = ModelHealth(store)
     assert not h.quarantined("w")
     h.record_failure("w", "m-w", "")  # 从空白账本继续记，不抛
     assert h.quarantined("w")
-
-
-def test_retire_without_env_file_reports_manual(tmp_path):
-    h = ModelHealth(tmp_path / "h.json", None, retire_days=1)
-    notice = h.record_failure("w", "m-w", "")
-    assert notice and "手动" in notice, "无法自动改写时要如实提示人工确认"
-    # 档案里仍记了 disabled，不会每天重复打网络
-    assert h.record_failure("w", "m-w", "") is None
 
 
 # ---------------- 3) WorkerPool 集成（派工路径真的被隔离） ----------------
@@ -316,15 +232,6 @@ def test_quarantined_worker_skipped_everywhere(tmp_path):
     assert "st:m2" in ov and "隔离" in ov
 
 
-def test_cache_hit_bypasses_quarantine(tmp_path):
-    h = _health(tmp_path)
-    h.record_failure("st:m2", "m2", "")
-    pool = _pool(h)
-    pool._cache[("st:m2", "任务A", None)] = "cached-answer"
-    assert pool.ask("st:m2", "任务A") == "cached-answer", "缓存命中零成本，不该被隔离挡住"
-    assert "隔离" in pool.ask("st:m2", "任务B"), "未缓存的任务仍要走隔离"
-
-
 class _Boom:
     """假 LLMClient：任何调用都终态失败（重试后仍败出 LLMError）。"""
 
@@ -348,26 +255,3 @@ def test_worker_final_failure_quarantines_it_for_today(tmp_path, monkeypatch):
     assert "隔离" in pool.ask("st:m2", "任务B"), "当天后续派工直接跳过该节点"
     # 隔离只落在失败的那个模型上
     assert not pool.health.quarantined("st:m1")
-
-
-def test_master_failure_recorded_not_blocked(tmp_path, monkeypatch):
-    """主智能体失败：记档（参与连击计数），但不拦截主的下一轮——主是用户选的。"""
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    monkeypatch.setattr(ac, "ROOT", tmp_path)  # 健康档案/清单都落在 tmp，不碰真仓库
-    monkeypatch.setattr("agent.core.agent.LLMClient", _Boom)
-    cfg = Config(_interpolate({
-        "agents": [],
-        "llm": {"base_url": "u", "api_key": "k", "model": "solo-m"},
-        "session": {"flush_batch": 1, "flush_interval": 0.0},
-    }))
-    bot = Agent(cfg, profile=None, enable_workers=False)
-    out = bot.run("hello")
-    assert "模型调用失败" in out
-    snap = bot.health.snapshot()
-    entry = snap.get("solo:solo-m")
-    assert entry and _today() in entry["fail_dates"], "主失败也要记入健康档案"
-    # 未达连击阈值 → 不标 #、不隔离下一轮（再跑一轮仍是正常报错路径）
-    out2 = bot.run("hello again")
-    assert "模型调用失败" in out2
-    bot.close()

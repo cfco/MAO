@@ -4,7 +4,7 @@
 
 - **外部 AI 当主，MAO 只当执行器**：本项目通过 bridge 被外部智能体（千问办公 / WorkBuddy 等）驱动，驱动者即主智能体。MAO 不再自带"选主自己跑"的入口（chat / run / pipeline / web 已移除），只提供本机工具（手）与池内免费模型（子 AI）。
 - 主智能体（外部 AI）：拆解任务、派工、汇总、把关，通过 bridge 调用 MAO 的全部本地工具（shell / 文件 / MCP / Skill）。
-- 子智能体（工人）：池里的 API 模型，纯文本执行器，负责并行干子任务、提供第二意见、交叉验证（`ask` / `ask_many` / `ask_vote` / `run_pipeline`）。
+- 子智能体（工人）：池里的 API 模型，纯文本执行器，负责并行干子任务、提供第二意见、交叉验证（`ask` / `ask_many` / `ask_vote` / `run_review`）。
 
 ## 目录结构
 
@@ -16,18 +16,14 @@ MAO/
 │   ├── config.py           # 智能体池 AgentProfile + 协作配置
 │   ├── skills_manager.py   # Skill 机制
 │   ├── core/
-│   │   ├── agent.py        # 主智能体 Loop（支持注入主 profile + 工人工具）
 │   │   ├── llm.py          # LLM 适配层（OpenAI 兼容协议）
-│   │   ├── orchestrator.py # 工人池：ask / ask_many 并行派工 + ask_vote 投票验证
-│   │   ├── pipeline.py     # 固定流水线：起草→评审→修订择优
-│   │   ├── events.py       # 统一事件 schema（bridge / --stream 共用）
-│   │   └── session.py      # 会话与历史落盘
+│   │   ├── orchestrator.py # 工人池：ask / ask_many(结构化) 并行派工 + ask_vote 投票验证 + health 预检
+│   │   └── health.py       # ModelHealth：当日失败隔离档案（data/model_health.json）
 │   └── tools/
 │       ├── base.py         # 工具基类 + 注册表
 │       ├── builtin.py      # 内置工具（shell/文件）
 │       └── mcp_client.py   # MCP 接入层（stdio/HTTP）
 ├── skills/                 # 技能目录（example_hello 是示例）
-├── data/sessions/          # 会话历史
 ├── config.yaml             # 智能体池 / MCP / 工具配置
 └── docs/架构方案.md
 ```
@@ -67,7 +63,7 @@ MAO/
 
    > 本项目只保留 **bridge 一条使用路线**：外部 AI 当主智能体，通过 stdin/stdout 的
    > JSON 行协议借用 MAO 的"手"（run_shell / 文件 / MCP / Skill）与"子 AI"
-   > （`ask` / `ask_many` 并行派工、`ask_vote` 投票验证、`run_pipeline` 流水线）。
+   > （`ask` / `ask_many` 并行派工、`ask_vote` 投票验证、`run_review` 评审团）。
    > 原先的 chat / run / pipeline / web「MAO 自己选主跑」入口已移除。接入步骤见
    > [docs/外部主接入指南.md](docs/外部主接入指南.md)。
 
@@ -105,14 +101,11 @@ LLM_API_KEY=sk-同一个bynara-key  # 兜底单模型（池里节点全挂时用
 两层互为守卫，各管各的边界：`.env.example`（AI 可改、进 git）里的 `*_KEY` 行
 永远必须是空占位（有测试守着，真实 key 不会被误提交）；反过来 `.env` 里若混进
 非 key 变量（如复制了整份 `.env.example`），启动时按 `[配置分层提醒]` 点名警告
-（只报变量名、绝不回显值）——因为这些变量会盖住 `.env.example` 的模型清单更新
-和自动下线效果。模型健康下线只会改写 `.env.example` 的 `*_MODELS` 行，永不触碰
-任何 `*_KEY` 行。
+（只报变量名、绝不回显值）——因为这些变量会盖住 `.env.example` 的模型清单更新。
 
-模型会自动体检：某模型一次请求终态失败 → 当天不再派工给它；连续 7 个"运行日"
-（程序实际启动过的天，周末没开机不计入也不打断）都失败 →
-自动在 `.env.example` 对应模型前加 `#` 下线（stderr 会提示；删掉 `#` 即恢复）。
-阈值可调：`config.yaml` 的 `collaboration.retire_days`。
+模型会自动体检：某模型一次请求终态失败 → 当天不再派工给它（当日隔离，专治免费 API
+的限流/抖动），并计入连续失败冷却。已移除"连续多日失败自动改 `.env.example` 下线"——
+按需驱动下路由取舍交给外部主，可用 `health` 指令查各节点当前是否可用。
 
 **第 2 步：配池（编辑 `config.yaml` 的 `agents`）**
 
@@ -129,8 +122,6 @@ agents:
     tags: code,长上下文      # 可选：给外部主选路用的能力标签
 ```
 
-可选开关（`collaboration`）：`cache_size: 0` 关闭工人答案 LRU 缓存（外部主按需发话、prompt 很少逐字重复时，缓存命中率低，可关）；`retire_days: 0` 关闭"连续多日失败自动往 `.env.example` 加 `#` 下线"（只保留当日隔离，把节点好坏的判断权完全交给外部主）。
-
 **第 3 步：验证**
 
 ```
@@ -142,14 +133,14 @@ echo '{"cmd":"list_agents"}' | uv run mao bridge
 
 ## 多智能体协作（核心玩法）
 
-### swarm 模式（默认）
+外部主 AI 通过 bridge 指令直接调度池里的免费模型当"子 AI"，自己决定何时并行、何时验证：
 
-主智能体获得两个派工工具，自主决定何时协作：
+- `ask`：把子任务派给某个工人（纯文本执行，无本地工具）；
+- `ask_many`：同一任务并行派多个工人，结果按入参顺序返回，含每个工人的 `ok`/耗时/状态（结构化 `workers` + 文本 `results`），适合多方案对比、交叉验证；
+- `ask_vote`：两步投票取共识（先各出方案，再对编号投票）；
+- `run_review`：外部主给初稿，多个工人只当评审团挑错。
 
-- `ask_worker`：把独立子任务派给某个工人并行干；
-- `ask_workers`：同一关键问题同时派给多个工人，多方案对比、交叉验证、投票取共识。
-
-派工过程通过 bridge 的事件流实时回显给外部主（`worker_dispatch` / `worker_result` 逐工人冒进度、`worker_gather_cancelled` 标记用户提前采纳）。工人是纯文本执行器（不挂本地工具）：免费模型 function calling 支持参差不齐，这样最稳也最安全，本地工具权始终在主智能体手里。
+工人是纯文本执行器（不挂本地工具）：免费模型 function calling 参差不齐，这样最稳也最安全，本地工具权始终在主智能体（外部 AI）手里。
 
 ### 外部智能体驱动（谁启动谁当主）
 
@@ -176,12 +167,7 @@ stderr 也已在 bridge 启动时归一为 UTF-8：Windows 重定向流默认本
 | `{"cmd":"ask","agent":"glm-flash","prompt":"..."}` | 把池内模型当纯文本大脑用 |
 | `{"cmd":"ask_many","workers":["a","b"],"prompt":"..."}` | 同一任务并行派多个工人；返回 `workers`（结构化逐工人 ok/status/answer/elapsed_ms）+ `results`（文本） |
 | `{"cmd":"ask_vote","prompt":"...","threshold":0.5}` | 两步投票取共识 |
-| `{"cmd":"run_pipeline","task":"..."}` | 固定流水线：起草→评审→修订择优 |
 | `{"cmd":"run_review","draft":"...","context":"可选"}` | 外部主给初稿，子 AI 只当评审团挑错（返回结构化 `reviews`） |
-| `{"cmd":"new_session","session_id":"可选","tools":["白名单"]}` | 建持久会话（可做工具隔离） |
-| `{"cmd":"chat","message":"...","session_id":"..."}` | 用会话跑一轮，可续历史（会话内 MAO 起一个带工具的 Agent 自主跑，相当于把整轮外包给它） |
-| `{"cmd":"list_sessions"}` / `{"cmd":"session_tools","session_id":"..."}` | 查会话清单 / 某会话工具白名单 |
-| `{"cmd":"close_session","session_id":"..."}` | 关会话 |
 
 外部智能体自己的大脑在它那边；本项目给它"手"（工具/技能）和"工人"（池内模型）。
 
@@ -194,7 +180,7 @@ mcp_servers:
   - name: filesystem
     transport: stdio
     command: npx
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/Users/Administrator/Desktop"]
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "D:/work/demo-dir"]
   - name: remote
     transport: http
     url: https://mcp.example.com/mcp
