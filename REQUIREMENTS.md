@@ -34,7 +34,7 @@
 
 ### 2.3 bridge：外部智能体当主（一条内核，三种外壳）
 
-`python -m agent bridge`，stdin 每行一个 JSON 请求、stdout 每行一个 JSON 响应（UTF-8），启动即发 ready 事件。诊断/警告一律走 stderr，stdout 只放 JSON 行。为驱动者（外部主）提供：本地工具执行（`call_tool`）、Skill 加载与脚本（`load_skill`/`run_skill_script`）、池内模型当纯文本子 AI（`ask`/`ask_many` 结构化/`ask_vote`）、评审团（`run_review`）、可用性预检（`health`、`list_agents` 含能力标签）。
+`python -m agent bridge`，stdin 每行一个 JSON 请求、stdout 每行一个 JSON 响应（UTF-8），启动即发 ready 事件。诊断/警告一律走 stderr，stdout 只放 JSON 行。为驱动者（外部主）提供：本地工具执行（`call_tool`）、Skill 加载与脚本（`load_skill`/`run_skill_script`）、池内模型当纯文本子 AI（`ask`/`ask_many` 结构化/`ask_vote`）、评审团（`run_review`）、可用性预检（`health`、`list_agents` 含能力标签）。响应 `ok` 反映真实成败：`call_tool`/`ask` 失败即 `ok:false`，派工类失败带稳定 `status` 码（`ok|error|cooldown|quarantined|missing|timeout`，全内核统一、不翻译成中文），成败判断靠字段而非解析文本前缀。
 
 同一 `Bridge` 内核另有两种外壳，行为与逐字契约和裸协议一致（外壳只做参数拼装/透传，不复制业务逻辑）：
 
@@ -58,7 +58,7 @@ MAO 不再有内部 Agent 循环，也不再持久化会话——它是被外部
 | 畸形响应归一 | 中转站内容过滤会返回 `choices: []`：显式归类为可重试的服务端错误（原本是裸 `IndexError`，会绕过错误分类与重试编排一路冒到调用方）；模型给出空 content 且无工具调用时返回明确说明，不再静默输出空白答复 |
 | 并发隔离 | 线程池并行派工，单工人失败/超时以文本如实带回，不拖垮整体 |
 | 整体限时 | `ask_many`/`vote`/`collect` 用 `concurrent.futures.wait` 对收集阶段整体限时；限时**按规模自适应** = `ceil(参与人数 ÷ max_workers) × llm.timeout + 30s`（调用方显式传入 `timeout` 时以传入值为准）。原先固定 300s 在「池大 + 并发低」时必然截断尾部批次（25 名 / 3 并发 = 9 批，单工人耗时 >33s 即超标）。超时工人标记"未完成"放弃等待，后台线程按 LLM 超时自行收尾 |
-| 当日失败隔离 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**终态失败**（重试后仍败）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示）。档案按路径**进程内共享单实例**（`health.get_health()`）：多工人池/多调用方各持独立内存账本 + 全量覆写会互相抹记录（lost update）、且彼此看不到隔离结果，共享后当日隔离全进程一致。**文件 IO 全部在锁外**（锁内更新内存取快照、锁外原子写盘），避免记账持锁把 health 锁串到 pool 锁卡住派工。（历史"连续 N 运行日失败自动在 `.env.example` 加 `#` 下线"已移除。） |
+| 当日失败隔离 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**不可重试的终态失败**（认证失败、非重试类 4xx）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示，`status=quarantined`）；429/5xx/超时等**可重试瞬时失败**耗尽重试只进短时冷却（`status=cooldown`），不再拉黑全天——免费节点限流是常态，按旧规则一次 429 就报废整天的可用池。档案按路径**进程内共享单实例**（`health.get_health()`）：多工人池/多调用方各持独立内存账本 + 全量覆写会互相抹记录（lost update）、且彼此看不到隔离结果，共享后当日隔离全进程一致。**文件 IO 全部在锁外**（锁内更新内存取快照、锁外原子写盘），避免记账持锁把 health 锁串到 pool 锁卡住派工。（历史"连续 N 运行日失败自动在 `.env.example` 加 `#` 下线"已移除。） |
 
 ## 5. 工具与能力
 
