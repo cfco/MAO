@@ -141,5 +141,9 @@ def test_registry_reads_external_workspace(tmp_path):
     reg = builtin.build_builtin_tools(_FakeCfg([str(extra)]))
     assert "外部内容" in reg.execute("read_file", {"path": str(extra / "note.txt")})
     assert "note.txt" in reg.execute("list_dir", {"path": str(extra)})
-    # 越界路径必须仍被拒
-    assert "超出项目根目录" in reg.execute("read_file", {"path": "C:/Windows/win.ini"})
+    # 越界路径必须仍被拒。取样必须平台无关：不能写 "C:/Windows/win.ini" ——
+    # 那是 Windows 绝对路径，但在 POSIX 下是**相对**路径，会解析进项目根里
+    # 一个名为 "C:" 的目录，命中的是"文件不存在"而非越界拒绝（CI ubuntu 实测红灯）。
+    outside = tmp_path / "outside.txt"
+    outside.write_text("不可读", encoding="utf-8")
+    assert "超出项目根目录" in reg.execute("read_file", {"path": str(outside)})
