@@ -1,13 +1,15 @@
 """内置工具：执行命令、文件读写、目录浏览。
 
 安全边界：
-- 文件读写/目录浏览工具的活动范围严格限制在项目根目录（ROOT）内，
-  禁止通过 .. 或绝对路径穿越到根目录之外，防止会话级工具隔离被绕过。
+- 文件读写/目录浏览工具的活动范围限制在「允许的根目录」内 = MAO 项目根 +
+  config 的 `tools.workspace` 所列目录（默认为空 → 仅项目根，边界不变）。
+  禁止通过 .. 或绝对路径穿越到这些根之外，防止会话级工具隔离被绕过。
 - run_shell 有三层防护：命令黑名单拦截不可逆操作、shell 注入模式拦截、
   优先用参数模式（shell=False）避免命令拼接风险。
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
 import shutil
@@ -19,6 +21,13 @@ from ..config import ROOT, Config  # 统一从 config 拿 ROOT，避免多处重
 from .base import FunctionTool, ToolRegistry
 
 ROOT_RESOLVED = ROOT.resolve()  # 规范化后的根，用于越界比对
+
+# 允许工具访问的根目录集合。默认只有 MAO 项目根；build_builtin_tools 会按
+# config 的 tools.workspace 追加外部项目目录。
+# 为什么用模块级而不是逐工具传参：越界判定必须在同一处生效 —— 五个工具各传一份
+# 容易漏改某一个，留下越界口子。
+_WORKSPACE_ROOTS: tuple[Path, ...] = (ROOT_RESOLVED,)
+
 DEFAULT_READ_LIMIT = 2000
 MAX_READ_BYTES = 64 * 1024    # read_file 单次最多读 64KB，防超长单行/超大文件
 MAX_WRITE_BYTES = 1024 * 1024 # write_file / append_file 单次最多写 1MB，防误操作占满磁盘
@@ -305,21 +314,62 @@ def _decode(b: bytes) -> str:
     return b.decode("utf-8", errors="replace")
 
 
-def _resolve(p: str) -> Path | None:
-    """把用户给的路径解析为规范绝对路径；超出项目根目录返回 None。
+def set_workspace_roots(extra: list[str] | None = None) -> tuple[Path, ...]:
+    """设置允许访问的根目录 = MAO 项目根 + 配置里的额外工作区。
 
-    - 相对路径基于项目根 ROOT
-    - resolve() 会展开 .. 与符号链接，再从规范化路径比对父级，杜绝穿越
+    为什么需要：MAO 常被用来驱动**别的项目**（在 MAO 里分析/改造另一个仓库），
+    但工具层原先把路径硬绑在 MAO 自己的根上，主智能体连目标项目的文件都读不到 ——
+    "驱动外部项目"就成了一句空话。
+
+    相对路径基于 ROOT 解析；不存在或解析失败的条目直接跳过：配置写错不该让
+    所有工具一起失效。
+    """
+    global _WORKSPACE_ROOTS
+    roots: list[Path] = [ROOT_RESOLVED]
+    for item in extra or []:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            p = Path(text).expanduser()
+            p = p.resolve() if p.is_absolute() else (ROOT / p).resolve()
+        except (OSError, ValueError):
+            continue
+        if not p.is_dir():
+            continue
+        if p == p.parent or p == Path(p.anchor):
+            # 盘符根（C:\）或文件系统根（/）：一旦成为允许的工作区，越界防护等于
+            # 把整台机器交出去。anchor 判定跨平台稳妥（C:/ 的 anchor 是 C:\、
+            # / 的 anchor 是 / 自身），p==p.parent 作兜底。
+            print(f'[workspace] 拒绝把根目录设为工作区（会交出整机）: {p}')
+            continue
+        if p not in roots:
+            roots.append(p)
+    _WORKSPACE_ROOTS = tuple(roots)
+    return _WORKSPACE_ROOTS
+
+
+def _resolve(p: str) -> Path | None:
+    """把用户给的路径解析为规范绝对路径；不在任何允许根目录内则返回 None。
+
+    - 相对路径一律基于 MAO 项目根 ROOT（保持既有语义，避免含义漂移）
+    - resolve() 会展开 .. 与符号链接，再逐个允许根比对父级，杜绝穿越
+    - 允许的根 = ROOT + tools.workspace（默认只有 ROOT，不配即维持原安全边界）
     """
     if not isinstance(p, str) or not p.strip():
         return None
     try:
         path = Path(p).expanduser()
         abs_path = path.resolve() if path.is_absolute() else (ROOT / path).resolve()
-        abs_path.relative_to(ROOT_RESOLVED)
-        return abs_path
     except (ValueError, OSError):
         return None
+    for root in _WORKSPACE_ROOTS:
+        try:
+            abs_path.relative_to(root)
+            return abs_path
+        except ValueError:
+            continue
+    return None
 
 
 def _purge_old_backups() -> None:
@@ -348,8 +398,27 @@ def _backup_before_overwrite(path: Path) -> str | None:
             return None
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         _purge_old_backups()
-        # 相对路径里的分隔符换成 __，让留档名保留原始层级信息且仍是合法文件名
-        rel = path.relative_to(ROOT_RESOLVED).as_posix().replace("/", "__")
+        # 留档名 = 「根名前缀 + 相对路径」：分隔符换成 __ 保留层级且仍是合法文件名。
+        # 外部工作区必须加根名前缀，否则不同项目里的同名文件（README.md）会在
+        # data/backup/ 里互相覆盖，回滚时拿错版本。
+        rel = None
+        for root in _WORKSPACE_ROOTS:
+            try:
+                rel_path = path.relative_to(root)
+            except ValueError:
+                continue
+            if root == ROOT_RESOLVED:
+                prefix = ""
+            else:
+                # 前缀 =「根名 + 根路径短哈希」：两个不同目录若恰好同名
+                # （如 D:/a/project 与 C:/b/project 都叫 project），仅靠 root.name
+                # 会生成同名留档互相覆盖、回滚时拿错版本；加 6 位哈希确保唯一。
+                h = hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:6]
+                prefix = f"{root.name}_{h}__"
+            rel = prefix + rel_path.as_posix().replace("/", "__")
+            break
+        if rel is None:
+            return None
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
         dest = BACKUP_DIR / f"{rel}.{stamp}.bak"
         shutil.copy2(path, dest)
@@ -359,6 +428,7 @@ def _backup_before_overwrite(path: Path) -> str | None:
 
 
 def build_builtin_tools(cfg: Config) -> ToolRegistry:
+    set_workspace_roots(cfg.workspace)   # 允许访问的根：MAO 项目根 + tools.workspace
     registry = ToolRegistry()
     timeout = cfg.shell_timeout
 
@@ -497,7 +567,8 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         description=(
             "在本机执行 shell 命令（Windows cmd 语法，如 dir、type、python、pip）。"
             "适合系统操作、批量文件处理、调用本机程序。返回 stdout/stderr 与退出码。"
-            "注意：不要执行 rm/del/format 等危险或不可逆操作；工作目录被限制在项目根目录内。"
+            "注意：不要执行 rm/del/format 等危险或不可逆操作；"
+            "工作目录限制在允许的工作区内（默认项目根，可用 config 的 tools.workspace 扩展）。"
         ),
         input_schema={
             "type": "object",
@@ -515,7 +586,10 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         input_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "文件路径（相对路径基于项目根目录）"},
+                "path": {
+                    "type": "string",
+                    "description": "文件路径（相对路径基于项目根；也可访问 tools.workspace 配置的外部目录）",
+                },
                 "limit": {"type": "integer", "description": "最多读取行数，默认 2000"},
             },
             "required": ["path"],

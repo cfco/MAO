@@ -238,6 +238,23 @@ class Config:
             out = default
         return out if minimum is None else max(minimum, out)
 
+    @staticmethod
+    def as_list(value: Any, key: str, default: list) -> list:
+        """把配置值安全转成 list：非法值警告一次并回退默认值。
+
+        与 as_int / as_float 同源：配置写错类型不该让程序崩，只警告并回退
+        （本项目对配置的一贯态度是"不阻启动、只警告"）。
+        单个字符串按单元素列表处理，方便 `workspace: ../proj` 这种简写。
+        """
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            return [value] if value.strip() else list(default)
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        _warn_bad_value(key, value, default)
+        return list(default)
+
     @property
     def max_workers(self) -> int:
         return self.as_int(self.collab_cfg.get("max_workers", 3), "collaboration.max_workers", 3,
@@ -286,6 +303,24 @@ class Config:
         return self.as_int(
             self.tools_cfg.get("shell_timeout", 120), "tools.shell_timeout", 120, minimum=1
         )
+
+    @property
+    def workspace(self) -> list[str]:
+        """额外允许工具访问的工作区目录（tools.workspace）。
+
+        为什么需要：MAO 的定位是「谁启动谁当主」，但它经常被用来驱动**别的项目**
+        （在 MAO 里分析/改造另一个仓库）。工具层原先把所有路径硬绑在 MAO 自己的
+        项目根上，主智能体连目标项目的一个文件都读不到 —— "驱动外部项目"就成了空话。
+
+        安全默认：不配即空列表 = 仅限本项目根，原有安全边界完全不变。
+        相对路径基于项目根解析，绝对路径原样使用。
+
+        示例：
+          tools:
+            workspace: ["../other-proj", "D:/work/some-repo"]
+        """
+        raw = self.as_list(self.tools_cfg.get("workspace"), "tools.workspace", [])
+        return [s for s in (str(x).strip() for x in raw) if s]
 
 
 def _load_dotenv(path: Path) -> list[str]:

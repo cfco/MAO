@@ -57,7 +57,8 @@ MAO 不再有内部 Agent 循环，也不再持久化会话——它是被外部
 
 ## 5. 工具与能力
 
-- **内置工具**：`run_shell`（命令黑名单 + 注入模式拦截，优先 shell=False，cwd 限制在项目根内）、`read_file`（64KB 头部截断，不全量载入内存）、`write_file`/`append_file`（1MB 上限）、`list_dir`。文件工具路径 resolve 后必须落在项目根内，杜绝穿越。
+- **内置工具**：`run_shell`（命令黑名单 + 注入模式拦截，优先 shell=False，cwd 限制在允许的工作区内）、`read_file`（64KB 头部截断，不全量载入内存）、`write_file`/`append_file`（1MB 上限）、`list_dir`。文件工具路径 resolve 后必须落在**允许的根目录**内，杜绝穿越。
+- **工作区（`tools.workspace`）**：允许的根 = MAO 项目根 + 该配置列出的外部项目目录（默认空 → 仅项目根，原有安全边界不变）。为什么要有：MAO 的定位是"谁启动谁当主、驱动项目干活"，而它经常要驱动**别的项目**（在 MAO 里分析/改造另一个仓库）；工具层若只认自己的根，主智能体连目标项目的一个文件都读不到，"驱动外部项目"就成了空话。外部项目的覆盖写同样留档到 `data/backup/`，留档名带根名前缀，避免不同项目的同名文件互相覆盖。相对路径仍一律基于项目根解析，不做含义漂移。
   - **`write_file` 覆盖前自动留档**：目标文件已存在时先复制到 `data/backup/`（`<相对路径>.时间戳.bak`，30 天惰性清理，>1MB 不留档），返回文本里给出留档路径可回滚。工具调用是同步的、等不了人工确认，所以不引入交互式确认，改为"自动留一份 + 如实告知"——覆盖是不可逆操作，至少要可恢复。
   - **黑名单按「命令首词」匹配**：危险命令只有被当作命令执行时才拦（`format D:`、`del /f /q /s x`、`shutdown /r`），出现在参数位的同名词不拦（`ruff format .`、`make clean`、`git log --pretty=format:%H`）——早期按任意位置匹配会大面积误拦正常开发命令。匹配前先归一 `cmd /c`·`cmd /k` 包装、路径前缀、`.exe`/`.com` 后缀；并按 `&`/`|`/`;` 切段逐段查首词（`echo x & del /s y` 也拦）。PowerShell 侧拦 `-EncodedCommand` 及其合法缩写（`-e`/`-enc`/`-ec`），`-ExecutionPolicy` 不误伤。
   - **注入模式匹配前先屏蔽引号内容**：`echo "a|b|c"` 里的管道符是字面量、不是命令拼接，直接对整串匹配会误拦（而 `python -c "print(1|2)"` 又因规则要求两侧都有分隔符而放行 —— 同一类写法两种结果）。现在先把成对引号内的内容替换为等长占位符再匹配：`cmd1 && cmd2`、`a | b | c` 照拦，引号外的拼接（`echo "x" && del y`）也照拦。
@@ -85,7 +86,7 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 | `agents` | 智能体池，按"站"组织（一 Endpoint+Key 挂多 model）；`models` 逗号分隔，`#` 前缀临时屏蔽，`@128k` 标注上下文窗口，可选 `tags`（能力标签，供外部主选路）、`note` |
 | `llm` | 兜底单模型 + temperature / timeout / max_retries |
 | `collaboration` | max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails / cooldown_base / health_file |
-| `tools` | shell_timeout |
+| `tools` | shell_timeout / workspace（额外允许工具访问的项目目录，默认为空=仅本项目根） |
 | `mcp_servers` | MCP 接入列表 |
 
 **配置分层**（`load_config`）：`${VAR}` 的取值优先级为 **shell 环境变量 > `.env` > `.env.example`**。`.env.example` 不只是示例——它作为基础层在运行时真实加载，承载接口地址与模型清单（随仓库维护，`git pull` 即更新，且它的 mtime 参与配置缓存失效判断）；`.env` 是覆盖层，用户只需写几行 `KEY=...`。key 占位行留在 `.env.example` 供契约测试核对变量名，真实 key 只进 `.env`（保密约定不变：`.gitignore` 永不提交、AI 不读取内容）。

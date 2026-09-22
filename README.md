@@ -171,6 +171,31 @@ stderr 也已在 bridge 启动时归一为 UTF-8：Windows 重定向流默认本
 
 外部智能体自己的大脑在它那边；本项目给它"手"（工具/技能）和"工人"（池内模型）。
 
+## 用 MAO 驱动别的项目（工作区）
+
+MAO 默认只能读写**自己的**项目根。要让它去分析/改造**另一个仓库**，在 `config.yaml` 里登记那个目录：
+
+```yaml
+tools:
+  workspace:
+    - ../other-proj           # 相对路径基于 MAO 项目根
+    - D:/work/other-proj      # 绝对路径也行
+```
+
+配好之后主智能体就能读目标项目的文件，也能把 `run_shell` 的工作目录指过去。外部驱动方（如 WorkBuddy）通过 bridge 调用时同样生效：
+
+```json
+{"cmd":"call_tool","name":"read_file","args":{"path":"D:/work/other-proj/README.md"}}
+{"cmd":"call_tool","name":"run_shell","args":{"command":"python -m pytest -q","cwd":"D:/work/other-proj"}}
+```
+
+要点：
+
+- **默认为空 = 仍然只能碰项目根**，安全边界不变；配了就等于把那些目录的读写权一并交给主智能体，只加自己信任的项目。
+- 覆盖外部项目已有文件时，原文件会自动留档到 `data/backup/`，留档名带根名前缀 —— 不同项目的同名文件（如两个仓库都有 `README.md`）不会在留档目录里互相覆盖。
+- 相对路径**仍然**一律基于 MAO 项目根解析，加工作区不会改变相对路径的含义。
+- 在允许根之外的路径（例如 `C:/Windows/win.ini`）依旧被拒绝，越界防护没有因为这项放宽而消失。
+
 ## 接入 MCP
 
 `config.yaml` 的 `mcp_servers` 加一段即可，启动时自动连接、发现工具，工具名格式 `mcp__<server>__<工具>`：
