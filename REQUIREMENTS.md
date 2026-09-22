@@ -32,9 +32,14 @@
 
 （历史上的 LRU 答案缓存、并发在飞去重、`run_pipeline` 固定流水线、内部 Agent 自主派工 loop 均已随「单一 bridge 路线」简化移除：外部主按需发话、命中率极低，且弱模型驱动多步工具循环不可靠。）
 
-### 2.3 bridge：外部智能体当主
+### 2.3 bridge：外部智能体当主（一条内核，三种外壳）
 
 `python -m agent bridge`，stdin 每行一个 JSON 请求、stdout 每行一个 JSON 响应（UTF-8），启动即发 ready 事件。诊断/警告一律走 stderr，stdout 只放 JSON 行。为驱动者（外部主）提供：本地工具执行（`call_tool`）、Skill 加载与脚本（`load_skill`/`run_skill_script`）、池内模型当纯文本子 AI（`ask`/`ask_many` 结构化/`ask_vote`）、评审团（`run_review`）、可用性预检（`health`、`list_agents` 含能力标签）。
+
+同一 `Bridge` 内核另有两种外壳，行为与逐字契约和裸协议一致（外壳只做参数拼装/透传，不复制业务逻辑）：
+
+- **`python -m agent mcp`（MCP server，stdio）**：把 11 条指令逐一映射为 MCP 工具（`mcp>=2` 官方 SDK 的 `MCPServer`），支持 MCP client 的宿主（Claude Desktop / Cursor / Qoder 等）只需在其配置里加一段 `{"command": "uv", "args": ["run", "mao", "mcp"], "cwd": "<项目根>"}` 即接入，免写子进程驱动代码。
+- **`python -m agent call <指令> [JSON]`（one-shot）**：单发一条指令、stdout 打印一行 JSON 响应即退出，供脚本/技能包在"每次调用都是新进程"的宿主里使用；JSON 参数可作位置参数或从 stdin 读一行（位置参数里的 `cmd` 优先）。退出码：0=ok:true，1=指令失败（ok:false），2=参数 JSON 坏。注意每次调用都付进程冷启动成本（配置加载；配了 `mcp_servers` 时还含 MCP 首连），高频场景仍应用长驻的 bridge/mcp 外壳。
 
 ## 3. 运行模型（MAO 侧无状态）
 

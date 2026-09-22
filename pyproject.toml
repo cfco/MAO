@@ -9,7 +9,7 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.30.0",
-    "mcp>=1.2.0",
+    "mcp>=2.0,<3",   # server 端用到 2.x 的 MCPServer（原 FastMCP）；1.x 无此 API
     "PyYAML>=6.0",
 ]
 

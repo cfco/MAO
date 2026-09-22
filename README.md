@@ -61,18 +61,20 @@ MAO/
    uv run mao bridge     # 外部智能体驱动模式（谁启动驱动，谁当主智能体）
    ```
 
-   > 本项目只保留 **bridge 一条使用路线**：外部 AI 当主智能体，通过 stdin/stdout 的
-   > JSON 行协议借用 MAO 的"手"（run_shell / 文件 / MCP / Skill）与"子 AI"
-   > （`ask` / `ask_many` 并行派工、`ask_vote` 投票验证、`run_review` 评审团）。
-   > 原先的 chat / run / pipeline / web「MAO 自己选主跑」入口已移除。接入步骤见
+   > 本项目只保留 **bridge 一条使用内核**（外加两个壳）：外部 AI 当主智能体，借用 MAO
+   > 的"手"（run_shell / 文件 / MCP / Skill）与"子 AI"（`ask` / `ask_many` 并行派工、
+   > `ask_vote` 投票验证、`run_review` 评审团）。接入按省事程度依次是
+   > **MCP（`mao mcp`，宿主填一段配置即用）**、**one-shot（`mao call`，脚本一行命令）**、
+   > **裸协议（`mao bridge`，自管子进程逐行 JSON）**。原先的 chat / run / pipeline / web
+   > 「MAO 自己选主跑」入口已移除。接入步骤见
    > [docs/外部主接入指南.md](docs/外部主接入指南.md)。
 
 ### 使用 pip（备选）
 
-1. 安装依赖（Python 3.10+）：
+1. 安装依赖（Python 3.10+，依赖清单以 `pyproject.toml` 为准）：
 
    ```
-   pip install -r requirements.txt
+   pip install .
    ```
 
 2. 运行：
@@ -142,9 +144,38 @@ echo '{"cmd":"list_agents"}' | uv run mao bridge
 
 工人是纯文本执行器（不挂本地工具）：免费模型 function calling 参差不齐，这样最稳也最安全，本地工具权始终在主智能体（外部 AI）手里。
 
-### 外部智能体驱动（谁启动谁当主）
+### 外部智能体驱动（谁启动谁当主）：一条内核，三种外壳
 
-任何能起子进程、能读写文本行的智能体都能当主：
+任何能起子进程、能读写文本行的智能体都能当主。`bridge` 是唯一内核（11 条无状态指令，
+下表），外面有两种更省事的壳：
+
+| 接入方式 | 适合谁 | 上手成本 |
+|---|---|---|
+| **`uv run mao mcp`（推荐）** | Claude Desktop / Cursor / Qoder 等支持 MCP 的宿主 | 宿主配置加一段，工具自动发现，协议零感知 |
+| **`uv run mao call <指令> '<JSON>'`** | 只有 shell/技能机制、每次调用起新进程的宿主（脚本、SKILL.md） | 一行命令拿一行 JSON，退出码表成败 |
+| **`uv run mao bridge`（裸协议）** | 要长驻、批量、自己管进出的深度集成驱动方 | 自写子进程驱动（逐行 JSON） |
+
+**MCP 接入**（宿主配置里加一段即可，11 条指令逐一映射为 MCP 工具）：
+
+```json
+{
+  "mcpServers": {
+    "mao": { "command": "uv", "args": ["run", "mao", "mcp"], "cwd": "D:/path/to/MAO" }
+  }
+}
+```
+
+**one-shot 接入**（脚本里最省事的一条；JSON 也可从 stdin 读）：
+
+```
+uv run mao call health
+uv run mao call ask '{"agent":"glm-flash","prompt":"总结一下这个仓库的结构"}'
+uv run mao call call_tool '{"name":"run_shell","args":{"command":"git status --short"}}'
+```
+
+退出码：0=成功，1=指令失败（响应里带 error），2=参数 JSON 坏。
+
+**bridge 裸协议**：
 
 ```
 python -m agent bridge
