@@ -65,9 +65,11 @@ class WorkerPool:
         self._env_of = {n: p.models_env for n, p in self.profiles.items()}
         # 工人回答 LRU 缓存：同(工人,任务,角色)不重复调用，省额度和时延。
         # 只缓存成功回答，失败结果不缓存（便于下次重试）。
+        # cache_size=0 → 关闭缓存（外部主按需发话、prompt 几乎不逐字重复时，命中率
+        # 极低，关掉省去内存与"陈旧答案被复用"的心智负担）。
         self._cache: OrderedDict[tuple, str] = OrderedDict()
         self._cache_size = self.cfg.as_int(
-            self.cfg.collab_cfg.get("cache_size", 32), "collaboration.cache_size", 32, minimum=1
+            self.cfg.collab_cfg.get("cache_size", 32), "collaboration.cache_size", 32, minimum=0
         )
         # 节点健康：连续失败达阈值进入冷却，冷却期内跳过该节点。
         # 冷却时长指数上升，成功即清零。
@@ -122,10 +124,32 @@ class WorkerPool:
         # 当日隔离直接标注在清单里：主智能体选工人时就避开，不用挨个撞错误提示
         return "\n".join(
             f"- {p.name}: model={p.model}"
+            + (f" tags={p.tags}" if getattr(p, "tags", "") else "")
             + ("（今日调用已失败，当天隔离中，勿派工）" if self.health.quarantined(p.name) else "")
             + (f"（{p.note}）" if p.note else "")
             for p in self.profiles.values()
         )
+
+    def health_status(self) -> list[dict]:
+        """每个工人的当前可用性快照，供外部主派工前预检（配合能力标签选路）。
+
+        available=False 表示当前不可派：冷却中（cooldown_s 剩余秒）或当日失败隔离。
+        缓存命中不受此限（ask 里先查缓存），这里只是给主的"该不该派"参考。
+        """
+        now = time.time()
+        out: list[dict] = []
+        for name, p in self.profiles.items():
+            with self._lock:
+                until = self._cooldowns.get(name, 0.0)
+            quarantined = self.health.quarantined(name)
+            out.append({
+                "worker": name, "model": p.model,
+                "tags": getattr(p, "tags", ""),
+                "available": until <= now and not quarantined,
+                "cooldown_s": round(max(0.0, until - now), 1),
+                "quarantined_today": quarantined,
+            })
+        return out
 
     def _is_in_cooldown(self, name: str) -> bool:
         """该节点是否处于冷却期（冷却期跳过，避免反复打一个坏节点）。"""
@@ -283,7 +307,7 @@ class WorkerPool:
             # 又各自成为新发起者重复打网络，去重机制在最需要它的挂死场景下正好失效。
             if self._inflight.get(key) is fut:
                 self._inflight.pop(key, None)
-            if out and not self._is_error(out):
+            if out and not self._is_error(out) and self._cache_size > 0:
                 self._cache[key] = out
                 while len(self._cache) > self._cache_size:
                     self._cache.popitem(last=False)  # 淘汰最久未用
@@ -465,50 +489,37 @@ class WorkerPool:
         )
         return [(w, got[w]) for w in valid if got.get(w) and not self._is_error(got[w])]
 
-    def ask_many(
-        self, workers: list[str], prompt: str, system: str | None = None,
-        timeout: float | None = None, emit=None, cancel_event=None,
-    ) -> str:
-        """同一子任务并行派给多个工人，收集全部回答（失败也如实带回）。
+    def _gather_many(
+        self, workers: list[str], prompt: str, system: str | None,
+        timeout: float | None, emit, cancel_event,
+    ) -> dict:
+        """并行派工的收集核心：ask_many（文本）与 ask_many_structured（结构化）共用。
 
-        输出按入参工人顺序排列（确定性）；timeout 对收集阶段整体限时，缺省按
-        参与人数与并发上限自适应（见 _effective_timeout），不用固定值——池大时
-        固定值必然截断尾部批次。超时工人以「未完成」如实带回，不无限等待。
-
-        冷却/当日隔离的工人**不在入口预过滤**，交给 ask 内部判定：
-        它们返回"跳过"提示并如实带回分节（原因不变），而**已缓存答案的工人
-        仍能命中缓存**——预过滤会让缓存命中一起被剔掉，与"缓存命中不受冷却影响"
-        的契约冲突。
-
-        emit(event_dict) / cancel_event(threading.Event) 是给 ask_workers 工具用的
-        实时反馈通路（不影响 collect/vote/流水线）：
-        - 派工开始冒 `{"type":"worker_dispatch", workers/total/prompt}`；
-        - 每有一个工人回来冒 `{"type":"worker_result", worker/index/total/elapsed_ms/ok/answer}`，
-          快的工人先亮出来，用户不必等最慢的那个；
-        - cancel_event 置位则停止继续等待，把已完成的部分作为工具返回交给主 LLM 继续，
-          未完成者以「用户提前结束派工」如实标注，并冒 `worker_gather_cancelled`；
-        - 两者都为 None 时退化成纯栅栏调用（bridge ask_many、单测等走这条）。
-        事件只走 emit（不落盘、不改工具返回契约给主 LLM 的仍是完整文本），
-        emit 内部异常吞掉，绝不拖垮派工。
+        返回 {valid, got, cancelled, completed, skipped, elapsed, limit}。
+        got[worker] 为 None 表示未完成（超时/被取消放弃等待）；否则是 ask 的返回文本
+        （成功答案或以「错误：/失败：」开头的说明）。elapsed[worker] 为该工人从派工到
+        回来的毫秒数（没回来的没有）。emit / cancel_event 语义同 ask_many（仅工具路径用）。
         """
         valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
         if not valid:
-            return f"错误：没有可用的子智能体。可用：{', '.join(self.profiles) or '无'}"
+            return {"valid": [], "got": {}, "cancelled": False, "completed": [],
+                    "skipped": [], "elapsed": {}, "limit": 0.0}
         limit = self._effective_timeout(len(valid), timeout)
         t0 = time.monotonic()
         completed: list[str] = []
+        elapsed: dict[str, int] = {}
 
         def _on_done(w: str, res: str | None) -> None:
+            completed.append(w)
+            elapsed[w] = int((time.monotonic() - t0) * 1000)
             if emit is None:
                 return
             ok = res is not None and not self._is_error(res)
-            completed.append(w)
             try:
                 emit({
                     "type": "worker_result", "worker": w,
                     "index": len(completed), "total": len(valid),
-                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
-                    "ok": ok, "answer": res or "",
+                    "elapsed_ms": elapsed[w], "ok": ok, "answer": res or "",
                 })
             except Exception:  # noqa: BLE001 - 事件冒泡失败不能影响派工
                 pass
@@ -528,6 +539,34 @@ class WorkerPool:
                       "completed": list(completed), "skipped": skipped})
             except Exception:  # noqa: BLE001
                 pass
+        return {"valid": valid, "got": got, "cancelled": cancelled, "completed": completed,
+                "skipped": skipped, "elapsed": elapsed, "limit": limit}
+
+    def ask_many(
+        self, workers: list[str], prompt: str, system: str | None = None,
+        timeout: float | None = None, emit=None, cancel_event=None,
+    ) -> str:
+        """同一子任务并行派给多个工人，收集全部回答（失败也如实带回）。
+
+        输出按入参工人顺序排列（确定性）；timeout 对收集阶段整体限时，缺省按
+        参与人数与并发上限自适应（见 _effective_timeout），不用固定值——池大时
+        固定值必然截断尾部批次。超时工人以「未完成」如实带回，不无限等待。
+
+        冷却/当日隔离的工人**不在入口预过滤**，交给 ask 内部判定：
+        它们返回"跳过"提示并如实带回分节（原因不变），而**已缓存答案的工人
+        仍能命中缓存**——预过滤会让缓存命中一起被剔掉，与"缓存命中不受冷却影响"
+        的契约冲突。
+
+        emit(event_dict) / cancel_event(threading.Event) 是给 ask_workers 工具用的
+        实时反馈通路（不影响 collect/vote/流水线），详见 _gather_many。给主 LLM 的
+        始终是完整文本；要程序化消费请用 ask_many_structured。
+        """
+        r = self._gather_many(workers, prompt, system, timeout, emit, cancel_event)
+        valid = r["valid"]
+        if not valid:
+            return f"错误：没有可用的子智能体。可用：{', '.join(self.profiles) or '无'}"
+        got, cancelled, completed, skipped, limit = (
+            r["got"], r["cancelled"], r["completed"], r["skipped"], r["limit"])
         blocks: list[str] = []
         if cancelled:
             blocks.append(
@@ -550,6 +589,40 @@ class WorkerPool:
                     out = f"错误：工人{kind}，本轮跳过"
             blocks.append(f"### 工人 {w} 的结果\n{out}")
         return "\n\n".join(blocks)
+
+    def ask_many_structured(
+        self, workers: list[str], prompt: str, system: str | None = None,
+        timeout: float | None = None, emit=None, cancel_event=None,
+    ) -> list[dict]:
+        """并行派工的结构化结果（外部主程序化消费，替代 Markdown 大块文本）。
+
+        返回按入参顺序的 list[dict]，每项：
+          {worker, ok(bool), status, answer(str), elapsed_ms(int|None)}
+        status ∈ {"ok","error","冷却中","当日失败隔离","timeout","cancelled"}：
+          - ok=True 时 status="ok"、answer 为工人回答；
+          - 跳过类取 ask 里已带的分类（冷却中/当日失败隔离），失败为 "error"；
+          - 未完成按是否被取消给 "cancelled"/"timeout"（answer 置空）。
+        与 ask_many 共用 _gather_many，emit/cancel_event 语义一致。
+        """
+        r = self._gather_many(workers, prompt, system, timeout, emit, cancel_event)
+        got, cancelled, elapsed = r["got"], r["cancelled"], r["elapsed"]
+        out: list[dict] = []
+        for w in r["valid"]:
+            res = got.get(w)
+            if res is None:
+                out.append({"worker": w, "ok": False,
+                            "status": "cancelled" if cancelled else "timeout",
+                            "answer": "", "elapsed_ms": elapsed.get(w)})
+                continue
+            kind = self._skip_kind(res)
+            ok = not self._is_error(res)
+            out.append({
+                "worker": w, "ok": ok,
+                "status": kind or ("ok" if ok else "error"),
+                "answer": res if ok else "",
+                "elapsed_ms": elapsed.get(w),
+            })
+        return out
 
     # ---------- 两步投票（M5：多人投票取共识） ----------
 

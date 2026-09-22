@@ -10,10 +10,10 @@
 
 | 角色 | 说明 |
 |---|---|
-| 主智能体（Master） | 拆解任务、派工、汇总、把关，掌握全部本地工具（shell/文件/MCP/Skill/派工工具）。可以是池内任一 API 模型，也可以是驱动本项目的**外部智能体**（bridge 模式：谁启动驱动，谁当主） |
+| 主智能体（Master） | 拆解任务、派工、汇总、把关，掌握全部本地工具（shell/文件/MCP/Skill/派工工具）。统一由**驱动本项目的智能体**担任（bridge 模式：谁启动驱动，谁当主）；MAO 自身不再"选池内模型当主"（chat/run/pipeline/web 入口已移除） |
 | 工人（Worker） | 智能体池里除主之外的成员，**纯文本执行器**（不挂本地工具）。免费模型 function calling 参差不齐，纯文本最稳最安全；本地工具权始终在主手里 |
 
-只有 CLI/Web 等非智能体入口启动时，才需要从池里选一个当主（`--orchestrator` 或交互选择）；池为空时用 `llm:` 段兜底单模型跑 solo。
+主智能体一律由驱动方（外部 AI）担任，MAO 不再从池里"选主"。池里的模型全部作为子 AI/工人被调用；`ask`/`ask_many`/`ask_vote`/`run_pipeline` 是无状态直连工人，只有 `new_session`/`chat` 才在 MAO 内起一个带工具的会话 Agent。
 
 ## 2. 协作模式
 
@@ -45,7 +45,7 @@
 
 ### 2.3 bridge：外部智能体当主
 
-`python -m agent bridge`，stdin/stdout 各一行 JSON（UTF-8），启动即发 ready 事件。为驱动者提供：本地工具执行、Skill 加载与脚本执行、池内模型当纯文本工人（`ask`/`ask_many`/`ask_vote`）、完整任务执行（`run_task`）、固定流水线（`run_pipeline`）、持久会话（`new_session`/`chat`/`list_sessions`/`session_tools`/`close_session`，支持工具白名单隔离）。
+`python -m agent bridge`，stdin/stdout 各一行 JSON（UTF-8），启动即发 ready 事件。为驱动者提供：本地工具执行、Skill 加载与脚本执行、池内模型当纯文本工人（`ask`/`ask_many`（结构化逐工人结果）/`ask_vote`）、可用性预检（`health`：冷却/当日隔离/能力标签）、评审团模式（`run_review`：外部主给初稿、子 AI 只挑错）、固定流水线（`run_pipeline`）、持久会话（`new_session`/`chat`/`list_sessions`/`session_tools`/`close_session`，支持工具白名单隔离）。
 
 ## 3. 主循环与上下文
 
@@ -64,7 +64,7 @@
 | 畸形响应归一 | 中转站内容过滤会返回 `choices: []`：显式归类为可重试的服务端错误（原本是裸 `IndexError`，会绕过错误分类与重试编排一路冒到调用方）；模型给出空 content 且无工具调用时返回明确说明，不再静默输出空白答复 |
 | 并发隔离 | 线程池并行派工，单工人失败/超时以文本如实带回，不拖垮整体 |
 | 整体限时 | `ask_many`/`vote`/`collect` 用 `concurrent.futures.wait` 对收集阶段整体限时；限时**按规模自适应** = `ceil(参与人数 ÷ max_workers) × llm.timeout + 30s`（调用方显式传入 `timeout` 时以传入值为准）。原先固定 300s 在「池大 + 并发低」时必然截断尾部批次（25 名 / 3 并发 = 9 批，单工人耗时 >33s 即超标）。超时工人标记"未完成"放弃等待，后台线程按 LLM 超时自行收尾 |
-| 当日失败隔离 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**终态失败**（重试后仍败）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示）；已缓存的回答不受影响（命中零成本）；主智能体失败同样记档，但**不**据此拦截主——主是用户明确选的，只计连击。档案按路径**进程内共享单实例**（`health.get_health()`）：WorkerPool 是"每个 Agent（=Web 每个会话）一份"，各持独立内存账本 + 全量覆写 `_persist` 会互相抹记录（lost update）、且彼此看不到隔离结果，当日隔离在多会话下等于没做。直接 `ModelHealth(...)` 仍返回独立实例（保留"新实例=模拟新进程重读盘"的可测性）。**文件 IO 全部在锁外**：锁内只更新内存并取一份快照（`_snapshot_locked()`），写盘交给锁外的 `_write_payload()`（自带写盘锁串行化、失败清临时文件）。`quarantined()` 是派工热路径，而 `WorkerPool.ask` 又是在自己的锁内调它 —— 记账若持锁做 IO，阻塞会从 health 锁串到 pool 锁、卡住全进程派工（实测读侧最大等待 19.89ms → 移出后 0.08~0.28ms） |
+| 当日失败隔离 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**终态失败**（重试后仍败）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示）；已缓存的回答不受影响（命中零成本）；主智能体失败同样记档，但**不**据此拦截主——主是用户明确选的，只计连击。档案按路径**进程内共享单实例**（`health.get_health()`）：WorkerPool 是"每个 Agent（=bridge 每个会话）一份"，各持独立内存账本 + 全量覆写 `_persist` 会互相抹记录（lost update）、且彼此看不到隔离结果，当日隔离在多会话下等于没做。直接 `ModelHealth(...)` 仍返回独立实例（保留"新实例=模拟新进程重读盘"的可测性）。**文件 IO 全部在锁外**：锁内只更新内存并取一份快照（`_snapshot_locked()`），写盘交给锁外的 `_write_payload()`（自带写盘锁串行化、失败清临时文件）。`quarantined()` 是派工热路径，而 `WorkerPool.ask` 又是在自己的锁内调它 —— 记账若持锁做 IO，阻塞会从 health 锁串到 pool 锁、卡住全进程派工（实测读侧最大等待 19.89ms → 移出后 0.08~0.28ms） |
 | 连续失败自动下线 | 取最近 `collaboration.retire_days`（默认 7）个**运行日**（程序实际启动过的天，记录在档案 `active_dates`；周末没开机既不计入也不打断连击），若该模型每个运行日都失败过 ⇒ 自动在 `.env.example` 对应 `*_MODELS` 行给该模型条目加 `#`（多站共用同模型一起下线），stderr 提示；档案记 `disabled` 防每日重复改写。运行日样本不足 retire_days 个时不判定（新装程序不会当天下线模型）。恢复是人工决策：删掉 `#` 即重新上线。`LLM_MODEL` 兜底行不自动动（注释掉会让 solo 路径直接失效），找不到条目时如实提示人工确认 |
 
 ## 5. 工具与能力
@@ -73,35 +73,31 @@
   - **`write_file` 覆盖前自动留档**：目标文件已存在时先复制到 `data/backup/`（`<相对路径>.时间戳.bak`，30 天惰性清理，>1MB 不留档），返回文本里给出留档路径可回滚。工具调用是同步的、等不了人工确认，所以不引入交互式确认，改为"自动留一份 + 如实告知"——覆盖是不可逆操作，至少要可恢复。
   - **黑名单按「命令首词」匹配**：危险命令只有被当作命令执行时才拦（`format D:`、`del /f /q /s x`、`shutdown /r`），出现在参数位的同名词不拦（`ruff format .`、`make clean`、`git log --pretty=format:%H`）——早期按任意位置匹配会大面积误拦正常开发命令。匹配前先归一 `cmd /c`·`cmd /k` 包装、路径前缀、`.exe`/`.com` 后缀；并按 `&`/`|`/`;` 切段逐段查首词（`echo x & del /s y` 也拦）。PowerShell 侧拦 `-EncodedCommand` 及其合法缩写（`-e`/`-enc`/`-ec`），`-ExecutionPolicy` 不误伤。
   - **注入模式匹配前先屏蔽引号内容**：`echo "a|b|c"` 里的管道符是字面量、不是命令拼接，直接对整串匹配会误拦（而 `python -c "print(1|2)"` 又因规则要求两侧都有分隔符而放行 —— 同一类写法两种结果）。现在先把成对引号内的内容替换为等长占位符再匹配：`cmd1 && cmd2`、`a | b | c` 照拦，引号外的拼接（`echo "x" && del y`）也照拦。
-- **MCP**：config.yaml `mcp_servers` 声明，stdio/HTTP 双传输；后台线程保长连接，**断线自动重连**（调用失败会停掉事件循环触发退避重连路径；曾连上后重连失败按退避持续重试，不是一次失败即永久放弃；首连失败仍快速失败上报）。单次连接尝试失败时逆序回滚已进入的 transport/session，防 stdio 子进程句柄泄漏。工具名 `mcp__<server>__<tool>`。**连接按配置进程内共享**（`mcp_client.acquire_group`，签名 = `mcp_servers` 内容）：Web 每个会话一个 Agent，各自连一套会为同一批 server 反复拉起子进程、反复等最长 90s 的首连；共享后同进程只维护一套连接，会话只把自己的注册表挂上去（`McpTool` 无状态可跨会话复用），**引用计数**保证最后一个使用者 `close()` 时才真正断开。
+- **MCP**：config.yaml `mcp_servers` 声明，stdio/HTTP 双传输；后台线程保长连接，**断线自动重连**（调用失败会停掉事件循环触发退避重连路径；曾连上后重连失败按退避持续重试，不是一次失败即永久放弃；首连失败仍快速失败上报）。单次连接尝试失败时逆序回滚已进入的 transport/session，防 stdio 子进程句柄泄漏。工具名 `mcp__<server>__<tool>`。**连接按配置进程内共享**（`mcp_client.acquire_group`，签名 = `mcp_servers` 内容）：bridge 每个会话一个 Agent，各自连一套会为同一批 server 反复拉起子进程、反复等最长 90s 的首连；共享后同进程只维护一套连接，会话只把自己的注册表挂上去（`McpTool` 无状态可跨会话复用），**引用计数**保证最后一个使用者 `close()` 时才真正断开。
 - **Skill**：`skills/<名>/SKILL.md`（frontmatter name+description），启动只注入清单省上下文，`load_skill` 按需读全文，`execute_skill_script` 跑脚本。脚本入参只接受 `scripts/` 下的裸 `.py` 文件名（拒路径分隔符/盘符/`..`），并在 resolve 后二次确认落点仍在技能目录内。
 - **会话级工具白名单**：`allow_tools` 裁剪注册表（bridge `new_session` 可传），实现多会话权限隔离。
 
 ## 6. 会话持久化
 
 - JSONL 追加写（`data/sessions/<id>.jsonl`），限流落盘：`session.flush_batch`(16) 条或 `session.flush_interval`(2.0s) 触发，`Agent.close()` 兜底 flush；CLI 参数 `--session-flush-batch/interval` 经环境变量 `MAO_SESSION_FLUSH_*` 覆盖。
-- **会话 id 白名单校验**：`sanitize_session_id` 只允许字母/数字/`.`/`_`/`-`，长度 1-64，显式拒绝 `..`、路径分隔符与盘符。Web `/api/chat`、bridge `new_session` 在边界发现非法 id 直接报错（不静默改写，否则调用方手里的 id 与落盘名不一致）；`Session.__init__` 再兜底，非法值绝不拿来做文件名——否则 `session_id="../../x"` 会把 JSONL 写到 `data/sessions` 之外。
+- **会话 id 白名单校验**：`sanitize_session_id` 只允许字母/数字/`.`/`_`/`-`，长度 1-64，显式拒绝 `..`、路径分隔符与盘符。bridge `new_session`/`chat` 在边界发现非法 id 直接报错（不静默改写，否则调用方手里的 id 与落盘名不一致）；`Session.__init__` 再兜底，非法值绝不拿来做文件名——否则 `session_id="../../x"` 会把 JSONL 写到 `data/sessions` 之外。
 - **默认会话 id 防碰撞**：未指定 id 时用 `_default_session_id()` = 秒级时间戳 + 4 位随机后缀。只用时间戳会同秒碰撞（实测同秒三次构造拿到同一文件，历史互相穿插、cleanup 按文件误删多会话），随机后缀把同秒碰撞概率压到 16⁻⁴。
-- 删除走隔离区：`Session.cleanup()` 保留最近 30 个，多余移入 `data/trash/`（7 天后物理删除），CLI/Web/bridge 启动各清一次。
+- 删除走隔离区：`Session.cleanup()` 保留最近 30 个，多余移入 `data/trash/`（7 天后物理删除），bridge 启动时清一次。
 - 设计选择：会话只持久化 user/assistant 文本，tool_calls/tool 中间消息不落盘（省盘省 token，过程可经事件流观测）。
 
-## 7. 入口与界面
+## 7. 入口
+
+只保留 **bridge 一条使用路线**：外部 AI（千问办公 / WorkBuddy 等）当主智能体，通过 `python -m agent bridge` 的 stdin/stdout JSON 行协议驱动 MAO。原先「MAO 自己选主跑」的 chat / run / pipeline / web 四个入口已移除。
 
 | 入口 | 命令 | 说明 |
 |---|---|---|
-| CLI 对话 | `uv run mao chat [--orchestrator 名] [--solo]` | 交互选主；`/new` 开新会话时**沿用当前主智能体**（原先走 `interactive=False` 会退回池内第一个，用户交互选过的主被悄悄换掉且没有任何提示） |
-| 单次任务 | `uv run mao run "任务" [--stream]` | --stream 输出统一事件 JSON 行 |
-| 固定流水线 | `uv run mao pipeline "任务" [--draft a,b --review c --revise d]` | 不选主，直接调度工人 |
-| Web | `uv run mao web` | FastAPI + SSE 流式，顶栏切换主智能体（localStorage 记忆，**切换即丢弃当前会话、下一条消息开新会话**；同一 session_id 换主时后端也会丢弃旧 Agent 按新主重建），会话空闲 30 分钟自动清理，上限 50 会话；会话创建（含 MCP 连接）在全局锁外执行，不阻塞其它请求。清理线程随 lifespan 启停，进入时**复位停止信号**（`_stop_event.clear()`）——它原是模块级全局，退出时 set 后不复位会让二次进入（uvicorn `--reload`、测试二次 with）新建的清理线程创建即退出，会话超时清理永久失效。收尾时三张会话表（`_agents`/`_last_active`/`_session_orch`）**一起清空**，不留孤儿条目 |
-| bridge | `uv run mao bridge` | 外部智能体驱动模式 |
+| bridge | `uv run mao bridge` | 外部智能体驱动模式（谁启动驱动，谁当主）。提供本地工具执行、Skill 加载与脚本、池内模型派工（`ask` / `ask_many` 并行 / `ask_vote` 投票验证 / `run_pipeline` 流水线）、持久会话（`new_session` / `chat` / `list_sessions` / `session_tools` / `close_session`）、逐工人实时事件与提前采纳（`worker_dispatch` / `worker_result` / `cancel_tool`） |
 
-三入口共用统一事件 schema（`agent/core/events.py`）：`llm_call / tool_start / tool_result(preview) / stage / final / error / session`。
+**统一事件 schema**（`agent/core/events.py`，bridge `--stream` 复用）：`llm_call / tool_start / tool_result(preview) / stage / final / error / session`，加并行派工的 `worker_dispatch / worker_result(preview) / worker_gather_cancelled`。
 
-**stdout 纯净约定**：bridge 与 `run --stream` 的 stdout 只放 JSON 行，所有诊断/警告（配置缺失变量、非法 session_id、MCP 状态、主智能体选择）统一走 stderr——混入 stdout 会让按行 `json.loads` 的调用方直接解析失败。bridge 与 `run --stream` 模式的 stdio 在 `load_config` 前即归一为 UTF-8（Windows 重定向流默认 GBK，中文事件/配置警告不转码会炸外部 UTF-8 解码）。
+**stdout 纯净约定**：bridge 的 stdout 只放 JSON 行，所有诊断/警告（配置缺失变量、非法 session_id、MCP 状态）统一走 stderr——混入 stdout 会让按行 `json.loads` 的调用方直接解析失败。bridge 的 stdio 在 `load_config` 前即归一为 UTF-8（Windows 重定向流默认 GBK，中文事件/配置警告不转码会炸外部 UTF-8 解码）。
 
-**同会话并发闸门**：同一 Agent（=同一 session_id）同一时刻只允许一轮 `run`；第二条并发请求非阻塞抢锁失败即返回"会话忙"提示，不写历史、不排队（Web 允许同一会话并发提交，无闸门会交错写 session.history/落盘缓冲）。
-
-**Web 断开即取消**：SSE 生成器为 async 生成器（同步生成器阻塞在 `queue.get()`，Starlette 无法及时传导取消）。客户端断开时生成器在 await 点收到关闭，`finally` 置位 `cancel_event`，后台轮次经 `should_stop` 在下一个边界（LLM 调用前/工具执行前）停下，不再继续消耗 token；取消粒度见 §3 的协作式取消说明。
+**会话与工具隔离**：`new_session` 可带工具白名单裁剪注册表；同一 session_id 同一时刻只允许一轮，第二条并发请求非阻塞抢锁失败即返回"会话忙"，不写历史、不排队。会话 id 走 `sanitize_session_id` 白名单校验（详见 §6）。
 
 ## 8. 配置参考（config.yaml）
 
@@ -124,13 +120,13 @@
 - `uv run ruff check .`：E/F/W/I/B/UP，line-length 100；用 `extend-exclude = ["data"]` 追加排除运行时产物与隔离区（**不要用 `exclude`**——那是替换语义，会顶掉 ruff 默认排除表把 `.venv`/`.git` 重新纳入扫描）。
 - 解释器版本以仓库根 `.python-version` 为唯一来源（CI 用不带参数的 `uv python install` 跟随它，不写死版本号）。
 - 质量门禁的守卫测试：`tests/test_config_contract.py`（`.env.example` ↔ `config.yaml` 变量名契约）、`tests/test_repo_hygiene.py`（`.gitignore` 规则真生效、ruff 用 extend-exclude）。
-- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避、会话限流落盘、WorkerPool 冷却/去抖/超时接管、投票编号确定性、ask_many 整体限时、流水线择优、路径防穿越、MCP 断线重连持续重试与连接回滚、同会话并发闸门、缓存命中不受冷却、bridge stderr UTF-8、should_stop 协作式取消（迭代顶部/工具前检查点）、Web SSE 断开传导取消、默认会话 id 防碰撞、配置分层（.env.example 基础层/.env 覆盖层/shell 最高/清单变更失效缓存/边界双向守卫：.env.example 的 *_KEY 行必须空、.env 混入非 key 变量按名告警不回显值、下线改写永不触碰 *_KEY 行）、模型健康（当日隔离、缓存旁路、运行日语义——周末断档不打断连击/出现未失败的运行日才清零/运行日样本不足不判定、旧 v1 档案兼容、达阈值改写 .env.example 加 #、幂等、跨进程持久化、主失败只记档；`tests/conftest.py` 用 `MAO_HEALTH_FILE` 给每个用例独立档案，防共享落盘跨用例污染）等。
-- 2026-09-22 审计修复的专项回归集中在 `tests/test_audit_fixes.py`：健康档案进程内共享（含"两个实例各自先读盘、再交错记账不得互相覆盖"的 lost update 场景）且直连构造仍独立、缺省派工规模上限（pick）与自适应限时、显式名单不被上限约束、批量路径缓存命中、MCP 连接共享与引用计数、system prompt 计入上下文预算、计票不采信错误文本、Web lifespan 二次进入后清理线程仍存活。**配套 11 项变异测试**（撤销修复 → 对应用例必须失败）确认用例非恒真；其中一次变异暴露并修正了一个被懒加载掩盖的恒真用例。
-- 2026-09-22 第二轮全链路审计的回归集中在 `tests/test_audit2_fixes.py`（27 例）：投票分母只算有效票、健康档案写盘不阻塞隔离查询与并发落盘不留垃圾、6 项数值配置的类型容错、流水线阶段间裁剪（含窗口伸缩与按份均分）、`write_file` 覆盖留档、`/new` 沿用当前主、注入检查不误拦引号内字面量且真实拼接照拦、lifespan 三张会话表一起清空、408/425/429/5xx 与 4xx 的重试分类。变异校验扩到 **20 项**（`tests/mutation_check.py`）；本轮变异又抓出 2 个恒真用例并修正（假 `_last_active` 被清理线程连带清理、测试 monkeypatch 掉了被测方法本身）。
+- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避、会话限流落盘、WorkerPool 冷却/去抖/超时接管、投票编号确定性、ask_many 整体限时、流水线择优、路径防穿越、MCP 断线重连持续重试与连接回滚、同会话并发闸门、缓存命中不受冷却、bridge stderr UTF-8、should_stop 协作式取消（迭代顶部/工具前检查点）、并行派工逐工人实时事件与提前采纳、结构化派工结果（`ask_many_structured`）、`health` 可用性探针、能力标签 `tags`、`cache_size=0` 关缓存、`retire_days=0` 关自动下线、评审团模式（`run_review`）、默认会话 id 防碰撞、配置分层（.env.example 基础层/.env 覆盖层/shell 最高/清单变更失效缓存/边界双向守卫：.env.example 的 *_KEY 行必须空、.env 混入非 key 变量按名告警不回显值、下线改写永不触碰 *_KEY 行）、模型健康（当日隔离、缓存旁路、运行日语义——周末断档不打断连击/出现未失败的运行日才清零/运行日样本不足不判定、旧 v1 档案兼容、达阈值改写 .env.example 加 #、幂等、跨进程持久化、主失败只记档；`tests/conftest.py` 用 `MAO_HEALTH_FILE` 给每个用例独立档案，防共享落盘跨用例污染）等。
+- 2026-09-22 审计修复的专项回归集中在 `tests/test_audit_fixes.py`：健康档案进程内共享（含"两个实例各自先读盘、再交错记账不得互相覆盖"的 lost update 场景）且直连构造仍独立、缺省派工规模上限（pick）与自适应限时、显式名单不被上限约束、批量路径缓存命中、MCP 连接共享与引用计数、system prompt 计入上下文预算、计票不采信错误文本。**配套变异测试**（撤销修复 → 对应用例必须失败）确认用例非恒真；其中一次变异暴露并修正了一个被懒加载掩盖的恒真用例。
+- 2026-09-22 第二轮全链路审计的回归集中在 `tests/test_audit2_fixes.py`（27 例）：投票分母只算有效票、健康档案写盘不阻塞隔离查询与并发落盘不留垃圾、6 项数值配置的类型容错、流水线阶段间裁剪（含窗口伸缩与按份均分）、`write_file` 覆盖留档、注入检查不误拦引号内字面量且真实拼接照拦、408/425/429/5xx 与 4xx 的重试分类。变异校验扩到多项（`tests/mutation_check.py`）；本轮变异又抓出 2 个恒真用例并修正（假 `_last_active` 被清理线程连带清理、测试 monkeypatch 掉了被测方法本身）。
 - GitHub Actions CI：ruff + pytest。
 
 ## 10. 安全边界
 
-- Web 只监听 127.0.0.1，不要暴露公网；`run_shell` 等价于把本机命令权交给模型（黑名单+注入拦截兜底）。
-- bridge 模式等价于把本机工具权交给驱动它的外部智能体，只给你信任的智能体用。
+- MAO 不再对外开任何网络端口（Web 入口已移除）；`run_shell` 等价于把本机命令权交给主智能体（黑名单+注入拦截兜底）。
+- bridge 通过本地 stdin/stdout 通信，等价于把本机工具权交给驱动它的外部智能体，只给你信任的智能体用。
 - 会话历史、`.env`、key 均在本地，不出本机。

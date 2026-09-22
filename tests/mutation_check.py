@@ -111,13 +111,6 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         f"{TESTFILE}::test_ballot_ignores_error_text",
     ),
     (
-        "M9 lifespan 不复位停止信号",
-        "web/server.py",
-        "    _stop_event.clear()",
-        "    pass  # mutated",
-        f"{TESTFILE}::test_web_lifespan_cleanup_thread_survives_reentry",
-    ),
-    (
         "M10 vote 缺省名单改回全池",
         "agent/core/orchestrator.py",
         "        pool = [w for w in dict.fromkeys(workers or self.pick()) if w in self.profiles]",
@@ -188,22 +181,6 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "            if code >= 500 or code in _RETRYABLE_STATUS:",
         "            if code >= 500:  # mutated",
         "tests/test_audit2_fixes.py::test_http_status_retry_classification",
-    ),
-    (
-        "M19 lifespan 不清 _session_orch",
-        "web/server.py",
-        "            _session_orch.clear()  # 三张会话表一起清，别留孤儿条目",
-        "            pass  # mutated",
-        "tests/test_audit2_fixes.py::test_web_lifespan_clears_all_session_tables",
-    ),
-    (
-        "M20 显式主智能体不被沿用",
-        "agent/__main__.py",
-        """    if profile is not None:
-        print(f"[主智能体] {profile.name} ({profile.model})（沿用当前主）", file=err)""",
-        """    if False:
-        print(f"[主智能体] {profile.name} ({profile.model})（沿用当前主）", file=err)""",
-        "tests/test_audit2_fixes.py::test_build_agent_keeps_explicit_profile",
     ),
 ]
 

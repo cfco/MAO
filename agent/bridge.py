@@ -1,11 +1,10 @@
 """外部智能体驱动模式（bridge）：谁启动并驱动本项目，谁就是主智能体。
 
-本项目为驱动者（主智能体）提供五类能力：
+本项目为驱动者（主智能体）提供四类能力：
 1. 本地工具执行（shell / 文件 / MCP 工具）
 2. Skill 加载与脚本执行
-3. 把池内任何模型当"纯文本工人"调度（ask / ask_vote 等）
-4. 完整的多智能体任务执行（run_task，本地选一个池内模型当主）
-5. 持久会话（new_session / chat / list_sessions / close_session）——
+3. 把池内任何模型当"纯文本工人"调度（ask / ask_many / ask_vote / run_pipeline）
+4. 持久会话（new_session / chat / list_sessions / close_session）——
    外部主可以开多个话茬，各自带历史上下文，也能续接上一次的对话。
 
 协议：stdin 每行一个 JSON 请求，stdout 每行一个 JSON 响应，UTF-8。
@@ -16,20 +15,21 @@
 请求指令：
   {"cmd":"ping"}
   {"cmd":"list_agents"}
+  {"cmd":"health"}                                              （各子 AI 可用性快照：冷却/当日隔离/能力标签）
   {"cmd":"list_tools"}
   {"cmd":"call_tool","name":"run_shell","args":{"command":"dir"}}
   {"cmd":"load_skill","name":"example_hello"}
   {"cmd":"run_skill_script","skill":"example_hello","script":"hello.py","args":{}}
   {"cmd":"ask","agent":"glm-flash","prompt":"...","system":"可选角色"}
-  {"cmd":"ask_many","workers":["a","b"],"prompt":"..."}        （并行派多个工人）
+  {"cmd":"ask_many","workers":["a","b"],"prompt":"..."}        （并行派多个工人，返回 workers 结构化 + results 文本）
   {"cmd":"ask_vote","prompt":"...","threshold":0.5}            （两步投票取共识）
-  {"cmd":"run_task","task":"...","orchestrator":"可选","solo":false,"stream":true}
   {"cmd":"run_pipeline","task":"...","stream":true}            （固定流水线：起草→评审→修订）
+  {"cmd":"run_review","draft":"...","context":"可选","workers":["a","b"]}  （外部主给初稿，子 AI 只当评审团挑错）
   {"cmd":"new_session","session_id":"可选","orchestrator":"可选","tools":["白名单"]}  （建持久会话，可做工具隔离）
   {"cmd":"chat","message":"...","session_id":"...","stream":true} （用会话跑一轮，可续历史）
   {"cmd":"list_sessions"}
   {"cmd":"session_tools","session_id":"..."}                       （查某会话的工具白名单/被裁剪项）
-  {"cmd":"cancel_tool","session_id":"..."}                         （结束当前工具派工；bridge 串行下 best-effort，Web 才实时）
+  {"cmd":"cancel_tool","session_id":"..."}                         （结束当前派工；bridge 串行读 stdin，best-effort 事后送达）
   {"cmd":"close_session","session_id":"..."}
 
 响应：{"ok":true,...} 或 {"ok":false,"error":"..."}；启动后先发一行 ready 事件。
@@ -55,6 +55,11 @@ from .core.session import sanitize_session_id
 from .skills_manager import SkillManager, register_skill_tools
 from .tools.base import ToolRegistry
 from .tools.builtin import build_builtin_tools
+
+REVIEW_SYSTEM = (
+    "你是独立评审智能体。针对给你的稿件只挑问题、给改进方向与编号建议，"
+    "不改写全文、不泛泛夸赞。若整体可用就明确说'可用'并列出仅剩的小问题。"
+)
 
 
 def _norm_workers(raw) -> list[str] | None:
@@ -84,7 +89,7 @@ class Bridge:
         self.skills.scan()
         self.registry: ToolRegistry = build_builtin_tools(cfg)
         register_skill_tools(self.registry, self.skills)
-        # MCP 走进程内共享连接组：bridge 与它临时建的 Agent（run_task）共享同一套
+        # MCP 走进程内共享连接组：bridge 与它建的会话 Agent 共享同一套
         # 连接，避免同进程内重复拉起 stdio 子进程、重复等最长 90s 的首连。
         self.mcp_group = None
         self.mcp_status: list[str] = []
@@ -187,12 +192,12 @@ class Bridge:
         return {"ok": True, "session_id": session_id}
 
     def _cancel_tool(self, req: dict) -> dict:
-        """请求结束当前会话正在执行的工具（当前仅 ask_workers 会响应）。
+        """请求结束当前会话正在执行的工具（当前仅 ask_workers 派工会响应）。
 
-        注意 bridge 的局限：bridge 是单线程串行读 stdin，`chat`/`run_task` 会阻塞整
-        个循环直到本轮跑完，这条指令只能排在其后、事后送达，起不到「跑一半时打断」
-        的作用。真正能用的是 Web 入口（轮次在后台线程跑，主循环可并发受理
-        /api/chat/cancel_tool）。这里保留指令是为了协议对称与将来支持异步 chat。
+        bridge 的局限：bridge 单线程串行读 stdin，`chat`/`run_pipeline` 会阻塞整个
+        循环直到本轮跑完，这条指令只能排在其后、事后送达，起不到「跑一半时打断」的
+        作用（Web 入口已移除，原先靠它后台线程并发受理实时打断的路子没了）。保留本
+        指令是为协议对称，并待 bridge 的 chat 改成后台线程异步受理后即可真正生效。
         """
         sid = str(req.get("session_id", "")).strip()
         with self._sessions_lock:
@@ -219,6 +224,9 @@ class Bridge:
             return {"ok": True, "agents": [p.brief() for p in self.cfg.agent_profiles]}
         if cmd == "list_tools":
             return {"ok": True, "tools": self.registry.info_list()}
+        if cmd == "health":
+            # 每个子 AI 的当前可用性快照（冷却/当日隔离/能力标签），供外部主派工前预检
+            return {"ok": True, "workers": self.workers.health_status()}
         if cmd == "call_tool":
             name = str(req.get("name", ""))
             return {"ok": True, "result": self.registry.execute(name, req.get("args") or {})}
@@ -246,11 +254,17 @@ class Bridge:
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
-            return {"ok": True, "results": self.workers.ask_many(
+            # 单次收集，同时给结构化（外部主程序化消费）与文本（向后兼容/展示）
+            recs = self.workers.ask_many_structured(
                 _norm_workers(req.get("workers")) or self.workers.pick(),
                 prompt,
                 req.get("system"),
-            )}
+            )
+            text = "\n\n".join(
+                f"### 工人 {r['worker']} 的结果\n" + (r["answer"] if r["ok"] else f"（{r['status']}）")
+                for r in recs
+            )
+            return {"ok": True, "results": text, "workers": recs}
         if cmd == "ask_vote":
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
@@ -282,10 +296,22 @@ class Bridge:
             return self._chat(req, out)
 
         # ---- 一次性任务 ----
-        if cmd == "run_task":
-            return self._run_task(req, out)
         if cmd == "run_pipeline":
             return self._run_pipeline(req, out)
+        if cmd == "run_review":
+            draft = str(req.get("draft", "")).strip()
+            if not draft:
+                return {"ok": False, "error": "draft 不能为空（外部主给出初稿，子 AI 只当评审团）"}
+            context = str(req.get("context", "")).strip()
+            reviewers = _norm_workers(req.get("workers")) or self.workers.pick()
+            prompt = (
+                "请作为独立评审，针对下面的稿件给出问题清单与**编号**改进建议，"
+                "直接挑错、给方向，不要客套、不要整段复述原文。\n"
+                + (f"【背景 / 验收标准】{context}\n" if context else "")
+                + f"【待评审稿件】\n{draft}"
+            )
+            recs = self.workers.ask_many_structured(reviewers, prompt, REVIEW_SYSTEM)
+            return {"ok": True, "reviews": recs}
         return {"ok": False, "error": f"未知指令: {cmd}"}
 
     # ---------- 具体指令实现 ----------
@@ -312,33 +338,6 @@ class Bridge:
         except Exception as e:  # noqa: BLE001 - 单轮失败不搞挂会话
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
         return {"ok": True, "session_id": sid, "result": result}
-
-    def _run_task(self, req: dict, out) -> dict:
-        """完整跑一轮多智能体任务（临时 Agent，跑完即关）。支持 stream 事件流。"""
-        task = str(req.get("task", "")).strip()
-        if not task:
-            return {"ok": False, "error": "task 不能为空"}
-        solo = bool(req.get("solo"))
-        orch = str(req.get("orchestrator") or "").strip()
-        try:
-            profile = self._find_profile(orch or None)
-        except ValueError as e:
-            return {"ok": False, "error": str(e)}
-        from .core.agent import Agent
-
-        bot = Agent(self.cfg, profile=profile, enable_workers=not solo)
-
-        def emit(ev: dict) -> None:
-            if out:
-                out(to_event(ev))
-
-        try:
-            result = bot.run(task, on_event=emit if req.get("stream") else None)
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        finally:
-            bot.close()
-        return {"ok": True, "result": result}
 
     def _run_pipeline(self, req: dict, out) -> dict:
         """固定流水线：起草→评审→修订（不选主，直接调度池内全部模型）。"""

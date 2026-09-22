@@ -1169,3 +1169,141 @@ def test_ask_many_cancel_returns_completed_early(monkeypatch):
     assert "ans-fast" in out, "已完成工人的结果必须保留"
     assert "提前结束" in out and "slow" in out
     assert any(e["type"] == "worker_gather_cancelled" for e in evs)
+
+
+# ---------------- 结构化派工 / 健康探针 / 能力标签 / 缓存与下线可关 ----------------
+
+def test_ask_many_structured_ordered_records(monkeypatch):
+    """ask_many_structured 按入参顺序返回，每条含 worker/ok/status/answer/elapsed_ms。"""
+    class Instant:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def chat(self, messages, tools=None):
+            return {"content": "hi"}
+
+    monkeypatch.setattr(orch, "LLMClient", Instant)
+    cfg = Config(_interpolate({"agents": [
+        {"name": "w1", "base_url": "u", "api_key": "k", "model": "m"},
+        {"name": "w2", "base_url": "u", "api_key": "k", "model": "m"},
+    ]}))
+    pool = WorkerPool(cfg, exclude=None)
+    recs = pool.ask_many_structured(["w1", "w2"], "任务")
+    assert [r["worker"] for r in recs] == ["w1", "w2"]
+    assert all(r["ok"] and r["status"] == "ok" and r["answer"] == "hi" for r in recs)
+    assert all(isinstance(r["elapsed_ms"], int) for r in recs)
+    # 空工人列表 → 空结果（不抛）
+    assert pool.ask_many_structured(["ghost"], "x") == []
+
+
+def test_ask_many_structured_error_and_timeout_status(monkeypatch):
+    """失败回答 → ok=False status=error；未完成（取消/超时）→ status=cancelled。"""
+    class Vary:
+        def __init__(self, _b, _a, model, **_k):
+            self.model = model
+
+        def chat(self, messages, tools=None):
+            if self.model == "slow":
+                time.sleep(2.0)
+            return {"content": "错误：上游 502" if self.model == "bad" else "good"}
+
+    monkeypatch.setattr(orch, "LLMClient", Vary)
+    cfg = Config(_interpolate({"agents": [
+        {"name": "bad", "base_url": "u", "api_key": "k", "model": "bad"},
+        {"name": "slow", "base_url": "u", "api_key": "k", "model": "slow"},
+    ]}))
+    pool = WorkerPool(cfg, exclude=None)
+    cancel = threading.Event()
+
+    def _emit(e):
+        if e["type"] == "worker_result" and e["worker"] == "bad":
+            cancel.set()  # bad 一回来就结束，放弃 slow
+
+    recs = pool.ask_many_structured(["bad", "slow"], "任务", emit=_emit, cancel_event=cancel)
+    by = {r["worker"]: r for r in recs}
+    assert by["bad"]["ok"] is False and by["bad"]["status"] == "error" and by["bad"]["answer"] == ""
+    assert by["slow"]["status"] == "cancelled"
+
+
+def test_health_status_reflects_cooldown_and_quarantine():
+    """失败后 health_status 标该工人不可用（冷却 + 当日隔离），其它工人照常可用。"""
+    cfg = Config(_interpolate({"agents": [
+        {"name": "d1", "base_url": "u", "api_key": "k", "model": "m"},
+        {"name": "d2", "base_url": "u", "api_key": "k", "model": "m"},
+    ]}))
+    pool = WorkerPool(cfg, exclude=None)
+    hs = pool.health_status()
+    assert all(x["available"] for x in hs), "初始应全部可用"
+    pool._cooldown_threshold = 1
+    pool._cooldown_base = 30.0
+    pool._record_result("d1", ok=False)  # 触发冷却 + 当日隔离（写各自 tmp 档案）
+    st = {x["worker"]: x for x in pool.health_status()}
+    assert st["d1"]["available"] is False
+    assert st["d1"]["quarantined_today"] is True and st["d1"]["cooldown_s"] > 0
+    assert st["d2"]["available"] is True
+
+
+def test_agentprofile_tags_in_brief_and_overview():
+    cfg = Config(_interpolate({"agents": [
+        {"name": "a", "base_url": "u", "api_key": "k", "model": "m", "tags": "code,中文"},
+    ]}))
+    p = cfg.agent_profiles[0]
+    assert p.tags == "code,中文"
+    assert p.brief()["tags"] == "code,中文"
+    pool = WorkerPool(cfg, exclude=None)
+    assert "tags=code,中文" in pool.overview()
+
+
+def test_cache_size_zero_disables_caching(monkeypatch):
+    """cache_size=0：同一 (工人,任务,角色) 两次派工各打一次网络（不缓存）。"""
+    calls = {"n": 0}
+
+    class Counting:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def chat(self, messages, tools=None):
+            calls["n"] += 1
+            return {"content": "x"}
+
+    monkeypatch.setattr(orch, "LLMClient", Counting)
+    cfg_off = Config(_interpolate({
+        "agents": [{"name": "w", "base_url": "u", "api_key": "k", "model": "m"}],
+        "collaboration": {"cache_size": 0},
+    }))
+    pool_off = WorkerPool(cfg_off, exclude=None)
+    worker = pool_off.names()[0]
+    pool_off.ask(worker, "same")
+    pool_off.ask(worker, "same")
+    assert calls["n"] == 2, "cache_size=0 必须不缓存"
+    # 对照：默认开缓存 → 第二次命中，不再打网络
+    calls["n"] = 0
+    cfg_on = Config(_interpolate({
+        "agents": [{"name": "w", "base_url": "u", "api_key": "k", "model": "m"}],
+    }))
+    pool_on = WorkerPool(cfg_on, exclude=None)
+    w2 = pool_on.names()[0]
+    pool_on.ask(w2, "same")
+    pool_on.ask(w2, "same")
+    assert calls["n"] == 1, "默认应命中缓存只打一次"
+
+
+def test_retire_days_zero_no_auto_disable(tmp_path):
+    """retire_days=0：连续多日失败也只在当日隔离，不自动往 .env.example 加 # 下线。"""
+    from agent.core.health import ModelHealth, _today
+
+    def run(retire_days: int) -> dict:
+        store = tmp_path / f"h{retire_days}.json"
+        env = tmp_path / f"env{retire_days}.txt"
+        env.write_text("NODE_X_MODELS=mm@8k,other\n", encoding="utf-8")
+        h = ModelHealth(store, env, retire_days=retire_days)
+        # 档案加载时会自动把"今天"记为运行日，故连击必须含今天才能真正判定下线
+        for day in (_today(), "2000-01-01"):
+            h.record_failure("kk", "mm", "NODE_X_MODELS", day=day)
+        return {"disabled": bool((h.snapshot().get("kk") or {}).get("disabled")),
+                "env": env.read_text(encoding="utf-8")}
+
+    off = run(0)
+    assert off["disabled"] is False and "#" not in off["env"], "retire_days=0 不该自动下线"
+    on = run(2)
+    assert on["disabled"] is True and "#mm" in on["env"], "对照组：达阈值应自动下线（证明上一条非恒真）"

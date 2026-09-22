@@ -127,6 +127,8 @@ class AgentProfile:
     model: str
     context_length: int = 0  # 上下文窗口(token)；0=未指定按 DEFAULT_CONTEXT
     note: str = ""
+    # 能力标签（逗号分隔，如 "code,中文,长上下文"）：外部主据此决定把哪类活派给谁。
+    tags: str = ""
     # 该模型清单来自哪个环境变量（如 NODE_A_MODELS）；模型健康下线时
     # 据此精确改写 .env.example 对应行。值写死在 config.yaml（非 ${VAR}）时为空。
     models_env: str = ""
@@ -139,6 +141,7 @@ class AgentProfile:
             "model": self.model,
             "context_length": self.context_length or DEFAULT_CONTEXT,
             "note": self.note,
+            "tags": self.tags,
         }
 
 
@@ -195,6 +198,7 @@ class Config:
                         model=mi,
                         context_length=ctx_len,
                         note=str(item.get("note", "")),
+                        tags=str(item.get("tags", "")),
                         models_env=models_env,
                     )
                 )
@@ -277,9 +281,11 @@ class Config:
 
     @property
     def health_retire_days(self) -> int:
-        """连续多少个"运行日"（程序实际启动过的天）都失败后自动给模型标 # 下线。最小 1。"""
+        """连续多少个"运行日"（程序实际启动过的天）都失败后自动给模型标 # 下线。
+        0 = 关闭自动改写 .env.example（只当日隔离、不再自动下线，适合外部主按需驱动
+        的场景——主每轮自己判断节点好坏，不需要 MAO 静默改配置）。最小 0。"""
         return self.as_int(
-            self.collab_cfg.get("retire_days", 7), "collaboration.retire_days", 7, minimum=1
+            self.collab_cfg.get("retire_days", 7), "collaboration.retire_days", 7, minimum=0
         )
 
     # ---------- 兼容旧配置的兜底单模型 ----------
@@ -304,7 +310,7 @@ class Config:
 
         优先级：环境变量 MAO_SESSION_FLUSH_BATCH > config.yaml 的 session.flush_batch > 默认 16。
         环境变量兜底用于 CLI 命令行覆盖（uv run mao chat --session-flush-batch N），
-        同一进程内对 chat/run/pipeline/web/bridge 所有入口生效。
+        同一进程内对 bridge（含其持久会话）各路径生效。
         """
         env = os.environ.get("MAO_SESSION_FLUSH_BATCH")
         if env is not None:
@@ -412,7 +418,7 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     - 返回新 Config 对象，调用方用它替换自己的 cfg 引用；已有 Agent 持有的旧 cfg
       不受影响，避免 MCP 连接被意外重连。
 
-    调用方（web/server._get_cfg）可频繁调用本函数，只有配置真正变化时才解析。
+    调用方可频繁调用本函数，只有配置真正变化时才解析。
     """
     global _cfg_cache, _cfg_cache_mtime, _cfg_cache_dotenv_mtime, _cfg_cache_example_mtime
     p = path or (ROOT / "config.yaml")

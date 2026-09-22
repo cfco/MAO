@@ -2,31 +2,30 @@
 
 **目标：三个臭皮匠顶个诸葛亮**——用多个免费、较慢、较弱的模型分工协作，产出比单模型更好的结果。
 
-- **谁启动，谁是主**：用外部智能体启动/驱动本项目时，它自动成为主智能体；CLI/Web 启动时才需要从 API 智能体池里选一个当主。
-- 主智能体：拆解任务、派工、汇总、把关，掌握全部本地工具（shell / 文件 / MCP / Skill）。
-- 子智能体（工人）：池里其余的 API 模型，纯文本执行器，负责并行干子任务、提供第二意见、交叉验证。
+- **外部 AI 当主，MAO 只当执行器**：本项目通过 bridge 被外部智能体（千问办公 / WorkBuddy 等）驱动，驱动者即主智能体。MAO 不再自带"选主自己跑"的入口（chat / run / pipeline / web 已移除），只提供本机工具（手）与池内免费模型（子 AI）。
+- 主智能体（外部 AI）：拆解任务、派工、汇总、把关，通过 bridge 调用 MAO 的全部本地工具（shell / 文件 / MCP / Skill）。
+- 子智能体（工人）：池里的 API 模型，纯文本执行器，负责并行干子任务、提供第二意见、交叉验证（`ask` / `ask_many` / `ask_vote` / `run_pipeline`）。
 
 ## 目录结构
 
 ```
 MAO/
 ├── agent/
-│   ├── __main__.py         # CLI 入口（bridge / chat / run / web）
+│   ├── __main__.py         # CLI 入口（仅 bridge 一条路线）
 │   ├── bridge.py           # 外部智能体驱动协议（谁驱动谁当主）
 │   ├── config.py           # 智能体池 AgentProfile + 协作配置
 │   ├── skills_manager.py   # Skill 机制
 │   ├── core/
 │   │   ├── agent.py        # 主智能体 Loop（支持注入主 profile + 工人工具）
 │   │   ├── llm.py          # LLM 适配层（OpenAI 兼容协议）
-│   │   ├── orchestrator.py # 工人池：ask_worker / ask_workers 并行派工
+│   │   ├── orchestrator.py # 工人池：ask / ask_many 并行派工 + ask_vote 投票验证
 │   │   ├── pipeline.py     # 固定流水线：起草→评审→修订择优
-│   │   ├── events.py       # 统一事件 schema（CLI/Web/bridge 三入口共用）
+│   │   ├── events.py       # 统一事件 schema（bridge / --stream 共用）
 │   │   └── session.py      # 会话与历史落盘
 │   └── tools/
 │       ├── base.py         # 工具基类 + 注册表
 │       ├── builtin.py      # 内置工具（shell/文件）
 │       └── mcp_client.py   # MCP 接入层（stdio/HTTP）
-├── web/                    # Web 服务 + 前端（顶栏可选主智能体）
 ├── skills/                 # 技能目录（example_hello 是示例）
 ├── data/sessions/          # 会话历史
 ├── config.yaml             # 智能体池 / MCP / 工具配置
@@ -63,12 +62,14 @@ MAO/
 3. 运行（入口命令 `mao`，由 `uv run` 驱动）：
 
    ```
-   uv run mao chat                    # 交互对话；池里多个智能体时让你选主
-   uv run mao chat --orchestrator kimi   # 直接指定主智能体
-   uv run mao run "任务" --solo       # 单次任务、不启用协作
-   uv run mao pipeline "任务"         # 固定流水线：起草→评审→修订择优
-   uv run mao web                     # Web 界面，顶栏切换主智能体；客户端断开即取消后台轮次
+   uv run mao bridge     # 外部智能体驱动模式（谁启动驱动，谁当主智能体）
    ```
+
+   > 本项目只保留 **bridge 一条使用路线**：外部 AI 当主智能体，通过 stdin/stdout 的
+   > JSON 行协议借用 MAO 的"手"（run_shell / 文件 / MCP / Skill）与"子 AI"
+   > （`ask` / `ask_many` 并行派工、`ask_vote` 投票验证、`run_pipeline` 流水线）。
+   > 原先的 chat / run / pipeline / web「MAO 自己选主跑」入口已移除。接入步骤见
+   > [docs/外部主接入指南.md](docs/外部主接入指南.md)。
 
 ### 使用 pip（备选）
 
@@ -81,11 +82,7 @@ MAO/
 2. 运行：
 
    ```
-   python -m agent chat                    # 交互对话；池里多个智能体时让你选主
-   python -m agent chat --orchestrator kimi   # 直接指定主智能体
-   python -m agent run "任务" --solo       # 单次任务、不启用协作
-   python -m agent pipeline "任务"         # 固定流水线：起草→评审→修订择优
-   python -m agent web                     # Web 界面，顶栏切换主智能体；客户端断开即取消后台轮次
+   python -m agent bridge     # 外部智能体驱动模式（谁启动驱动，谁当主智能体）
    ```
 
 ### 配置智能体池
@@ -120,6 +117,7 @@ LLM_API_KEY=sk-同一个bynara-key  # 兜底单模型（池里节点全挂时用
 **第 2 步：配池（编辑 `config.yaml` 的 `agents`）**
 
 按"站"组织：一个 Endpoint + 一个 Key 可以挂多个模型，每个模型自动成为一个智能体。
+可选 `tags`（逗号分隔的能力标签）帮外部主决定"这类活派给谁"——`health`/`list_agents` 会把标签回吐给主。
 
 ```yaml
 agents:
@@ -128,12 +126,16 @@ agents:
     api_key: ${NODE_A_KEY}
     models: ${NODE_A_MODELS}
     note: 中转站A
+    tags: code,长上下文      # 可选：给外部主选路用的能力标签
 ```
+
+可选开关（`collaboration`）：`cache_size: 0` 关闭工人答案 LRU 缓存（外部主按需发话、prompt 很少逐字重复时，缓存命中率低，可关）；`retire_days: 0` 关闭"连续多日失败自动往 `.env.example` 加 `#` 下线"（只保留当日隔离，把节点好坏的判断权完全交给外部主）。
 
 **第 3 步：验证**
 
 ```
-uv run mao chat        # 池里多个智能体时会让你选一个当主
+# 起 bridge，发一行 list_agents，应回出池内智能体（不含 key）
+echo '{"cmd":"list_agents"}' | uv run mao bridge
 ```
 
 免 key 方案：本地跑 Ollama（`base_url: http://localhost:11434/v1`，`api_key: ""`）。池为空时会用 `llm:` 段的兜底单模型跑 solo（`llm:` 段的 `base_url`/`model` 带默认值，只有 `LLM_API_KEY` 必填）。
@@ -147,7 +149,7 @@ uv run mao chat        # 池里多个智能体时会让你选一个当主
 - `ask_worker`：把独立子任务派给某个工人并行干；
 - `ask_workers`：同一关键问题同时派给多个工人，多方案对比、交叉验证、投票取共识。
 
-对话中你能实时看到派工过程（CLI 打印 / Web 卡片展示）。工人是纯文本执行器（不挂本地工具）：免费模型 function calling 支持参差不齐，这样最稳也最安全，本地工具权始终在主智能体手里。
+派工过程通过 bridge 的事件流实时回显给外部主（`worker_dispatch` / `worker_result` 逐工人冒进度、`worker_gather_cancelled` 标记用户提前采纳）。工人是纯文本执行器（不挂本地工具）：免费模型 function calling 支持参差不齐，这样最稳也最安全，本地工具权始终在主智能体手里。
 
 ### 外部智能体驱动（谁启动谁当主）
 
@@ -165,18 +167,19 @@ stderr 也已在 bridge 启动时归一为 UTF-8：Windows 重定向流默认本
 | 指令 | 说明 |
 |------|------|
 | `{"cmd":"ping"}` | 握手，返回版本与池内智能体名 |
-| `{"cmd":"list_agents"}` | 智能体池清单（不含 key） |
+| `{"cmd":"list_agents"}` | 智能体池清单（不含 key，含能力标签 tags） |
+| `{"cmd":"health"}` | 各子 AI 当前可用性快照（冷却剩余/当日隔离/标签），派工前预检 |
 | `{"cmd":"list_tools"}` | 本地工具清单（内置+MCP+Skill） |
 | `{"cmd":"call_tool","name":"run_shell","args":{...}}` | 执行本地工具 |
 | `{"cmd":"load_skill","name":"example_hello"}` | 读技能全文 |
 | `{"cmd":"run_skill_script","skill":"...","script":"...","args":{}}` | 跑技能脚本 |
 | `{"cmd":"ask","agent":"glm-flash","prompt":"..."}` | 把池内模型当纯文本大脑用 |
-| `{"cmd":"ask_many","workers":["a","b"],"prompt":"..."}` | 同一任务并行派多个工人 |
+| `{"cmd":"ask_many","workers":["a","b"],"prompt":"..."}` | 同一任务并行派多个工人；返回 `workers`（结构化逐工人 ok/status/answer/elapsed_ms）+ `results`（文本） |
 | `{"cmd":"ask_vote","prompt":"...","threshold":0.5}` | 两步投票取共识 |
-| `{"cmd":"run_task","task":"...","orchestrator":"可选","solo":false}` | 完整跑一轮多智能体任务 |
 | `{"cmd":"run_pipeline","task":"..."}` | 固定流水线：起草→评审→修订择优 |
+| `{"cmd":"run_review","draft":"...","context":"可选"}` | 外部主给初稿，子 AI 只当评审团挑错（返回结构化 `reviews`） |
 | `{"cmd":"new_session","session_id":"可选","tools":["白名单"]}` | 建持久会话（可做工具隔离） |
-| `{"cmd":"chat","message":"...","session_id":"..."}` | 用会话跑一轮，可续历史 |
+| `{"cmd":"chat","message":"...","session_id":"..."}` | 用会话跑一轮，可续历史（会话内 MAO 起一个带工具的 Agent 自主跑，相当于把整轮外包给它） |
 | `{"cmd":"list_sessions"}` / `{"cmd":"session_tools","session_id":"..."}` | 查会话清单 / 某会话工具白名单 |
 | `{"cmd":"close_session","session_id":"..."}` | 关会话 |
 
@@ -207,6 +210,6 @@ mcp_servers:
 
 ## 安全说明
 
-- 内置 `run_shell` 可直接执行本机命令，Web 只监听 127.0.0.1，不要暴露到公网
+- 内置 `run_shell` 可直接执行本机命令，等于把本机命令权交给主智能体；bridge 通过本地 stdin/stdout 通信，不监听任何网络端口
 - `bridge` 模式等价于把本机工具权交给驱动它的外部智能体，只给你信任的智能体用
 - `config.yaml` 里若直接填 API key，注意不要外传该文件

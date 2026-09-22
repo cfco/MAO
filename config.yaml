@@ -59,13 +59,8 @@ collaboration:
                                  # 对应 *_MODELS 行给该模型加 # 下线（删 # 即人工恢复）
   health_file: data/model_health.json  # 健康档案落盘位置（当日失败标记/下线记录，无密钥）
 
-server:
-  host: 127.0.0.1
-  port: 8000
-
 tools:
   shell_timeout: 120             # 单条命令最长执行秒数
-
 # 会话落盘限流：add 一次先入内存并进缓冲，满足条件才真正写盘，
 # 避免 Agent 单轮多工具迭代产生大量零碎磁盘写入。可按部署环境调节。
 # 正常退出由 Agent.close() 兜底刷盘，进程崩溃最多丢失一个限流窗口内的少量消息。
@@ -83,3 +78,4 @@ session:
 #     transport: http
 #     url: https://mcp.example.com/mcp
 mcp_servers: []
+

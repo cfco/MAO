@@ -14,10 +14,7 @@
 """
 from __future__ import annotations
 
-import asyncio
-import importlib.util
 import json
-import threading
 import time
 from pathlib import Path
 
@@ -247,41 +244,3 @@ def test_ballot_still_parses_normal_vote(monkeypatch):
     picked = pool.select_best([("a", "AAA"), ("b", "BBB")], voters=[worker])
     assert picked is not None and picked[0] == "b"
 
-
-# ---------------- 7) Web lifespan 复位停止信号 ----------------
-
-def _load_web_server():
-    spec = importlib.util.spec_from_file_location(
-        "mao_web_server_lifespan_probe", ROOT / "web" / "server.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _alive_cleanup_threads() -> int:
-    return sum(
-        1 for t in threading.enumerate() if t.name == "session-cleanup" and t.is_alive()
-    )
-
-
-def test_web_lifespan_cleanup_thread_survives_reentry(tmp_path, monkeypatch):
-    """原缺陷：_stop_event 退出时 set 后不复位，二次进入时清理线程创建即退出。"""
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    monkeypatch.setattr(sess_mod.Session, "cleanup", staticmethod(lambda keep_recent=30: 0))
-
-    srv = _load_web_server()
-
-    async def twice() -> tuple[int, int]:
-        async with srv.lifespan(srv.app):
-            await asyncio.sleep(0.05)
-            first = _alive_cleanup_threads()
-        async with srv.lifespan(srv.app):
-            await asyncio.sleep(0.3)
-            second = _alive_cleanup_threads()
-        return first, second
-
-    first, second = asyncio.run(twice())
-    assert first == 1
-    assert second == 1, f"二次进入后清理线程必须存活（实际 {second}）—— 会话超时清理不能失效"

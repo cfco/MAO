@@ -15,11 +15,8 @@
 """
 from __future__ import annotations
 
-import asyncio
-import importlib.util
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -27,15 +24,12 @@ import openai
 import pytest
 
 import agent.core.orchestrator as orch
-import agent.core.session as sess_mod
 import agent.tools.builtin as builtin
 from agent.config import Config, _interpolate
 from agent.core.health import get_health
 from agent.core.llm import LLMClient
 from agent.core.orchestrator import WorkerPool
 from agent.core.pipeline import Pipeline
-
-ROOT_PATH = Path(__file__).resolve().parent.parent
 
 
 def _pool(models: str, cap: int = 5, **collab) -> WorkerPool:
@@ -231,45 +225,7 @@ def test_write_file_new_file_needs_no_backup(tmp_path, monkeypatch):
     assert not (tmp_path / "backup").exists()
 
 
-# ---------------- 6) /new 保持主智能体 ----------------
-
-def test_build_agent_keeps_explicit_profile(tmp_path, monkeypatch):
-    from agent.__main__ import build_agent
-
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    cfg = Config(_interpolate({"agents": [
-        {"name": "pool-first", "base_url": "u", "api_key": "k", "model": "ma"},
-        {"name": "wanted-second", "base_url": "u", "api_key": "k", "model": "mb"},
-    ]}))
-    args = SimpleNamespace(orchestrator=None, stream=False, solo=False)
-    wanted = cfg.profile("wanted-second")
-
-    bot = build_agent(cfg, args, interactive=False, profile=wanted)
-    try:
-        assert bot.profile is wanted, "显式传入的主必须沿用，不能被池内第一个顶掉"
-    finally:
-        bot.close()
-
-
-def test_build_agent_without_profile_picks_pool_first(tmp_path, monkeypatch):
-    """对照：不传 profile 时仍走原选主逻辑（池内第一个）——证明上一个用例测的是新行为。"""
-    from agent.__main__ import build_agent
-
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    cfg = Config(_interpolate({"agents": [
-        {"name": "pool-first", "base_url": "u", "api_key": "k", "model": "ma"},
-    ]}))
-    args = SimpleNamespace(orchestrator=None, stream=False, solo=False)
-    bot = build_agent(cfg, args, interactive=False)
-    try:
-        assert bot.profile is cfg.profile("pool-first")
-    finally:
-        bot.close()
-
-
-# ---------------- 7) 注入检查不再误拦引号内字面量 ----------------
+# ---------------- 6) 注入检查不再误拦引号内字面量 ----------------
 
 def test_injection_check_ignores_quoted_literals():
     from agent.tools.builtin import _check_command_safety
@@ -287,37 +243,7 @@ def test_injection_check_still_blocks_real_concatenation():
     assert _check_command_safety('echo "x" && del y') is not None, "引号外的拼接照拦"
 
 
-# ---------------- 8) lifespan 收尾清 _session_orch ----------------
-
-def _load_web_server(name: str):
-    spec = importlib.util.spec_from_file_location(name, ROOT_PATH / "web" / "server.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_web_lifespan_clears_all_session_tables(tmp_path, monkeypatch):
-    """收尾时三张会话表必须一起清空。
-
-    只往 _session_orch 塞键：若同时往 _last_active 塞假时间戳，清理线程会把它当成
-    过期会话并连带 pop 掉 _session_orch，从而掩盖 lifespan 自身的清理是否生效
-    （变异测试对此报过恒真）。
-    """
-    monkeypatch.setattr(sess_mod, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(sess_mod, "TRASH_DIR", tmp_path / "trash")
-    monkeypatch.setattr(sess_mod.Session, "cleanup", staticmethod(lambda keep_recent=30: 0))
-    srv = _load_web_server("mao_web_lifespan_tables_probe")
-
-    async def once() -> tuple[int, int, int]:
-        async with srv.lifespan(srv.app):
-            with srv._lock:
-                srv._session_orch["orphan"] = "some-orch"
-        return len(srv._agents), len(srv._last_active), len(srv._session_orch)
-
-    assert asyncio.run(once()) == (0, 0, 0), "三张会话表必须一起清空（_session_orch 不得留孤儿）"
-
-
-# ---------------- 9) 408/425 可重试 ----------------
+# ---------------- 7) 408/425 可重试 ----------------
 
 @pytest.mark.parametrize(("code", "expect_retry"), [(408, True), (425, True), (429, True),
                                                     (503, True), (404, False), (401, False)])

@@ -5,11 +5,9 @@
 - MCP _connect_once 失败回滚：transport 已 enter 后失败必须退出，不泄漏子进程
 - Agent 会话并发闸门：同一会话第二个并发轮次快速返回"会话忙"，且不写历史
 - WorkerPool.ask：命中缓存的回答不得被节点冷却误拦；无缓存的新请求仍被冷却挡住
-- CLI _print_event：pipeline_stage 事件要有阶段输出（旧实现 pipeline 全程静默）
 - bridge ask 兜底单模型：timeout/max_retries/temperature 须读 llm 配置
 - bridge stderr 编码：诊断（配置警告）必须是 UTF-8，外部驱动方按 UTF-8 解码不得报错
 - Agent should_stop：迭代顶部/工具执行前协作式取消，不再消耗 token
-- Web SSE 断开：客户端断开（生成器 aclose）应传导为后台轮次取消
 """
 from __future__ import annotations
 
@@ -221,17 +219,6 @@ def test_ask_cache_hit_bypasses_cooldown():
     assert "冷却" in pool.ask(worker, "other-prompt")
 
 
-# ---------------- CLI：pipeline 阶段输出 ----------------
-
-def test_cli_print_event_pipeline_stage(capsys):
-    from agent.__main__ import _print_event
-
-    _print_event({"type": "pipeline_stage", "stage": "draft", "summary": "3 名起草工人并行出稿中"})
-    out = capsys.readouterr().out
-    assert "[阶段]" in out and "draft" in out and "起草" in out, (
-        f"pipeline 阶段应可见输出（旧实现此事件被忽略、全程静默）：{out!r}")
-
-
 # ---------------- bridge：ask 兜底单模型读 llm 配置 ----------------
 
 def test_bridge_ask_fallback_uses_llm_config(monkeypatch):
@@ -290,45 +277,6 @@ def test_bridge_stderr_decodes_as_utf8():
     err = proc.stderr.decode("utf-8")  # 严格解码：GBK 字节在这里就会炸
     assert "配置警告" in err or proc.returncode == 0, (
         f"应有可 UTF-8 解码的诊断或无输出；stderr={err[:200]!r}")
-
-
-def test_run_stream_stdout_decodes_as_utf8():
-    """run --stream 与 bridge 同契约：stdout 纯 JSON 行且必须 UTF-8。
-
-    实测修正前 UTF-8 归一只覆盖 bridge，`run --stream` 落进管道的中文事件
-    按 GBK 编码（0xC4 起头），外部驱动方 json.loads 直接 UnicodeDecodeError。
-    LLM 指向必然拒连的端口：走 LLMError 中文提示路径，无需真实网络。
-    必须同时把池钉空（NODE_*_MODELS=""）：--solo 只关工人、主仍从池里选，
-    池非空时请求打到 .env.example 里的免费路由——真回了中文答案，
-    "必然失败"的断言就没了（本地实测翻车系环境耦合，CI 靠 runner 无外网侥幸绿）。
-    """
-    import os
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent
-    env = dict(os.environ)
-    env.update({
-        "LLM_API_KEY": "dummy",
-        "LLM_ENDPOINT": "http://127.0.0.1:9/v1",
-        "NODE_A_MODELS": "",
-        "NODE_B_MODELS": "",
-    })
-    proc = subprocess.run(
-        [sys.executable, "-m", "agent", "run", "演示任务", "--solo", "--stream"],
-        input=b"", capture_output=True, cwd=str(root), env=env, timeout=120,
-    )
-    out = proc.stdout.decode("utf-8")  # 严格解码：旧实现（GBK）在这里就会炸
-    lines = [ln for ln in out.splitlines() if ln.strip()]
-    assert lines, f"--stream 无 stdout 输出；stderr={proc.stderr[:400]!r}"
-    import json as _json
-
-    for ln in lines:
-        ev = _json.loads(ln)  # 每行都必须是合法 JSON
-        assert "event" in ev or "ok" in ev, f"非事件/结果行混入 stdout：{ln[:80]}"
-    # 中文错误提示确实在输出里（证明真的过了 GBK 陷阱，而不是恰好没打印中文）
-    assert any("模型调用失败" in ln for ln in lines), "应包含中文 LLMError 事件行"
 
 
 # ---------------- Agent：协作式取消 should_stop ----------------
@@ -390,59 +338,3 @@ def test_agent_should_stop_before_each_tool(tmp_path, monkeypatch):
         assert executed == [], f"取消后任何工具都不应执行，实际：{executed}"
     finally:
         bot.close()
-
-
-# ---------------- Web：SSE 断开传导为后台轮次取消 ----------------
-
-def test_web_sse_disconnect_cancels_turn(monkeypatch):
-    """模拟客户端中途断开：消费首帧后 aclose 生成器，后台 run 应观察到 should_stop 置位。
-
-    旧实现是同步生成器阻塞在 events.get()，断开后无法传导取消，
-    后台那一轮会整跑完继续烧 token。
-    """
-    import web.server as ws
-
-    cfg = Config(_interpolate({"agents": [
-        {"name": "n1", "base_url": "u", "api_key": "k", "model": "m1"},
-    ]}))
-    monkeypatch.setattr(ws, "_get_cfg", lambda: cfg)
-    monkeypatch.setattr(ws, "_agents", {})
-    monkeypatch.setattr(ws, "_last_active", {})
-    monkeypatch.setattr(ws, "_session_orch", {})
-
-    in_run = threading.Event()
-    stop_seen = threading.Event()
-
-    class CancelAgent:
-        mcp_status: list = []
-
-        def __init__(self, cfg, session_id=None, profile=None, **kw):
-            self.registry = SimpleNamespace(names=lambda: [])
-            self.closed = False
-
-        def run(self, message, on_event=None, should_stop=None):
-            assert should_stop is not None, "Web 必须把取消探针传进 Agent.run"
-            on_event({"type": "text", "content": "partial"})
-            in_run.set()
-            for _ in range(250):  # 模拟轮次在边界上反复检查探针
-                if should_stop():
-                    stop_seen.set()
-                    return "cancelled"
-                time.sleep(0.02)
-            return "not-cancelled"
-
-        def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(ws, "Agent", CancelAgent)
-    resp = ws.chat(ws.ChatRequest(message="hi", session_id="cx1"))
-
-    async def first_frame_then_close():
-        body = resp.body_iterator
-        frame = await body.__anext__()
-        assert frame.startswith("data:")
-        await body.aclose()  # 客户端断开：starlette 关闭生成器时会走 finally 置位
-
-    asyncio.run(first_frame_then_close())
-    assert in_run.wait(timeout=5), "后台轮次应已启动"
-    assert stop_seen.wait(timeout=5), "生成器关闭后后台轮次应观察到取消并停下"

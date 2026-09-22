@@ -55,7 +55,7 @@ class ModelHealth:
     ):
         self.store_path = Path(store_path)
         self.env_example_path = Path(env_example_path) if env_example_path else None
-        self.retire_days = max(1, int(retire_days))
+        self.retire_days = max(0, int(retire_days))  # 0 = 关闭自动下线改写（只当日隔离）
         self._lock = threading.Lock()
         # 落盘专用锁：写盘已移到 _lock 之外（见 _write_payload），多个线程可能同时
         # 落盘 —— 需要串行化，否则并发 os.replace 到同一目标在 Windows 上会互相踩。
@@ -91,7 +91,7 @@ class ModelHealth:
             entry = self._data.setdefault(name, {})
             dates = sorted(set(entry.get("fail_dates") or []) | {day})
             entry["fail_dates"] = dates[-_MAX_DATES_KEPT:]
-            if not entry.get("disabled") and self._streak_full_locked(entry["fail_dates"]):
+            if self.retire_days > 0 and not entry.get("disabled") and self._streak_full_locked(entry["fail_dates"]):
                 entry["disabled"] = day
                 # 只登记"该下线了"，真正的文件改写放到锁外（见下）
                 retire = (model, models_env)
