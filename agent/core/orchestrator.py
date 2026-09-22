@@ -1,12 +1,13 @@
-"""多智能体编排：工人池（子智能体）与派工工具。
+"""多智能体编排：工人池（子智能体）与派工。
 
 核心理念（三个臭皮匠顶个诸葛亮）：
-- 主智能体：拆解、派工、汇总、把关（它自己也可以是个免费弱模型）
-- 工人池：智能体池里除主之外的全部成员，纯文本执行器（不挂本地工具）
-- swarm 模式：把 ask_worker / ask_workers 做成主智能体的工具，
-  由主智能体在 Agent Loop 里自主决定何时拆解、派工、汇总。
-- M5 增强：ask 结果 LRU 缓存（同工同题不重复烧钱）；vote 两步投票
-  （先收集各方方案，再让全体对编号方案投票，超阈值即共识）。
+- 主智能体＝外部驱动方（经 bridge / mcp / call 三外壳调用本项目），负责拆解、派工、
+  汇总、把关——本项目不再自带内部 Agent Loop（已随"单一 bridge 内核"收敛移除）。
+- 工人池：智能体池里的全部成员，纯文本执行器（不挂本地工具，兼容性最好、最安全）。
+- 派工能力：ask_result（单个，结构化）/ ask_many（并行 + 结构化）/ vote（两步投票取共识）；
+  pick() 跨调用 round-robin 分摊负载、可跳过冷却/隔离、支持按 tags 选路。
+- 历史演进：ask 结果 LRU 缓存、并发同 key 去重、swarm 的 ask_worker 工具等均已移除
+  （外部主按需发话、命中率极低）；每次如实打网络。
 """
 from __future__ import annotations
 
@@ -55,6 +56,12 @@ class WorkerPool:
     健康档案（ModelHealth）叠加在冷却之上：仅当某模型出现**终态不可重试错误**
     （认证失败、非重试 4xx）才当天隔离（当天不再派工）；可重试的瞬时失败只进冷却，
     不会升级成全天封禁——见 _record_result。
+
+    公共 API 面（#4）：三外壳（bridge/mcp/call）实际只用到 ask_result /
+    ask_many_structured / vote / collect / pick / health_status。此外 ask / ask_many
+    （文本报告版，二者是结构化结果的渲染封装）、select_best（对**已有候选**投票择优，
+    是 _run_ballot 的公共出口）、names 是有意保留的程序化公共 API——供直接以 Python
+    方式复用内核的调用方与单测使用，不是待清理的死代码。
     """
 
     def __init__(self, cfg: Config, exclude: str | None = None,
@@ -91,7 +98,11 @@ class WorkerPool:
         self._clients: dict[str, LLMClient] = {}
         # pick() 轮转游标（#6）：随默认批量派工的调用推进，把负载摊到整个池，
         # 而非每次死取头部 N 个。单进程一池共享 → 全局 round-robin。
+        # _pick_lock 单独一把：MCP 外壳下宿主可并发发工具调用（同步工具跑在线程池），
+        # 多个默认派工会同时推进游标。绝不能复用 self._lock——pick()→_skip_reason()
+        # →_is_in_cooldown() 已持 self._lock，重入非重入锁会自死锁。
         self._pick_cursor = 0
+        self._pick_lock = threading.Lock()
 
     # ---------- 基础派工 ----------
 
@@ -106,7 +117,7 @@ class WorkerPool:
         为什么轮转（#6）：池子「一站多模型」轻易几十个，而固定取头部 N 个会让同一批
         头部节点反复挨打、最快被限流/隔离，尾部几十个模型整天闲置——既没摊薄免费额度
         又放大单点抖动。用一个随调用推进的游标做 round-robin：
-        - 单次调用内仍是**连续窗口**（确定性）——投票编号、流水线候选顺序不会在一次
+        - 单次调用内仍是**连续窗口**（确定性）——投票编号、候选顺序不会在一次
           任务中途漂移；
         - 连续多次默认调用（不显式点名 workers）则轮流覆盖整个池，把负载摊到所有可用模型。
         首次调用从头部开始（游标 0），因此"池内前 N 个"仍是第一次的结果，向后依次轮转。
@@ -130,28 +141,17 @@ class WorkerPool:
         if cap is None or cap <= 0 or not live:
             return live
         n = len(live)
-        start = self._pick_cursor % n
-        self._pick_cursor += min(cap, n)
+        with self._pick_lock:  # 仅护游标自增；live 快照与窗口切片在锁外，绝不嵌套 self._lock
+            start = self._pick_cursor % n
+            self._pick_cursor += min(cap, n)
         window = live[start:] + live[:start]  # 轮转后的连续窗口，仍保持池内相对顺序
         return window[:cap]
-
-    def overview(self) -> str:
-        if not self.profiles:
-            return "（当前池里没有其它智能体，所有工作由你自己完成）"
-        # 当日隔离直接标注在清单里：主智能体选工人时就避开，不用挨个撞错误提示
-        return "\n".join(
-            f"- {p.name}: model={p.model}"
-            + (f" tags={p.tags}" if getattr(p, "tags", "") else "")
-            + ("（今日调用已失败，当天隔离中，勿派工）" if self.health.quarantined(p.name) else "")
-            + (f"（{p.note}）" if p.note else "")
-            for p in self.profiles.values()
-        )
 
     def health_status(self) -> list[dict]:
         """每个工人的当前可用性快照，供外部主派工前预检（配合能力标签选路）。
 
         available=False 表示当前不可派：冷却中（cooldown_s 剩余秒）或当日失败隔离。
-        缓存命中不受此限（ask 里先查缓存），这里只是给主的"该不该派"参考。
+        这里只是给主的"该不该派"参考。
         """
         now = time.time()
         out: list[dict] = []
@@ -167,6 +167,24 @@ class WorkerPool:
                 "quarantined_today": quarantined,
             })
         return out
+
+    # ---------- 兜底单模型纳入健康体系（#8）----------
+    # ask 不带 agent 时走 cfg.llm 的兜底模型，它不是池里的 profile，历史上完全
+    # 游离在冷却/当日隔离之外，与主路线容错语义割裂。这里给它一个合成键 solo:<model>，
+    # 复用同一套 _skip_reason / _record_result，让兜底路径也"抖了会退避、终态失败当天不再打"。
+
+    def solo_key(self) -> str:
+        """兜底单模型在健康体系里的合成键。"""
+        return f"solo:{self.cfg.llm.get('model', '')}"
+
+    def is_dispatchable(self, name: str) -> tuple[bool, str]:
+        """任意键（含 solo 键）当前能否派工，返回 (可用?, 原因或空串)。"""
+        reason = self._skip_reason(name)
+        return (reason is None, reason or "")
+
+    def note_result(self, name: str, ok: bool, fatal: bool = False) -> None:
+        """记录任意键一次成败：冷却照记；fatal（终态不可重试）才当日隔离。"""
+        self._record_result(name, ok=ok, fatal=fatal)
 
     def _is_in_cooldown(self, name: str) -> bool:
         """该节点是否处于冷却期（冷却期跳过，避免反复打一个坏节点）。"""
@@ -413,7 +431,7 @@ class WorkerPool:
         """并行收集多个工人对同一任务的成功回答，按入参工人顺序返回（确定性）。
 
         与 ask_many 的区别：只返回成功回答的 (工人, 回答) 列表，且顺序与
-        workers 入参顺序一致，不随完成先后漂移——投票编号、流水线候选
+        workers 入参顺序一致，不随完成先后漂移——投票编号、候选顺序
         依赖该确定性（as_completed 完成序会导致同一任务两次运行编号互换）。
         失败/冷却/当日隔离/超时/空回复的工人不进结果。
 
@@ -509,7 +527,7 @@ class WorkerPool:
             })
         return out
 
-    # ---------- 两步投票（M5：多人投票取共识） ----------
+    # ---------- 两步投票（多人投票取共识） ----------
 
     def _run_ballot(
         self, candidates: list[tuple[str, str]], voters: list[str], timeout: float | None = None
@@ -567,8 +585,8 @@ class WorkerPool:
         """对已有候选方案投票择优（复用两步投票的第二步，不重复收集阶段）。
 
         返回 (胜出工人名, 胜出全文, 票况摘要)；无解析选票返回 None。
-        供流水线修订阶段等「候选已就绪」的场景复用。voters 缺省取 pick() 的
-        可用工人子集（受 collaboration.max_participants 约束），不再默认全池。
+        供调用方「候选已就绪、只想复用投票择一」的场景（程序化公共 API，见类文档）。
+        voters 缺省取 pick() 的可用工人子集（受 collaboration.max_participants 约束）。
         """
         th = threshold if threshold is not None else self.cfg.as_float(
             self.cfg.collab_cfg.get("vote_threshold", 0.5),
@@ -594,7 +612,7 @@ class WorkerPool:
         workers: list[str] | None = None,
         threshold: float | None = None,
         timeout: float | None = None,
-    ) -> str:
+    ) -> dict:
         """两步投票：先让每个工人给出方案，再让全体工人对方案编号投票。
 
         投票规则：
@@ -608,7 +626,12 @@ class WorkerPool:
         跳过冷却与当日隔离的工人）—— 全池投票在「一站多模型」的池子里意味着
         收集 N 次 + 投票 N 次共 2N 个请求，免费额度扛不住且尾部批次必然超时。
 
-        返回结构化文本（含每方案得票与共识结论），供主智能体直接采信或人工复核。
+        返回结构化 dict（#2：让外层 ok 反映真实成败，不再只回一段文本）：
+          {ok: bool, consensus: bool, report: str}
+          · ok=False：无法投票（没有可投票工人 / 全员无可用方案 / 结果无法解析），
+            report 为原因文本；
+          · ok=True & consensus=True：达成过半共识，report 含胜出方案全文；
+          · ok=True & consensus=False：投票成功但未过半，report 列票况请主裁决。
         """
         th = threshold if threshold is not None else self.cfg.as_float(
             self.cfg.collab_cfg.get("vote_threshold", 0.5),
@@ -616,17 +639,17 @@ class WorkerPool:
         )
         pool = [w for w in dict.fromkeys(workers or self.pick()) if w in self.profiles]
         if not pool:
-            return "错误：没有可投票的子智能体。"
+            return {"ok": False, "consensus": False, "report": "错误：没有可投票的子智能体。"}
 
         # 第一步：收集各工人方案（失败者淘汰，不进候选池；顺序确定性）
         candidates = self.collect(pool, prompt, timeout=timeout)
         if not candidates:
-            return "错误：所有工人均未给出可用方案，无法投票。"
+            return {"ok": False, "consensus": False, "report": "错误：所有工人均未给出可用方案，无法投票。"}
 
         # 第二步：编号后发给全体投票
         result = self._run_ballot(candidates, pool, timeout)
         if result is None:
-            return "错误：投票结果无法解析（工人未输出编号）。"
+            return {"ok": False, "consensus": False, "report": "错误：投票结果无法解析（工人未输出编号）。"}
         best_idx, tally, total, best_n, invalid = result
         ratio = best_n / total
         body = ["## 候选方案", *[f"[{i}] {w}：{ans[:96]}…" for i, (w, ans) in enumerate(candidates, 1)]]
@@ -637,12 +660,13 @@ class WorkerPool:
             body.append(
                 f"（另有 {invalid} 张票投了不存在的编号，已忽略；比例按有效票 {total} 张计算）"
             )
-        if ratio >= th:
+        consensus = ratio >= th
+        if consensus:
             winner = candidates[best_idx - 1]
             body.append(f"## 共识达成（{best_n}/{total} 票 ≥ {th:.0%}）")
             body.append(f"胜出方案（{winner[0]}）：\n{winner[1]}")
         else:
             body.append(f"## 未达共识（最高 {best_n}/{total}，阈值 {th:.0%}）")
             body.append("请主智能体结合候选内容自行裁决或要求重投。")
-        return "\n".join(body)
+        return {"ok": True, "consensus": consensus, "report": "\n".join(body)}
 

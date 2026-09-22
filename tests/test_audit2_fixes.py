@@ -57,7 +57,9 @@ def test_ballot_denominator_excludes_invalid_votes(monkeypatch):
             return {"role": "assistant", "content": "候选方案正文"}
 
     monkeypatch.setattr(orch, "LLMClient", lambda *a, **k: FakeClient())
-    out = pool.vote("选一个方案", workers=pool.names(), threshold=0.5)
+    v = pool.vote("选一个方案", workers=pool.names(), threshold=0.5)
+    assert v["ok"] is True and v["consensus"] is True, "有效票 1/1 过半 ⇒ ok+consensus 均 True"
+    out = v["report"]
     assert "共识达成" in out, f"有效票 1/1 应达成共识：\n{out}"
     assert "1/1" in out
     assert "投了不存在的编号" in out, "废票要如实提示，不能静默丢弃"

@@ -147,3 +147,22 @@ def test_registry_reads_external_workspace(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("不可读", encoding="utf-8")
     assert "超出项目根目录" in reg.execute("read_file", {"path": str(outside)})
+
+
+def test_tool_run_ok_is_structured_not_prefix_sniffed(tmp_path):
+    """#3：run() 的 ok 由 ToolResult 决定，不再嗅探输出前缀。
+    文件正文以「错误：」开头是**成功读取**；真正的越界/不存在才是失败。"""
+    extra = tmp_path / "extproj"
+    extra.mkdir()
+    (extra / "log.txt").write_text("错误：这只是日志首行\n第二行\n", encoding="utf-8")
+    reg = builtin.build_builtin_tools(_FakeCfg([str(extra)]))
+
+    good = reg.run("read_file", {"path": str(extra / "log.txt")})
+    assert good["ok"] is True, "内容以错误：开头的正常读取不该被判失败"
+    assert "错误：" in good["result"] and good["error"] == ""
+
+    # execute() 文本契约不变（ToolResult 是 str 子类）
+    assert "第二行" in reg.execute("read_file", {"path": str(extra / "log.txt")})
+
+    bad = reg.run("read_file", {"path": str(tmp_path / "outside.txt")})
+    assert bad["ok"] is False and "超出项目根目录" in bad["error"]

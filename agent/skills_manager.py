@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-from .tools.base import FunctionTool, ToolRegistry
+from .tools.base import FunctionTool, ToolRegistry, ToolResult
 
 ROOT = Path(__file__).resolve().parent.parent
 SKILLS_DIR = ROOT / "skills"
@@ -86,16 +86,19 @@ class SkillManager:
     def load_full(self, name: str) -> str:
         info = self.skills.get(name)
         if not info:
-            return f"错误：技能 '{name}' 不存在。可用技能：{', '.join(self.skills) or '无'}"
+            return ToolResult(
+                f"错误：技能 '{name}' 不存在。可用技能：{', '.join(self.skills) or '无'}", ok=False)
         return (info["dir"] / "SKILL.md").read_text(encoding="utf-8")
 
     def run_script(self, skill: str, script: str, args: dict | None = None) -> str:
         info = self.skills.get(skill)
         if not info:
-            return f"错误：技能 '{skill}' 不存在。可用技能：{', '.join(self.skills) or '无'}"
+            return ToolResult(
+                f"错误：技能 '{skill}' 不存在。可用技能：{', '.join(self.skills) or '无'}", ok=False)
         name = _safe_script_name(script)
         if name is None:
-            return f"错误：脚本名非法（只能是 scripts/ 下的文件名）：{script!r}"
+            return ToolResult(
+                f"错误：脚本名非法（只能是 scripts/ 下的文件名）：{script!r}", ok=False)
         scripts_dir = info["dir"] / "scripts"
         path = scripts_dir / name
         # 双保险：即便上面的白名单被绕过，落点也必须仍在技能自己的 scripts/ 内，
@@ -103,9 +106,10 @@ class SkillManager:
         try:
             path.resolve().relative_to(scripts_dir.resolve())
         except (ValueError, OSError):
-            return f"错误：脚本路径超出技能目录，已拒绝：{script!r}"
+            return ToolResult(
+                f"错误：脚本路径超出技能目录，已拒绝：{script!r}", ok=False)
         if not path.exists():
-            return f"错误：脚本不存在：{path}"
+            return ToolResult(f"错误：脚本不存在：{path}", ok=False)
         payload = json.dumps(args or {}, ensure_ascii=False)
         try:
             proc = subprocess.run(
@@ -115,7 +119,8 @@ class SkillManager:
                 timeout=SCRIPT_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            return f"错误：脚本超过 {SCRIPT_TIMEOUT} 秒未完成，已终止"
+            return ToolResult(
+                f"错误：脚本超过 {SCRIPT_TIMEOUT} 秒未完成，已终止", ok=False)
         from .tools.builtin import _decode
         parts = []
         if proc.stdout:

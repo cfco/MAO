@@ -28,13 +28,29 @@ class Tool:
         }
 
 
+class ToolResult(str):
+    """工具返回值：默认（裸 str）即成功；需要显式判失败时返回 `ToolResult(text, ok=False)`。
+
+    设计成 str 子类，是为了让 `execute()` 的文本契约、以及"输出即任意文本"的工具
+    （read_file/run_shell/list_dir/MCP 透传）不再被"错误：…"前缀启发式误判（#3）：
+    - 文件内容/命令输出恰好以"错误："开头 → 裸 str → ok=True（不是工具失败）；
+    - 路径越界、命令被拦、超时等**真·工具错误** → ToolResult(..., ok=False)。
+    既有对返回文本做 `==` / `in` / 切片 / startswith 的调用与测试全部照旧可用。
+    """
+
+    def __new__(cls, text: str, ok: bool = True) -> ToolResult:
+        obj = super().__new__(cls, text)
+        obj.ok = ok
+        return obj
+
+
 class FunctionTool(Tool):
     """用 Python 函数直接构造一个工具。
 
-    `func` 可写成单参 `func(args)`（绝大多数工具），也可写成双参 `func(args, ctx)`
-    ——双参版本用于需要「边执行边冒进度事件」或「响应用户取消」的工具（如 ask_workers）。
-    是否传 ctx 由本类按签名自动判定：单参工具即便注册表传了 ctx 也不会收到（保持向后
-    兼容，bridge call_tool / 测试等无 ctx 的调用路径照常工作）。
+    `func` 可写成单参 `func(args)`（当前全部内置/Skill 工具），也可写成双参
+    `func(args, ctx)`——双参是留给"边执行边冒进度事件 / 响应用户取消"这类流式工具的
+    扩展缝（当前无内置工具用到，但注册表会按签名自动决定是否透传 ctx）。单参工具即便
+    注册表传了 ctx 也不会收到（bridge call_tool / 测试等无 ctx 的调用路径照常工作）。
     """
 
     def __init__(self, name: str, description: str, input_schema: dict, func: Callable[..., str]):
@@ -102,19 +118,14 @@ class ToolRegistry:
     def openai_schemas(self) -> list[dict]:
         return [t.to_openai_schema() for t in self._tools.values()]
 
-    # 工具用「返回值文本首词」自报失败的统一约定（内置 / MCP / Skill 三条来源一致）。
-    # 注意这是文本边界的启发式：极少数正常输出恰好以这些前缀开头会被判失败，
-    # 属工具层未彻底结构化的历史约定（比 call_tool 一律 ok:true 已前进一大步）。
-    _ERROR_PREFIXES = (
-        "错误：", "工具执行出错：", "未知工具",
-        "MCP 工具调用失败：", "MCP 工具返回错误：",
-    )
-
     def run(self, name: str, arguments: str | dict, ctx: Any | None = None) -> dict:
         """执行一次工具调用，返回结构化 {ok, result, error}（#3：让 ok 反映真实成败）。
 
-        ok=False 覆盖四类：未知工具、参数非合法 JSON、工具抛异常、工具按前缀约定自报失败。
-        result 恒为给人/给模型读的文本；error 仅在失败时给出（成功为空串）。
+        ok 判定（不再嗅探返回值文本前缀）：
+        - 未知工具 / 参数非合法 JSON / 工具抛异常 → ok=False（注册表控制流错误）；
+        - 工具返回 ToolResult → 取其 .ok；
+        - 工具返回裸 str → 成功（ok=True），哪怕内容以"错误："开头（可能是文件/命令正文）。
+        result 恒为文本；error 仅失败时给出（等于 result）。
         """
         tool = self._tools.get(name)
         if tool is None:
@@ -129,12 +140,13 @@ class ToolRegistry:
             msg = f"错误：工具参数不是合法 JSON：{e}"
             return {"ok": False, "result": msg, "error": msg}
         try:
-            text = tool.execute(args, ctx)
+            out = tool.execute(args, ctx)
         except Exception as e:  # noqa: BLE001 - 工具错误必须转成文本回给模型
             msg = f"工具执行出错：{type(e).__name__}: {e}"
             return {"ok": False, "result": msg, "error": msg}
-        ok = not str(text).startswith(self._ERROR_PREFIXES)
-        return {"ok": ok, "result": text, "error": "" if ok else str(text)}
+        ok = bool(getattr(out, "ok", True))  # 裸 str → True；ToolResult → 自带标志
+        text = str(out)
+        return {"ok": ok, "result": text, "error": "" if ok else text}
 
     def execute(self, name: str, arguments: str | dict, ctx: Any | None = None) -> str:
         """执行一次工具调用，返回文本（永不抛异常）。run() 的文本包装，向后兼容。"""

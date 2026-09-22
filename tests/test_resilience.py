@@ -157,6 +157,39 @@ def test_bridge_ask_fallback_uses_llm_config(monkeypatch):
         b.close()
 
 
+def test_bridge_fallback_participates_in_health(tmp_path, monkeypatch):
+    """#8：兜底单模型也纳入健康体系——终态失败当天隔离，第二次直接跳过不再打。"""
+    from agent import bridge as br
+    from agent.core.llm import LLMError
+
+    class Boom:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def chat(self, messages, tools=None):
+            raise LLMError("auth", "bad key", retryable=False)  # 终态不可重试
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(br, "LLMClient", Boom)
+    cfg = Config(_interpolate({
+        "agents": [],
+        "llm": {"base_url": "u", "api_key": "k", "model": "solo-m"},
+    }))
+    b = br.Bridge(cfg)
+    try:
+        first = b.handle({"cmd": "ask", "prompt": "hi"})
+        assert first["ok"] is False and first["status"] == "error"
+        sk = b.workers.solo_key()
+        assert b.workers.health.quarantined(sk), "终态失败应把兜底模型当天隔离"
+        second = b.handle({"cmd": "ask", "prompt": "hi"})
+        assert second["ok"] is False and second["status"] == "quarantined", (
+            "隔离后当天不再打，直接返回 quarantine")
+    finally:
+        b.close()
+
+
 def test_bridge_call_tool_reports_failure_shape():
     """#3：call_tool 未知工具/失败必须回 ok:false，不再永远 ok:true 把错误塞进 result。"""
     from agent import bridge as br

@@ -212,7 +212,9 @@ def test_ask_many_no_valid_workers():
 def test_vote_empty_pool():
     cfg = Config(_interpolate({"agents": []}))
     pool = WorkerPool(cfg, exclude=None)
-    assert pool.vote("q") == "错误：没有可投票的子智能体。"
+    v = pool.vote("q")
+    assert v["ok"] is False and v["consensus"] is False
+    assert v["report"] == "错误：没有可投票的子智能体。"
 
 
 # ---------------- ask 并发去抖（同 key 只打一次网络） ----------------
@@ -326,8 +328,8 @@ def test_collect_and_vote_candidate_order_follows_input():
 
     orig = _install_fake_llm(FakeClient)
     try:
-        out_ab = pool.vote("题目")                      # 默认池顺序 w1, w2
-        out_ba = pool.vote("题目", workers=[w2, w1])    # 同题反序（阶段1命中缓存）
+        out_ab = pool.vote("题目")["report"]            # 默认池顺序 w1, w2
+        out_ba = pool.vote("题目", workers=[w2, w1])["report"]  # 同题反序（阶段1命中缓存）
         got_ba = pool.collect([w2, w1], "另一题")
     finally:
         orch.LLMClient = orig
@@ -699,7 +701,7 @@ def test_health_status_reflects_cooldown_and_quarantine():
     assert st["d2"]["available"] is True
 
 
-def test_agentprofile_tags_in_brief_and_overview():
+def test_agentprofile_tags_in_brief_and_health():
     cfg = Config(_interpolate({"agents": [
         {"name": "a", "base_url": "u", "api_key": "k", "model": "m", "tags": "code,中文"},
     ]}))
@@ -707,4 +709,5 @@ def test_agentprofile_tags_in_brief_and_overview():
     assert p.tags == "code,中文"
     assert p.brief()["tags"] == "code,中文"
     pool = WorkerPool(cfg, exclude=None)
-    assert "tags=code,中文" in pool.overview()
+    hs = {x["worker"]: x for x in pool.health_status()}
+    assert hs["a"]["tags"] == "code,中文", "能力标签要能在预检快照里看到（供外部主选路）"

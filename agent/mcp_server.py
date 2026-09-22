@@ -23,6 +23,9 @@ _SERVER_INSTRUCTIONS = (
     "用法建议：派工前先 health 预检（available=false 的别硬派），按 tags 决定哪类活派给谁；"
     "call_tool 使用本机工具（run_shell/文件读写/list_dir，范围=项目根+配置的 workspace）；"
     "ask/ask_many/ask_vote/run_review 调度池内免费子 AI（纯文本执行，无本地工具）。"
+    "⚠ 安全：call_tool→run_shell 会在**运行本进程的这台机器**上执行真实命令，run_shell 是"
+    "命令卫生黑名单、并非沙箱。接入前请确认你信任该宿主；生产环境建议用容器/独立账户隔离，"
+    "并只把 workspace 配成必要的目录。"
 )
 
 

@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 from ..config import ROOT, Config  # 统一从 config 拿 ROOT，避免多处重复定义漂移
-from .base import FunctionTool, ToolRegistry
+from .base import FunctionTool, ToolRegistry, ToolResult
 
 ROOT_RESOLVED = ROOT.resolve()  # 规范化后的根，用于越界比对
 
@@ -526,18 +526,20 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     def run_shell(args: dict) -> str:
         command = str(args.get("command", "")).strip()
         if not command:
-            return "错误：command 不能为空"
+            return ToolResult("错误：command 不能为空", ok=False)
         # ---- 安全检查：黑名单 + 注入模式 ----
         danger = _check_command_safety(command)
         if danger:
-            return f"错误：{danger}（run_shell 已内置安全防护；如确需执行，可在项目根目录用终端手动运行）"
+            return ToolResult(
+                f"错误：{danger}（run_shell 已内置安全防护；如确需执行，可在项目根目录用终端手动运行）",
+                ok=False)
         # cwd 必须在项目根内且确实存在；`..`/绝对路径越界直接拒绝并给提示
         cwd_raw = str(args.get("cwd") or ".")
         cwd = _resolve(cwd_raw) if cwd_raw not in (".", ROOT.as_posix(), str(ROOT)) else ROOT_RESOLVED
         if cwd is None:
-            return f"错误：cwd 超出项目根目录，被拒绝：{cwd_raw}"
+            return ToolResult(f"错误：cwd 超出项目根目录，被拒绝：{cwd_raw}", ok=False)
         if not cwd.is_dir():
-            return f"错误：cwd 不是有效目录：{cwd}"
+            return ToolResult(f"错误：cwd 不是有效目录：{cwd}", ok=False)
         # ---- shell=True 加固：优先用参数模式（shell=False），不适用时退回 shell=True ----
         proc = None
         args_list = _try_split_args(command)
@@ -575,9 +577,9 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
                     capture_output=True,
                 )
         except subprocess.TimeoutExpired:
-            return f"错误：命令超过 {timeout} 秒未完成，已终止"
+            return ToolResult(f"错误：命令超过 {timeout} 秒未完成，已终止", ok=False)
         except OSError as e:  # noqa: BLE001 - 目录等系统级错误给友好提示
-            return f"错误：无法执行命令：{e}"
+            return ToolResult(f"错误：无法执行命令：{e}", ok=False)
         parts = []
         if proc.stdout:
             parts.append(_decode(proc.stdout)[-8000:])
@@ -589,11 +591,11 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     def read_file(args: dict) -> str:
         p = _resolve(str(args.get("path", "")))
         if p is None:
-            return f"错误：路径非法或超出项目根目录：{args.get('path', '')}"
+            return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '')}", ok=False)
         if not p.exists():
-            return f"错误：文件不存在：{p}"
+            return ToolResult(f"错误：文件不存在：{p}", ok=False)
         if p.is_dir():
-            return f"错误：{p} 是目录，请用 list_dir 查看目录内容"
+            return ToolResult(f"错误：{p} 是目录，请用 list_dir 查看目录内容", ok=False)
         limit = int(args.get("limit", DEFAULT_READ_LIMIT))
         # 按字节限量读取（只读头部，不全量载入内存）：防超长单行/超大文件把内存和上下文塞爆
         with p.open("rb") as f:
@@ -614,10 +616,10 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     def write_file(args: dict) -> str:
         p = _resolve(str(args.get("path", "")))
         if p is None:
-            return f"错误：路径非法或超出项目根目录：{args.get('path', '')}"
+            return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '')}", ok=False)
         content = str(args.get("content", ""))
         if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
-            return f"错误：写入内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）"
+            return ToolResult(f"错误：写入内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）", ok=False)
         backup = _backup_before_overwrite(p)  # 覆盖前留档，保证可回滚
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -628,10 +630,10 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     def append_file(args: dict) -> str:
         p = _resolve(str(args.get("path", "")))
         if p is None:
-            return f"错误：路径非法或超出项目根目录：{args.get('path', '')}"
+            return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '')}", ok=False)
         content = str(args.get("content", ""))
         if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
-            return f"错误：追加内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）"
+            return ToolResult(f"错误：追加内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）", ok=False)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(content)
@@ -640,9 +642,9 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     def list_dir(args: dict) -> str:
         p = _resolve(str(args.get("path", ".")))
         if p is None:
-            return f"错误：路径非法或超出项目根目录：{args.get('path', '.')}"
+            return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '.')}", ok=False)
         if not p.exists():
-            return f"错误：路径不存在：{p}"
+            return ToolResult(f"错误：路径不存在：{p}", ok=False)
         try:
             entries = []
             for item in sorted(p.iterdir()):
@@ -650,7 +652,7 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
                 size = "" if item.is_dir() else f"  {item.stat().st_size}B"
                 entries.append(f"{kind}  {item.name}{size}")
         except PermissionError:
-            return f"错误：无权限访问 {p}"
+            return ToolResult(f"错误：无权限访问 {p}", ok=False)
         return "\n".join(entries) if entries else "（空目录）"
 
     registry.register(FunctionTool(

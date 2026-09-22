@@ -24,7 +24,10 @@
   {"cmd":"run_review","draft":"...","context":"可选","workers":["a","b"]}  （外部主给初稿，子 AI 只当评审团）
 
 响应：{"ok":true,...} 或 {"ok":false,"error":"..."}。
-  · ok 反映真实成败：call_tool / ask 失败即 ok:false（不再永远 true 把错误塞进 result/answer）。
+  · ok 一律反映真实成败（#2/#3）：
+    - call_tool / ask：工具或子 AI 失败即 ok:false；
+    - ask_many / run_review：ok = 至少一个工人成功（逐工人结果见 workers/reviews）；
+    - ask_vote：ok = 投票是否真正产出结果，另带 consensus 布尔（是否过半）。
   · ask / ask_many 的结构化条目带稳定 status 码：ok|error|cooldown|quarantined|missing|timeout。
 """
 from __future__ import annotations
@@ -129,11 +132,21 @@ class Bridge:
                 out["error"] = res["error"]
             return out
         if cmd == "load_skill":
-            return {"ok": True, "content": self.skills.load_full(str(req.get("name", "")))}
+            content = self.skills.load_full(str(req.get("name", "")))
+            ok = bool(getattr(content, "ok", True))
+            out = {"ok": ok, "content": str(content)}
+            if not ok:
+                out["error"] = str(content)
+            return out
         if cmd == "run_skill_script":
-            return {"ok": True, "result": self.skills.run_script(
+            res = self.skills.run_script(
                 str(req.get("skill", "")), str(req.get("script", "")), req.get("args") or {}
-            )}
+            )
+            ok = bool(getattr(res, "ok", True))
+            out = {"ok": ok, "result": str(res)}
+            if not ok:
+                out["error"] = str(res)
+            return out
         if cmd == "ask":
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
@@ -145,9 +158,16 @@ class Bridge:
                 if r["ok"]:
                     return {"ok": True, "answer": r["answer"], "status": r["status"]}
                 return {"ok": False, "answer": "", "status": r["status"], "error": r["error"]}
-            # 未指定 agent：用兜底单模型（懒创建复用）。失败归一成与工人 ask 同一种
-            # {ok:false, answer:"", status, error} 形状，不再让 LLMError 冒泡成另一种契约
-            # （#3：同一个 ask 失败此前有两种响应形状）。
+            # 未指定 agent：用兜底单模型（懒创建复用）。#8：也纳入健康体系——
+            # 冷却/当日隔离按合成键 solo:<model> 走与工人同一套判定；失败按 retryable
+            # 分级（终态错误当天隔离，瞬时失败只短时退避）。契约与工人 ask 对称
+            # （#3：失败归一成 {ok:false, answer:"", status, error}，不再冒泡成另一种形状）。
+            sk = self.workers.solo_key()
+            ok_now, reason = self.workers.is_dispatchable(sk)
+            if not ok_now:
+                status = "quarantined" if reason == "当日失败隔离" else "cooldown"
+                return {"ok": False, "answer": "", "status": status,
+                        "error": f"兜底模型今日不可用（{reason}），请指定 agent 或稍后再试"}
             client = self._fallback_client()
             try:
                 resp = client.chat([
@@ -155,13 +175,15 @@ class Bridge:
                     {"role": "user", "content": prompt},
                 ])
             except LLMError as e:
+                self.workers.note_result(sk, ok=False, fatal=not e.retryable)
                 return {"ok": False, "answer": "", "status": "error", "error": str(e)}
+            self.workers.note_result(sk, ok=True)
             return {"ok": True, "answer": resp.get("content", ""), "status": "ok"}
         if cmd == "ask_many":
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
-            # 一次收集，同时回结构化（外部主程序化消费）与文本（人读/兼容）
+            # 一次收集，同时回结构化（外部主程序化消费）与文本（人读）
             recs = self.workers.ask_many_structured(
                 _norm_workers(req.get("workers")) or self.workers.pick(),
                 prompt,
@@ -171,12 +193,23 @@ class Bridge:
                 f"### 工人 {r['worker']} 的结果\n" + (r["answer"] if r["ok"] else f"（{r['status']}）")
                 for r in recs
             )
-            return {"ok": True, "results": text, "workers": recs}
+            # #2：外层 ok = 至少一个工人成功；全失败/无可用工人 → ok:false
+            usable = any(r["ok"] for r in recs)
+            out = {"ok": usable, "results": text, "workers": recs}
+            if not usable:
+                out["error"] = "全部子 AI 均未成功（或无可用工人）"
+            return out
         if cmd == "ask_vote":
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
-            return {"ok": True, "result": self.workers.vote(prompt, _norm_workers(req.get("workers")), req.get("threshold"))}
+            v = self.workers.vote(prompt, _norm_workers(req.get("workers")), req.get("threshold"))
+            # #2：vote 返回结构化 {ok, consensus, report}——ok=投票是否真正产出结果，
+            # consensus=是否过半；无法投票时 ok:false 且带 error。
+            out = {"ok": v["ok"], "result": v["report"], "consensus": v["consensus"]}
+            if not v["ok"]:
+                out["error"] = v["report"]
+            return out
         if cmd == "run_review":
             draft = str(req.get("draft", "")).strip()
             if not draft:
@@ -190,7 +223,11 @@ class Bridge:
                 + f"【待评审稿件】\n{draft}"
             )
             recs = self.workers.ask_many_structured(reviewers, prompt, REVIEW_SYSTEM)
-            return {"ok": True, "reviews": recs}
+            usable = any(r["ok"] for r in recs)
+            out = {"ok": usable, "reviews": recs}
+            if not usable:
+                out["error"] = "全部评审工人均未成功（或无可用工人）"
+            return out
         return {"ok": False, "error": f"未知指令: {cmd}"}
 
     def close(self) -> None:
@@ -226,7 +263,14 @@ def reconfigure_streams() -> None:
 
 
 def serve(cfg: Config) -> None:
-    """阻塞式协议循环：stdin 请求行 → stdout 响应行。"""
+    """阻塞式协议循环：stdin 请求行 → stdout 响应行。
+
+    并发语义（#7）：本 shell 逐行**串行**处理——一条指令（如自适应限时可达数分钟的
+    ask_many）执行期间，后续行排队等待，且不支持中途取消；要并行只能多开进程。
+    而 mcp 外壳下宿主可并发发工具调用、同步工具跑在线程池里，故内核共享态
+    （工人池健康、客户端缓存、轮转游标等）均已按可并发访问设计/加锁。两者行为一致，
+    差别只在"一次一条"还是"可多条同时在飞"。
+    """
     reconfigure_streams()
     bridge = Bridge(cfg)
     ready = {

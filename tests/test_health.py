@@ -224,12 +224,13 @@ def test_quarantined_worker_skipped_everywhere(tmp_path):
     assert pool.collect(["st:m2"], "任务A") == []
     many = pool.ask_many(["st:m2"], "任务A")
     assert "错误" in many and "st:m2" in many
-    assert pool.vote("任务A", workers=["st:m2"]).startswith("错误"), (
+    v = pool.vote("任务A", workers=["st:m2"])
+    assert v["ok"] is False and v["report"].startswith("错误"), (
         "候选收集全被隔离 → 直接报无可用方案，而不是打出真请求"
     )
-    # 工人清单一目了然：隔离的工人被标注，主智能体选工时提前避开
-    ov = pool.overview()
-    assert "st:m2" in ov and "隔离" in ov
+    # 隔离态在预检快照里一目了然：主智能体派工前查 health 即可避开，不用挨个撞错误提示
+    hs = {x["worker"]: x for x in pool.health_status()}
+    assert hs["st:m2"]["quarantined_today"] is True and hs["st:m2"]["available"] is False
 
 
 class _Boom:

@@ -18,7 +18,7 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from .base import Tool, ToolRegistry
+from .base import Tool, ToolRegistry, ToolResult
 
 try:
     from mcp.client.streamable_http import streamablehttp_client
@@ -253,7 +253,8 @@ class McpConnection:
             with self._lock:
                 rc = self._reconnect_count
             hint = f"（已连续重连 {rc} 次，后台自动重试中）" if rc > 0 else ""
-            return f"错误：MCP server '{self.name}' 未连接：{self.error}{hint}"
+            return ToolResult(
+                f"错误：MCP server '{self.name}' 未连接：{self.error}{hint}", ok=False)
         try:
             fut = asyncio.run_coroutine_threadsafe(
                 session.call_tool(remote_name, args or {}), loop
@@ -273,7 +274,7 @@ class McpConnection:
                         loop.call_soon_threadsafe(loop.stop)
                     except Exception:  # noqa: BLE001 - loop 恰好已退出等边缘情况
                         pass
-            return f"MCP 工具调用失败：{type(e).__name__}: {e}"
+            return ToolResult(f"MCP 工具调用失败：{type(e).__name__}: {e}", ok=False)
         texts: list[str] = []
         for block in getattr(result, "content", []) or []:
             text = getattr(block, "text", None)
@@ -283,7 +284,8 @@ class McpConnection:
                 texts.append("（返回了一张图片，本工具暂以文本为主，图片已忽略）")
         joined = "\n".join(texts)
         if getattr(result, "isError", False):
-            return "MCP 工具返回错误：" + (joined or "(无错误详情)")
+            return ToolResult(
+                "MCP 工具返回错误：" + (joined or "(无错误详情)"), ok=False)
         return joined or "(空结果)"
 
 

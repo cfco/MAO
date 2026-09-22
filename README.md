@@ -255,4 +255,5 @@ mcp_servers:
 
 - 内置 `run_shell` 可直接执行本机命令，等于把本机命令权交给主智能体；bridge 通过本地 stdin/stdout 通信，不监听任何网络端口
 - `bridge` 模式等价于把本机工具权交给驱动它的外部智能体，只给你信任的智能体用
+- ⚠ **`mao mcp` 把接入门槛降到"宿主配置里加一行"**：任何连上它的 MCP 宿主（Claude Desktop / Cursor 等）都能经 `call_tool → run_shell` 在你这台机器执行命令，而 `run_shell` 是命令卫生黑名单、**并非沙箱**（`python -c` 之类可绕，见 `builtin.py` 说明）。接入前确认信任该宿主；生产环境建议用容器 / 独立账户隔离，`tools.workspace` 只配必要目录、默认为空。
 - `config.yaml` 里若直接填 API key，注意不要外传该文件
