@@ -17,9 +17,9 @@ from pathlib import Path
 
 import yaml
 
+from .config import ROOT  # 从统一来源导入 ROOT，避免各模块各自计算导致漂移
 from .tools.base import FunctionTool, ToolRegistry, ToolResult
 
-ROOT = Path(__file__).resolve().parent.parent
 SKILLS_DIR = ROOT / "skills"
 SCRIPT_TIMEOUT = 120
 # 脚本名白名单：只允许 scripts/ 下的裸文件名（字母/数字/._-，必须以 .py 结尾）
@@ -102,7 +102,7 @@ class SkillManager:
         scripts_dir = info["dir"] / "scripts"
         path = scripts_dir / name
         # 双保险：即便上面的白名单被绕过，落点也必须仍在技能自己的 scripts/ 内，
-        # 否则 execute_skill_script 就能拿 `../../x.py` 跑项目外任意 Python 文件。
+        # 否则 run_skill_script 就能拿 `../../x.py` 跑项目外任意 Python 文件。
         try:
             path.resolve().relative_to(scripts_dir.resolve())
         except (ValueError, OSError):
@@ -143,8 +143,12 @@ def register_skill_tools(registry: ToolRegistry, manager: SkillManager) -> None:
         func=lambda a: manager.load_full(str(a.get("name", ""))),
     ))
     registry.register(FunctionTool(
-        name="execute_skill_script",
-        description="执行技能自带的 Python 脚本。脚本通过命令行参数接收一个 JSON 字符串，结果用 stdout 输出。",
+        name="run_skill_script",
+        description=(
+            "执行技能自带的 Python 脚本（与 bridge/mcp 的 run_skill_script 指令同名，"
+            "避免 list_tools 与协议文档出现两套名字）。脚本通过命令行参数接收一个 JSON "
+            "字符串，结果用 stdout 输出。"
+        ),
         input_schema={
             "type": "object",
             "properties": {

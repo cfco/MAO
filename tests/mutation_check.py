@@ -70,7 +70,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M8 计票不过滤非成功票",
-        "agent/core/orchestrator.py",
+        "agent/core/voting.py",
         """            if res is None or res["status"] != ST_OK:
                 continue""",
         """            if res is None:
@@ -79,14 +79,14 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M10 vote 缺省名单改回全池",
-        "agent/core/orchestrator.py",
+        "agent/core/voting.py",
         "        pool = [w for w in dict.fromkeys(workers or self.pick()) if w in self.profiles]",
         "        pool = [w for w in dict.fromkeys(workers or self.names()) if w in self.profiles]",
         f"{TESTFILE}::test_default_fanout_is_bounded",
     ),
     (
         "M12 投票分母含无效票",
-        "agent/core/orchestrator.py",
+        "agent/core/voting.py",
         """        total = len(valid)
         invalid = len(votes) - total""",
         """        total = len(votes)
@@ -114,7 +114,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M16 注入检查不屏蔽引号",
-        "agent/tools/builtin.py",
+        "agent/tools/shell_safety.py",
         "    scan = _mask_quoted(stripped)",
         "    scan = stripped  # mutated",
         "tests/test_audit2_fixes.py::test_injection_check_ignores_quoted_literals",
@@ -137,7 +137,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M19 解释器内联代码不再扫描",
-        "agent/tools/builtin.py",
+        "agent/tools/shell_safety.py",
         "            return interp, _strip_wrapping_quotes(tokens[i + 1])",
         '            return interp, ""  # mutated',
         "tests/test_core.py::test_interpreter_inline_code_guard_blocks_bypass",

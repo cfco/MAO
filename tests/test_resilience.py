@@ -33,8 +33,8 @@ def test_mcp_reconnect_retries_after_failed_reconnect():
         n = len(attempts) + 1
         attempts.append(n)
         if n == 1:
-            # 模拟"连上后马上断开"：run_forever 启动后 50ms 内停掉 loop
-            conn.loop.call_later(0.05, conn.loop.stop)
+            # 模拟"连上后马上断开"：host 等待被唤醒（新生命周期下 loop.stop 不再使用）
+            conn.loop.call_later(0.05, conn._wake_host)
             return True
         if n >= 4:
             conn._stop.set()  # 已证明会持续重试，放线程正常收尾

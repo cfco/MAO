@@ -47,16 +47,6 @@ def test_registry_duplicate_raises():
         reg.register(FunctionTool("t", "d", {}, lambda a: "y"))
 
 
-def test_registry_restrict_returns_removed():
-    reg = ToolRegistry()
-    reg.register(FunctionTool("a", "d", {}, lambda a: "1"))
-    reg.register(FunctionTool("b", "d", {}, lambda a: "2"))
-    removed = reg.restrict(["a"])
-    assert removed == ["b"]
-    assert reg.get("b") is None
-    assert reg.get("a") is not None
-
-
 def test_registry_execute_unknown_and_bad_json():
     reg = ToolRegistry()
     reg.register(FunctionTool("t", "d", {}, lambda a: "ok"))
@@ -203,10 +193,13 @@ def test_ask_unknown_worker():
 
 
 def test_ask_many_no_valid_workers():
+    """审计 P1：点名的工人在池里不存在时不再笼统报「没有可用」，而是逐工人显式 missing。"""
     cfg = Config(_interpolate({"agents": []}))
     pool = WorkerPool(cfg, exclude=None)
     out = pool.ask_many(["nope1", "nope2"], "task")
-    assert "没有可用的子智能体" in out
+    assert "nope1" in out and "nope2" in out, "点名的工人逐个带回"
+    assert "不存在" in out, "missing 说明含可行动的提示（可用名单）"
+    assert pool.ask_many([], "task") == "错误：没有可用的子智能体。可用：无", "空名单仍走总提示"
 
 
 def test_vote_empty_pool():
@@ -535,7 +528,7 @@ def test_llm_empty_choices_retried_then_succeeds(monkeypatch):
 # ---------------- skill 脚本名路径穿越（本轮修正） ----------------
 
 def test_skill_script_path_traversal_rejected(tmp_path):
-    """execute_skill_script 的 script 入参必须只是 scripts/ 下的裸 .py 文件名。"""
+    """run_skill_script 的 script 入参必须只是 scripts/ 下的裸 .py 文件名。"""
     from agent.skills_manager import SkillManager
 
     skill_dir = tmp_path / "demo"
@@ -602,8 +595,10 @@ def test_ask_many_structured_ordered_records(monkeypatch):
     assert [r["worker"] for r in recs] == ["w1", "w2"]
     assert all(r["ok"] and r["status"] == "ok" and r["answer"] == "hi" for r in recs)
     assert all(isinstance(r["elapsed_ms"], int) for r in recs)
-    # 空工人列表 → 空结果（不抛）
-    assert pool.ask_many_structured(["ghost"], "x") == []
+    # 审计 P1：不存在的工人不再被静默丢弃，而是逐条带回 status=missing（不打网络）
+    recs = pool.ask_many_structured(["ghost"], "x")
+    assert [r["worker"] for r in recs] == ["ghost"]
+    assert recs[0]["status"] == "missing" and recs[0]["ok"] is False
 
 
 def test_answer_starting_with_error_prefix_is_still_success(monkeypatch):

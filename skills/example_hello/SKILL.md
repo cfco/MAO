@@ -12,7 +12,7 @@ description: 示例技能，用于验证 Skill 机制。当用户想测试技能
 - 用户想参考着写一个新技能
 
 ## 怎么用
-调用 execute_skill_script 工具：
+调用 run_skill_script 工具：
 - skill: `example_hello`
 - script: `hello.py`
 - args: `{"name": "对方的称呼"}`（可省略，默认叫"朋友"）

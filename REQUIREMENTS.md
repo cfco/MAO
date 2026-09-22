@@ -68,7 +68,7 @@ MAO 不再有内部 Agent 循环，也不再持久化会话——它是被外部
   - **黑名单按「命令首词」匹配**：危险命令只有被当作命令执行时才拦（`format D:`、`del /f /q /s x`、`shutdown /r`），出现在参数位的同名词不拦（`ruff format .`、`make clean`、`git log --pretty=format:%H`）——早期按任意位置匹配会大面积误拦正常开发命令。匹配前先归一 `cmd /c`·`cmd /k` 包装、路径前缀、`.exe`/`.com` 后缀；并按 `&`/`|`/`;` 切段逐段查首词（`echo x & del /s y` 也拦）。PowerShell 侧拦 `-EncodedCommand` 及其合法缩写（`-e`/`-enc`/`-ec`），`-ExecutionPolicy` 不误伤。
   - **注入模式匹配前先屏蔽引号内容**：`echo "a|b|c"` 里的管道符是字面量、不是命令拼接，直接对整串匹配会误拦（而 `python -c "print(1|2)"` 又因规则要求两侧都有分隔符而放行 —— 同一类写法两种结果）。现在先把成对引号内的内容替换为等长占位符再匹配：`cmd1 && cmd2`、`a | b | c` 照拦，引号外的拼接（`echo "x" && del y`）也照拦。
 - **MCP**：config.yaml `mcp_servers` 声明，stdio/HTTP 双传输；后台线程保长连接，**断线自动重连**（调用失败会停掉事件循环触发退避重连路径；曾连上后重连失败按退避持续重试，不是一次失败即永久放弃；首连失败仍快速失败上报）。单次连接尝试失败时逆序回滚已进入的 transport/session，防 stdio 子进程句柄泄漏。工具名 `mcp__<server>__<tool>`。**连接按配置进程内共享**（`mcp_client.acquire_group`，签名 = `mcp_servers` 内容）：同进程只维护一套连接，**引用计数**保证最后一个使用者 `close()` 时才真正断开。
-- **Skill**：`skills/<名>/SKILL.md`（frontmatter name+description），启动只注入清单省上下文，`load_skill` 按需读全文，`execute_skill_script` 跑脚本。脚本入参只接受 `scripts/` 下的裸 `.py` 文件名（拒路径分隔符/盘符/`..`），并在 resolve 后二次确认落点仍在技能目录内。
+- **Skill**：`skills/<名>/SKILL.md`（frontmatter name+description），启动只注入清单省上下文，`load_skill` 按需读全文，`run_skill_script` 跑脚本。脚本入参只接受 `scripts/` 下的裸 `.py` 文件名（拒路径分隔符/盘符/`..`），并在 resolve 后二次确认落点仍在技能目录内。
 
 ## 6. 会话与持久化
 

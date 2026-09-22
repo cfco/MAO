@@ -35,11 +35,22 @@ _RECONNECT_JITTER = 0.5    # 每次加 0~0.5s 随机抖动，避免多连接同�
 
 
 def _safe_name(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]", "_", str(s))[:32] or "srv"
+    """把任意字符串归一成工具名安全片段。
+
+    连字符 `-` 也归一为下划线：否则 server "a-b" 与 "a_b" 归一后工具名
+    `mcp__a-b__x` / `mcp__a_b__x` 不重名，注册表的重名检测形同虚设，
+    两个都注册成功——与"重名只留第一个、不炸 Bridge"的意图相悖（审计 P1b）。
+    """
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(s))[:32] or "srv"
 
 
 class McpTool(Tool):
-    """远程 MCP 工具的本地同步包装。"""
+    """远程 MCP 工具的本地同步包装。
+
+    execute 必须收 (args, ctx) 两个位置参数：ToolRegistry.run 恒以
+    `tool.execute(args, ctx)` 调用，只声明 args 会抛 TypeError，
+    被注册表兜底吞掉后所有 mcp__* 工具永远"工具执行出错"（审计 P0）。
+    """
 
     def __init__(self, name: str, description: str, input_schema: dict, conn: McpConnection, remote_name: str):
         self.name = name
@@ -48,7 +59,7 @@ class McpTool(Tool):
         self._conn = conn
         self._remote_name = remote_name
 
-    def execute(self, args: dict) -> str:
+    def execute(self, args: dict, ctx: Any | None = None) -> str:
         return self._conn.call_tool(self._remote_name, args)
 
 
@@ -57,11 +68,16 @@ class McpConnection:
 
     生命周期（含重连）：
     1) start() 启动后台线程
-    2) 线程内 new event loop → run_connect_forever() 循环：
+    2) 线程内 new event loop → 循环执行 _connect_and_host()：
        - _connect_once() 建立 transport + session + initialize
-       - 成功后保持 run_forever()
-       - 连接断开后捕获异常 → 指数退避 → 再次 _connect_once()
-    3) stop() 主动退出（设置 _stop 事件 → 线程感知后退出循环）
+       - 成功后 await 唤醒事件（host），保持会话可被 call_tool 使用
+       - 唤醒（被动断开/主动 stop）后在**同一 task** 里退出 CM → 指数退避 → 重连
+    3) stop() 置 _stop 并唤醒 host；收尾清理由后台线程完成
+
+    为什么必须"同 task 进、同 task 出"（审计 P2）：stdio_client/http 的上下文
+    管理器底层是 anyio cancel scope，跨 task 退出会直接抛错。旧实现 enter 在
+    run_until_complete 的 task A、exit 在 host 结束后的 task B，__aexit__ 必然
+    失败又被吞掉——transport/子进程从不真正关闭，每轮重连泄漏一份句柄。
     """
 
     def __init__(self, name: str, cfg: dict):
@@ -77,6 +93,9 @@ class McpConnection:
         self._stop = threading.Event()      # stop() 时置位，跳出重连循环
         self._reconnect_count: int = 0
         self._lock = threading.Lock()        # 保护 reconnect_count 和 session/error 的并发读写
+        # host 等待事件：仅在 _connect_and_host（loop 线程）内创建/清空，
+        # 其它线程通过 _wake_host()（call_soon_threadsafe 投递）唤醒它。
+        self._host_evt: asyncio.Event | None = None
 
     # ---------- 生命周期 ----------
 
@@ -88,34 +107,23 @@ class McpConnection:
             self.error = self.error or "连接超时（90s）"
 
     def _run_connect_forever(self, ready: threading.Event) -> None:
-        """后台线程主循环：连接 → 断开 → 退避重连 → ... 直到 stop()。"""
+        """后台线程主循环：连接+托管 → 唤醒（断开/停止）→ 退避重连 → ... 直到 stop()。"""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         ever_connected = False
         try:
             while not self._stop.is_set():
-                connected = self.loop.run_until_complete(self._connect_once(ready))
+                connected = self.loop.run_until_complete(self._connect_and_host(ready))
                 ready.set()  # 无论首次连接成败，都让 start() 超时逻辑能放行
-                if connected:
-                    ever_connected = True
-                    # 进入 run_forever，直到 session 因异常断开（断开时会触发 reconnect_backoff）
-                    try:
-                        self.loop.run_forever()
-                        # run_forever 正常退出（loop.stop 被调用）：需要判断是主动 stop 还是被动断开
-                    finally:
-                        self._shutdown_resources()
-                    if self._stop.is_set():
-                        break  # 主动关闭，不再重连
-                    # 被动断开：触发重连
-                    self._reconnect_count += 1
-                    self._backoff_wait()
-                    continue
+                if self._stop.is_set():
+                    break  # 主动关闭，不再重连
                 # 连接失败：首连失败直接退出（start() 拿到 error 快速上报，语义不变）；
                 # 曾连上过则说明节点活着过，此后失败属于"断线重连"范畴——免费/不稳节点
                 # 挂了又恢复是常态，必须继续指数退避重试。原实现在这里 break，
                 # 第一次重连失败就把重连线程判死刑，与模块头声明的重连承诺相悖。
-                if not ever_connected:
+                if not connected and not ever_connected:
                     break
+                ever_connected = True
                 self._reconnect_count += 1
                 self._backoff_wait()
         except Exception as e:  # noqa: BLE001 - 线程内兜底
@@ -124,12 +132,45 @@ class McpConnection:
         finally:
             # 线程收尾：关闭事件循环（否则每次 stop/线程退出泄漏一个 loop 及其句柄）。
             # 置 None 再 close，避免 call_tool 拿到已关闭的 loop 提交协程。
+            # CM 已在 _connect_and_host 的同一 task 里退出，这里只剩关 loop。
             loop, self.loop = self.loop, None
+            self.session = None
             try:
                 if loop is not None:
                     loop.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    async def _connect_and_host(self, ready: threading.Event) -> bool:
+        """一次完整的「连接 → 托管 → 清理」：enter 与 exit 恒在同一 task 内（anyio 约束）。
+
+        返回 True 表示本次确实建立过连接（退出时已把 CM 清理完）；
+        False 表示连接失败（_connect_once 内部已完成部分 enter 的回滚）。
+        host 阶段 await _host_evt：被 _wake_host 唤醒（被动断线 / 主动 stop）即收尾。
+        """
+        if not await self._connect_once(ready):
+            return False
+        # 连接建立即放行 start() 的 90s 等待——不能让 ready 等 host 结束，
+        # 否则健康长连接下 start() 会一直卡到超时才返回。
+        ready.set()
+        ev = asyncio.Event()
+        self._host_evt = ev
+        try:
+            if not self._stop.is_set():
+                await ev.wait()
+            return True
+        finally:
+            self._host_evt = None
+            await self._shutdown_once()
+            self.session = None
+            self._transport_cm = None
+            self._session_cm = None
+
+    def _wake_host(self) -> None:
+        """结束当前 host 等待（在 loop 线程上执行，见 stop/call_tool 的投递）。"""
+        ev = self._host_evt
+        if ev is not None:
+            ev.set()
 
     async def _connect_once(self, ready: threading.Event) -> bool:
         """一次连接尝试。成功返回 True（session 建立、初始化完成）。失败返回 False。
@@ -185,28 +226,12 @@ class McpConnection:
                 self.error = f"{type(e).__name__}: {e}"
             return False
 
-    def _shutdown_resources(self) -> None:
-        """关闭 transport/session 上下文管理器（不销毁 loop，重连还要用）。
-
-        loop 仍在跑（其它线程触发）用 run_coroutine_threadsafe 提交；
-        loop 已停（本线程 run_forever 退出后收尾）必须直接 run_until_complete，
-        否则提交到停住的 loop 永远不会执行，transport 句柄静默泄漏。
-        """
-        try:
-            loop = self.loop
-            if loop is None:
-                pass
-            elif loop.is_running():
-                asyncio.run_coroutine_threadsafe(self._shutdown_once(), loop).result(timeout=5)
-            else:
-                loop.run_until_complete(self._shutdown_once())
-        except Exception:  # noqa: BLE001 - 关闭时可能 loop 已死
-            pass
-        self.session = None
-        self._transport_cm = None
-        self._session_cm = None
-
     async def _shutdown_once(self) -> None:
+        """退出 session / transport 上下文管理器。
+
+        只允许由 _connect_and_host 的 finally 调用——与 __aenter__ 同一 task，
+        anyio cancel scope 才能正常退出（跨 task 退出必抛错、清理形同虚设）。
+        """
         try:
             if self._session_cm is not None:
                 await self._session_cm.__aexit__(None, None, None)
@@ -224,18 +249,20 @@ class McpConnection:
         self._stop.wait(timeout=delay)
 
     def stop(self) -> None:
+        """主动关闭：置停止位并唤醒 host，收尾（退 CM → 退线程 → 关 loop）由后台线程完成。
+
+        旧实现在这里 run_coroutine_threadsafe(_shutdown_once) + loop.stop()：
+        前者跨 task 退出 anyio scope 必抛错被吞（子进程从没关成），后者会让
+        run_until_complete 直接炸 RuntimeError。现在只需叫醒 host 任务，
+        它会在自己（=enter 时那个）task 里把清理做完再正常返回。
+        """
         self._stop.set()
-        if self.loop is not None:
+        loop = self.loop
+        if loop is not None:
             try:
-                asyncio.run_coroutine_threadsafe(self._shutdown_once(), self.loop).result(timeout=5)
-            except Exception:  # noqa: BLE001
+                loop.call_soon_threadsafe(self._wake_host)
+            except Exception:  # noqa: BLE001 - 线程已退出、loop 已关，无资源可漏
                 pass
-            try:
-                self.loop.call_soon_threadsafe(self.loop.stop)
-            except Exception:  # noqa: BLE001
-                pass
-            # 不在此处置 self.loop = None：后台线程收尾（_run_connect_forever 的 finally）
-            # 还要用它提交关闭协程并负责 close，由线程自己置空，避免竞态拿到 None 崩溃。
 
     # ---------- 调用 ----------
 
@@ -261,17 +288,15 @@ class McpConnection:
             )
             result = fut.result(timeout=300)
         except Exception as e:  # noqa: BLE001
-            # 调用时异常（session 断了）：标记重连，让后台线程接手
+            # 调用时异常（session 断了）：作废当前 session 并唤醒 host，
+            # 让后台线程走「同 task 清理 → 退避 → 重连」路径。
             if not self._stop.is_set():
                 with self._lock:
-                    self.session = None  # 触发后台 run_forever 退出 → 重连
-                # run_forever 只有 loop.stop() 才会退出（session=None 无人监听），
-                # 必须显式停掉 loop，后台线程才会走「退避 → _connect_once」重连路径，
-                # 否则该 server 从此永远返回"未连接"。
-                loop = self.loop
-                if loop is not None and loop.is_running():
+                    self.session = None
+                # _host_evt 为 None 说明线程已在退避/重连途中，无需（也无从）唤醒。
+                if self._host_evt is not None and loop.is_running():
                     try:
-                        loop.call_soon_threadsafe(loop.stop)
+                        loop.call_soon_threadsafe(self._wake_host)
                     except Exception:  # noqa: BLE001 - loop 恰好已退出等边缘情况
                         pass
             return ToolResult(f"MCP 工具调用失败：{type(e).__name__}: {e}", ok=False)
@@ -323,7 +348,13 @@ def connect_and_register(
                 conn=conn,
                 remote_name=t.name,
             )
-            registry.register(tool)
+            try:
+                registry.register(tool)
+            except ValueError as e:
+                # 重名（如 server "a-b" 与 "a_b" 归一后同名）：跳过一个工具远好过
+                # 炸掉整个 Bridge 初始化——后者会让 serve() 连 ready 行都发不出。
+                status.append(f"[MCP] {name}: 跳过重名工具 {tool.name}（远端名 {t.name}）- {e}")
+                continue
             if out_tools is not None:
                 out_tools.append(tool)
         status.append(f"[MCP] {name}: 已连接，发现 {len(tools)} 个工具")

@@ -8,53 +8,44 @@
   pick() 跨调用 round-robin 分摊负载、可跳过冷却/隔离、支持按 tags 选路。
 - 历史演进：ask 结果 LRU 缓存、并发同 key 去重、swarm 的 ask_worker 工具等均已移除
   （外部主按需发话、命中率极低）；每次如实打网络。
+
+文件结构（2026-09-22 拆分后）：
+  orchestrator.py —— WorkerPool 类：派工 + 并行 + 健康 + pick 轮转
+  voting.py       —— VotingMixin：投票两步（收集 + 编号投票）、择优
+  constants.py    —— 派工结果状态码（ST_OK/ST_ERROR 等）
+  health.py       —— 模型健康档案（当日失败隔离）
+  llm.py          —— LLM 适配层
 """
 from __future__ import annotations
 
 import concurrent.futures
-import re
 import sys
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, wait
 
 from ..config import AgentProfile, Config
+from .constants import (
+    ST_COOLDOWN,
+    ST_ERROR,
+    ST_MISSING,
+    ST_OK,
+    ST_QUARANTINED,
+    ST_TIMEOUT,
+    WORKER_SYSTEM,
+)
 from .health import ModelHealth, get_health
 from .llm import LLMClient, LLMError
-
-WORKER_SYSTEM = (
-    "你是协作团队中的工人智能体。认真完成分配给你的子任务，"
-    "直接给出结果内容本身，不要客套、不要复述任务。"
-    "如果子任务无法完成，明确说明原因和你的困难。"
-)
-VOTER_SYSTEM = (
-    "你是协作团队中的评审工人。下面给你一份方案清单，"
-    "请选出你认为最好的那份，只输出它的编号（一个数字），不要输出任何其他内容。"
-)
-
-# ---------- 派工结果状态（#4：结构化取代对「错误：」文本前缀的字符串嗅探）----------
-# 成败由**控制流**决定（是否跳过、chat 是否抛错），绝不从工人回答文本里猜：
-# 工人正常回答若以「错误：」开头也不会被误判成失败。
-ST_OK = "ok"                    # 成功拿到回答
-ST_ERROR = "error"              # 打了网络但失败（LLMError / 意外异常 / 取 client 失败）
-ST_COOLDOWN = "cooldown"        # 冷却中，本轮跳过
-ST_QUARANTINED = "quarantined"  # 当日失败隔离，本轮跳过
-ST_MISSING = "missing"          # 指定工人不在池里
-ST_TIMEOUT = "timeout"          # 批量派工整体限时内未回来（由收集层标注）
-# 以上状态码即对外 status 词表（ask_result / ask_many_structured / 单 ask 统一使用），
-# 不再另设中文标签翻译层：外部主按稳定英文码程序化消费。
-# 批量派工的整体限时不再是固定常量：按「批次 × 单请求超时」自适应推导，
-# 见 WorkerPool._effective_timeout —— 固定值在「池大 + 并发低」时必然截断尾部批次。
-# 单请求超时直接取 llm.timeout，与主智能体、工人客户端同源。
+from .voting import VotingMixin
 
 
-class WorkerPool:
+class WorkerPool(VotingMixin):
     """子智能体池：纯文本执行器（不挂本地工具，兼容性最好、最安全）。
 
     免费节点友好：单节点抖动/限流/不可用不拖垮整体——连续失败进入**短时冷却**，
     冷却中跳过该节点（ask 直接返回冷却提示），其它节点照常工作，冷却到期后自动回来。
     健康档案（ModelHealth）叠加在冷却之上：仅当某模型出现**终态不可重试错误**
-    （认证失败、非重试 4xx）才当天隔离（当天不再派工）；可重试的瞬时失败只进冷却，
+    （认证失败、非重试类 4xx）才当天隔离（当天不再派工）；可重试的瞬时失败只进冷却，
     不会升级成全天封禁——见 _record_result。
 
     公共 API 面（#4）：三外壳（bridge/mcp/call）实际只用到 ask_result /
@@ -62,6 +53,9 @@ class WorkerPool:
     （文本报告版，二者是结构化结果的渲染封装）、select_best（对**已有候选**投票择优，
     是 _run_ballot 的公共出口）、names 是有意保留的程序化公共 API——供直接以 Python
     方式复用内核的调用方与单测使用，不是待清理的死代码。
+
+    WorkerPool 继承 VotingMixin：投票相关的 vote / select_best / _run_ballot /
+    render_answer 均在 VotingMixin 中定义，这里专注派工与健康逻辑。
     """
 
     def __init__(self, cfg: Config, exclude: str | None = None,
@@ -94,7 +88,7 @@ class WorkerPool:
         # （_clients）都需加锁保护。（历史上此处还有 LRU 答案缓存与并发在飞去重，
         # 已随「单一 bridge 路线」简化移除——外部主按需发话，命中率极低。）
         self._lock = threading.Lock()
-        # 按 profile.name 缓存 LLMClient，避免每次派工都重建连接池（任务3）
+        # 按 profile.name 缓存 LLMClient，避免每次派工都重建连接池
         self._clients: dict[str, LLMClient] = {}
         # pick() 轮转游标（#6）：随默认批量派工的调用推进，把负载摊到整个池，
         # 而非每次死取头部 N 个。单进程一池共享 → 全局 round-robin。
@@ -238,17 +232,6 @@ class WorkerPool:
             notice = None
         if notice:
             print(notice, file=sys.stderr)  # stderr：bridge/--stream 的 stdout 必须纯净
-
-    @staticmethod
-    def render_answer(r: dict) -> str:
-        """把结构化派工结果渲染成对外文本（单 ask / ask_many 的人读输出）。
-
-        成败只认 status，绝不回头解析回答文本里的「错误：」字样——单一事实源：
-        ask()/ask_many 的人读文本都由这里生成，内部判定一律走 ask_result 的结构。
-        """
-        if r["status"] == ST_OK:
-            return r["answer"]
-        return f"错误：{r['error']}"
 
     def ask_result(self, worker: str, prompt: str, system: str | None = None) -> dict:
         """派工核心：返回结构化结果 {worker, ok, status, answer, error}（永不抛异常）。
@@ -408,21 +391,48 @@ class WorkerPool:
         batches = max(1, -(-max(1, n) // self.cfg.max_workers))
         return batches * per_call + 30.0
 
+    def _spawn(self, fn, sem: threading.Semaphore) -> Future:
+        """起一个 daemon 工作线程执行 fn，返回其 Future（取代 ThreadPoolExecutor）。
+
+        为什么不用 ThreadPoolExecutor（审计 P2）：它的 worker 是非 daemon 线程，
+        解释器退出时 atexit 会把它们全部 join——批量派工里的「放弃等待」只是不再
+        等结果，bridge/mcp 进程收尾仍会被在飞请求（最长 LLM timeout×retries）拖住。
+        daemon 线程让退出干脆。取消语义保留：整体限时到点后尚未开跑的任务被 cancel，
+        set_running_or_notify_cancel 返回 False ⇒ 不再打网络，不白烧免费额度。
+        """
+        fut: Future = Future()
+
+        def _run() -> None:
+            with sem:
+                if not fut.set_running_or_notify_cancel():
+                    return  # 已被放弃（cancel），不派工
+                try:
+                    fut.set_result(fn())
+                except BaseException as e:  # noqa: BLE001 - 异常必须进 future，不能杀线程
+                    fut.set_exception(e)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return fut
+
     def _run_parallel(
         self, workers: list[str], prompt: str, system: str | None, timeout: float,
         on_done=None,
     ) -> dict[str, dict | None]:
-        """并行派工给多个工人并限时收集，调用方拿到后 shutdown(wait=False) 不阻塞。
+        """并行派工给多个工人并限时收集；未完成的放弃等待（daemon 线程，不拖退出）。
 
         并发单元固定为 ask_result（结构化、不抛异常），也是各类 spy 测试的 patch 点。
-        on_done 透传给 _wait_gather（ask_many 用它记每个工人耗时；collect/vote 不传）。
+        并发上限由信号量把守（与原线程池容量等价），批次节奏与 _effective_timeout
+        的推导保持一致。on_done 透传给 _wait_gather（ask_many 用它记每个工人耗时；
+        collect/vote 不传）。
         """
-        ex = ThreadPoolExecutor(max_workers=min(len(workers), self.cfg.max_workers))
-        try:
-            futs = {ex.submit(self.ask_result, w, prompt, system): w for w in workers}
-            return self._wait_gather(futs, timeout, on_done=on_done)
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
+        if not workers:
+            return {}
+        sem = threading.Semaphore(min(len(workers), self.cfg.max_workers))
+        futs = {
+            self._spawn(lambda w=w: self.ask_result(w, prompt, system), sem): w
+            for w in workers
+        }
+        return self._wait_gather(futs, timeout, on_done=on_done)
 
     def collect(
         self, workers: list[str], prompt: str, system: str | None = None,
@@ -457,15 +467,20 @@ class WorkerPool:
 
         返回 {valid, got, elapsed, limit}。got[worker] 为 None 表示超时未完成；
         否则是 ask_result 的结构化 dict。elapsed[worker] 为该工人从派工到回来的毫秒数。
+
+        不认识的工人名**不再静默丢弃**（审计 P1）：照样进入结果、由 ask_result 如实
+        带回 status=missing——bridge 文档承诺的 status 词表含 missing，且外部主点名
+        拼错时若只收到「全部子 AI 均未成功」，会拿着同一个错名字永远重试。
         """
-        valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
+        valid = list(dict.fromkeys(workers))
         if not valid:
             return {"valid": [], "got": {}, "elapsed": {}, "limit": 0.0}
         limit = self._effective_timeout(len(valid), timeout)
         t0 = time.monotonic()
         elapsed: dict[str, int] = {}
 
-        def _on_done(w: str, res: str | None) -> None:
+        def _on_done(w: str, res: dict | None) -> None:
+            # res 来自 _wait_gather 的 fut.result()：ask_result 的结构化 dict 或 None（超时）
             elapsed[w] = int((time.monotonic() - t0) * 1000)
 
         got = self._run_parallel(valid, prompt, system, limit, on_done=_on_done)
@@ -526,147 +541,3 @@ class WorkerPool:
                 "elapsed_ms": elapsed.get(w),
             })
         return out
-
-    # ---------- 两步投票（多人投票取共识） ----------
-
-    def _run_ballot(
-        self, candidates: list[tuple[str, str]], voters: list[str], timeout: float | None = None
-    ) -> tuple[int, dict[int, int], int, int, int] | None:
-        """对编号候选方案发起投票（两步投票的第二步）。
-
-        返回 (best_idx, tally, total, best_n, invalid)：total 是**有效票数**，
-        invalid 是投了不存在编号的废票数（调用方据此如实提示）。
-        候选编号与 candidates 下标一一对应（candidates 顺序由调用方保证确定性）。
-        无任何可解析选票（超时/工人都没输出编号）返回 None。
-        阈值不在这里判（共识与否由调用方按得票比例决定），故本函数不收阈值参数。
-        """
-        numbered = [
-            f"[{i}] {w}\n预览：{ans[:80]}".replace("\n", " ")
-            for i, (w, ans) in enumerate(candidates, 1)
-        ]
-        ballot = "候选方案：\n" + "\n".join(numbered) + "\n\n请只输出你认可方案的编号数字。"
-        got = self._run_parallel(
-            voters, ballot, VOTER_SYSTEM, self._effective_timeout(len(voters), timeout)
-        )
-        votes: list[int] = []
-        for res in got.values():
-            # 只有成功派工的 ST_OK 回答才算"投票意见"：错误/跳过/超时按结构化 status
-            # 排除，绝不解析文本前缀（#4）。ask_result 已保证失败时 answer="" —— 双重保险，
-            # 冷却提示、HTTP 状态码、"超过 Ns 未完成"里带的数字都不会被误当成选票。
-            if res is None or res["status"] != ST_OK:
-                continue
-            m = re.search(r"(?<!\d)\d+(?!\d)", res["answer"])
-            if m:
-                votes.append(int(m.group()))
-        if not votes:
-            return None
-        # 分母只算**有效票**：模型偶尔会随口给个不存在的编号（如候选只有 3 份却投 9），
-        # 这种废票不该出现在共识比例的分母里。原实现 total = len(votes) 把废票也算进
-        # 分母，会出现"有效票 1/1 全投方案一、却被另 2 张废票稀释成 1/3 判为未达共识"
-        # 的错误结论 —— 投票是"取共识"的关键路径，分母错就等于结论错。
-        valid = [v for v in votes if 1 <= v <= len(candidates)]
-        if not valid:
-            return None
-        total = len(valid)
-        invalid = len(votes) - total
-        tally: dict[int, int] = {}
-        for v in valid:
-            tally[v] = tally.get(v, 0) + 1
-        best_idx, best_n = max(tally.items(), key=lambda kv: kv[1])
-        return best_idx, tally, total, best_n, invalid
-
-    def select_best(
-        self,
-        candidates: list[tuple[str, str]],
-        voters: list[str] | None = None,
-        threshold: float | None = None,
-        timeout: float | None = None,
-    ) -> tuple[str, str, str] | None:
-        """对已有候选方案投票择优（复用两步投票的第二步，不重复收集阶段）。
-
-        返回 (胜出工人名, 胜出全文, 票况摘要)；无解析选票返回 None。
-        供调用方「候选已就绪、只想复用投票择一」的场景（程序化公共 API，见类文档）。
-        voters 缺省取 pick() 的可用工人子集（受 collaboration.max_participants 约束）。
-        """
-        th = threshold if threshold is not None else self.cfg.as_float(
-            self.cfg.collab_cfg.get("vote_threshold", 0.5),
-            "collaboration.vote_threshold", 0.5, minimum=0.0,
-        )
-        pool = [w for w in dict.fromkeys(voters or self.pick()) if w in self.profiles]
-        if not pool:
-            return None
-        result = self._run_ballot(candidates, pool, timeout)
-        if result is None:
-            return None
-        best_idx, tally, total, best_n, _invalid = result
-        winner = candidates[best_idx - 1]
-        summary = (
-            f"投票 {best_n}/{total} 票（阈值 {th:.0%}）；票况："
-            + ", ".join(f"[{i}]={tally.get(i, 0)}" for i in range(1, len(candidates) + 1))
-        )
-        return winner[0], winner[1], summary
-
-    def vote(
-        self,
-        prompt: str,
-        workers: list[str] | None = None,
-        threshold: float | None = None,
-        timeout: float | None = None,
-    ) -> dict:
-        """两步投票：先让每个工人给出方案，再让全体工人对方案编号投票。
-
-        投票规则：
-        1) 并行收集各工人对同一任务的目标作答（成功结果才进入候选池），
-           候选顺序按入参工人顺序排列（编号确定性，重跑不互换）。
-        2) 把候选方案编号（附 80 字符预览）重新发给全体工人，每人选一个编号。
-        3) 统计得票：最高票数 / 总票数 >= 阈值（默认 collaboration.vote_threshold，
-           通常取 0.5，即过半共识）则宣布达成共识，否则列出票况请主智能体裁决。
-
-        workers 缺省取 pick()（按 collaboration.max_participants 限制参与人数、
-        跳过冷却与当日隔离的工人）—— 全池投票在「一站多模型」的池子里意味着
-        收集 N 次 + 投票 N 次共 2N 个请求，免费额度扛不住且尾部批次必然超时。
-
-        返回结构化 dict（#2：让外层 ok 反映真实成败，不再只回一段文本）：
-          {ok: bool, consensus: bool, report: str}
-          · ok=False：无法投票（没有可投票工人 / 全员无可用方案 / 结果无法解析），
-            report 为原因文本；
-          · ok=True & consensus=True：达成过半共识，report 含胜出方案全文；
-          · ok=True & consensus=False：投票成功但未过半，report 列票况请主裁决。
-        """
-        th = threshold if threshold is not None else self.cfg.as_float(
-            self.cfg.collab_cfg.get("vote_threshold", 0.5),
-            "collaboration.vote_threshold", 0.5, minimum=0.0,
-        )
-        pool = [w for w in dict.fromkeys(workers or self.pick()) if w in self.profiles]
-        if not pool:
-            return {"ok": False, "consensus": False, "report": "错误：没有可投票的子智能体。"}
-
-        # 第一步：收集各工人方案（失败者淘汰，不进候选池；顺序确定性）
-        candidates = self.collect(pool, prompt, timeout=timeout)
-        if not candidates:
-            return {"ok": False, "consensus": False, "report": "错误：所有工人均未给出可用方案，无法投票。"}
-
-        # 第二步：编号后发给全体投票
-        result = self._run_ballot(candidates, pool, timeout)
-        if result is None:
-            return {"ok": False, "consensus": False, "report": "错误：投票结果无法解析（工人未输出编号）。"}
-        best_idx, tally, total, best_n, invalid = result
-        ratio = best_n / total
-        body = ["## 候选方案", *[f"[{i}] {w}：{ans[:96]}…" for i, (w, ans) in enumerate(candidates, 1)]]
-        body.append("## 投票结果")
-        for i in range(1, len(candidates) + 1):
-            body.append(f"方案[{i}]: {tally.get(i, 0)}/{total} 票")
-        if invalid:
-            body.append(
-                f"（另有 {invalid} 张票投了不存在的编号，已忽略；比例按有效票 {total} 张计算）"
-            )
-        consensus = ratio >= th
-        if consensus:
-            winner = candidates[best_idx - 1]
-            body.append(f"## 共识达成（{best_n}/{total} 票 ≥ {th:.0%}）")
-            body.append(f"胜出方案（{winner[0]}）：\n{winner[1]}")
-        else:
-            body.append(f"## 未达共识（最高 {best_n}/{total}，阈值 {th:.0%}）")
-            body.append("请主智能体结合候选内容自行裁决或要求重投。")
-        return {"ok": True, "consensus": consensus, "report": "\n".join(body)}
-

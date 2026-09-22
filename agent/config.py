@@ -153,15 +153,17 @@ class Config:
         raw 用于反查「agents[*].models 来自哪个环境变量」（记录到 AgentProfile.models_env），
         模型健康自动下线时据此改写 .env.example 的对应行。缺省（如测试直接构造）留空。
         """
-        self.raw = data
+        self.raw = raw if raw is not None else data  # 兜底：构造方没传 raw 时用 data，避免 None
         self.llm_cfg: dict = data.get("llm", {}) or {}
         self.tools_cfg: dict = data.get("tools", {}) or {}
         self.collab_cfg: dict = data.get("collaboration", {}) or {}
         self.mcp_servers: list = data.get("mcp_servers", []) or []
 
         # 站名 → 插值前的原始条目（只为提取 models_env，其余字段不依赖）
+        # 读 self.raw 而非参数 raw：构造方未传 raw 时 self.raw 已兜底为 data，
+        # 两处口径一致（审计 P2：曾有一个读 self.raw 一个读参数的半截兜底）。
         raw_items: dict[str, dict] = {}
-        for item in (raw or {}).get("agents", []) or []:
+        for item in (self.raw or {}).get("agents", []) or []:
             if isinstance(item, dict) and "name" in item:
                 raw_items[str(item["name"])] = item
 
@@ -323,11 +325,17 @@ class Config:
         return [s for s in (str(x).strip() for x in raw) if s]
 
 
-def _load_dotenv(path: Path) -> list[str]:
+def _load_dotenv(path: Path, into: set[str] | None = None) -> list[str]:
     """把一个 KEY=VALUE 文件注入 os.environ（供 ${VAR} 插值使用），返回文件里出现的变量名。
 
     只返回名字、不返回值：调用方据此做分层体检（.env 应只放 key），返回值设计
     上就拿不走任何密钥内容。
+
+    `into`（可选）收集**本次实际注入**的 key：热重载时用于回收"上次由 dotenv
+    注入、但本次文件已删除"的 key（见 load_config），保证从 .env 删掉一行后
+    os.environ 不再残留旧值。只对等于 os.environ 时才收集；shell 预置的
+    同名变量（`key in os.environ and key not in _dotenv_keys` 分支）不收集、
+    load_config 也不会回收它。
 
     分层加载（调用方按序调两次，后层覆盖前层同名变量）：
     1) .env.example —— 基础层：接口地址与模型清单，随仓库维护，git pull 即更新；
@@ -363,6 +371,8 @@ def _load_dotenv(path: Path) -> list[str]:
                 continue  # shell 里已有，尊重 shell 的值
             os.environ[key] = val
             _dotenv_keys.add(key)
+            if into is not None:
+                into.add(key)
     except OSError:
         pass  # 读取失败不拖垮启动，交给原环境变量
     return names
@@ -385,13 +395,18 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     - 带进程内缓存，config.yaml / .env / .env.example 三者 mtime 均未变则直接复用。
       （.env.example 现在参与运行时配置——模型健康下线会改写它，必须纳入失效判断。）
     - force=True 强制重读并重新构建 Config（热加载场景）。
+    - 缓存只服务于默认路径：显式传 path（测试/多配置场景）每次真实读盘，
+      既不读缓存也不写缓存（审计 P2：旧实现缓存全局唯一却不区分 path，
+      加载过一次显式路径后，默认路径的调用可能拿到别的文件构建的缓存）。
     - 返回新 Config 对象，调用方用它替换自己的 cfg 引用；已有 Agent 持有的旧 cfg
       不受影响，避免 MCP 连接被意外重连。
 
     调用方可频繁调用本函数，只有配置真正变化时才解析。
     """
     global _cfg_cache, _cfg_cache_mtime, _cfg_cache_dotenv_mtime, _cfg_cache_example_mtime
+    global _dotenv_keys
     p = path or (ROOT / "config.yaml")
+    cacheable = path is None
     example_path = ROOT / ".env.example"
     dotenv_path = ROOT / ".env"
     _load_dotenv(example_path)          # 基础层：接口与模型清单
@@ -401,7 +416,8 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     dotenv_mtime = _safe_mtime(dotenv_path)
     example_mtime = _safe_mtime(example_path)
     if (
-        not force
+        cacheable
+        and not force
         and _cfg_cache is not None
         and _cfg_cache_mtime == cfg_mtime
         and _cfg_cache_dotenv_mtime == dotenv_mtime
@@ -411,6 +427,17 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     # mtime 变化 / 强制重载 / 首次加载：读磁盘 → 构建 Config → 更新缓存
     _missing_logged.clear()  # 新 config 可能引用不同的 ${VAR}，重置警告
     _bad_value_logged.clear()  # 同上：新配置可能已修好类型错，允许重新告警
+    # 热重载回收：把「上次由 dotenv 注入、本次文件已删除」的 key 从 os.environ 清掉。
+    # 旧实现 _dotenv_keys 只增不清，从 .env 删掉一行 key 后 os.environ 仍残留旧值，
+    # "停用某 key" 永远不会生效（配置/安全语义泄漏）。回收集合只含**本次实际注入**
+    # 的 key：shell 预置（不在 _dotenv_keys）的变量不受影响；example/.env 两层任一
+    # 层还有该 key 也不会被回收。
+    injected: set[str] = set()
+    _load_dotenv(example_path, injected)
+    env_names = _load_dotenv(dotenv_path, injected)
+    for stale in _dotenv_keys - injected:
+        os.environ.pop(stale, None)
+    _dotenv_keys = injected
     # 分层守卫：.env 是"AI 不可修改区"（约定只放 key），健康下线等自动改写
     # 只会发生在 .env.example。若 .env 里混进了接口/模型等非 key 变量，会静默
     # 压住 .env.example 的更新（# 下线看似失效），必须显式提醒——只报变量名，
@@ -427,7 +454,10 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     data: dict = {}
     if p.exists():
         data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    _cfg_cache = Config(_interpolate(data), raw=data)
+    cfg = Config(_interpolate(data), raw=data)
+    if not cacheable:
+        return cfg  # 显式路径：不进全局缓存，避免污染/错拿默认配置的缓存
+    _cfg_cache = cfg
     _cfg_cache_mtime = cfg_mtime
     _cfg_cache_dotenv_mtime = dotenv_mtime
     _cfg_cache_example_mtime = example_mtime

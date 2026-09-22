@@ -97,17 +97,6 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
-    def restrict(self, allowed: list[str]) -> list[str]:
-        """会话级工具隔离：只保留白名单内的工具，返回被裁剪掉的工具名。
-
-        用于多会话/多租户场景，给不同会话不同的工具权限。
-        """
-        allowed_set = set(allowed)
-        removed = [n for n in self._tools if n not in allowed_set]
-        for n in removed:
-            del self._tools[n]
-        return removed
-
     def info_list(self) -> list[dict]:
         """列出全部工具的 (name, description)，供对外展示（bridge list_tools 等）。"""
         return [

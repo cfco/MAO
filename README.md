@@ -247,7 +247,7 @@ mcp_servers:
 
 1. `skills/` 下建文件夹，写 `SKILL.md`（frontmatter 的 `name` + `description` 必填，description 决定主智能体什么时候想到用它）
 2. 需要脚本就放 `scripts/`，脚本从 `argv[1]` 接收 JSON 参数，结果 print 到 stdout
-3. 重启生效；运行时 Agent 先 `load_skill` 读全文，再用 `execute_skill_script` 跑脚本
+3. 重启生效；运行时 Agent 先 `load_skill` 读全文，再用 `run_skill_script` 跑脚本
 
 参考示例：`skills/example_hello/`
 
