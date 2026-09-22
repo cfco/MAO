@@ -96,19 +96,38 @@ def test_env_example_has_no_dead_vars():
 
 
 def test_filling_env_example_activates_llm_section(monkeypatch):
-    """模拟用户照 .env.example 填好 .env 后，config 的 llm 段与智能体池都必须真正生效。
+    """照 .env.example 填完 .env 后，config 的 llm 段与智能体池必须真正生效。
 
-    这正是修复前失败的那条：api_key 为空 → 兜底单模型不可用。
+    模板可以把"必填项"留空等你手填（本项目的 .env.example 就把两个 KEY 留空，
+    注释要求你粘贴自己的 key），所以这里分两步：
+    1) 按模板原样解析 → 有默认值/有值的项必须解析出非空结果；
+    2) 再把"必填但留空"的变量补上值 → 必须真落到 config 上。
+    第 2 步正是修复前的失败场景：填了变量名对不上的项（LLM_KEY vs LLM_API_KEY），
+    值再真也不生效。
     """
+    data = yaml.safe_load(CONFIG_YAML.read_text(encoding="utf-8"))
     for key, val in _parse_env_example().items():
         monkeypatch.setenv(key, val)
 
-    cfg = Config(_interpolate(yaml.safe_load(CONFIG_YAML.read_text(encoding="utf-8"))))
-
-    assert cfg.llm.get("api_key"), "照 .env.example 填完，兜底单模型的 api_key 不应为空"
-    assert cfg.llm.get("base_url"), "兜底单模型的 base_url 不应为空"
+    cfg = Config(_interpolate(data))
+    assert cfg.llm.get("base_url"), "兜底单模型的 base_url 不应为空（模板或默认值应提供）"
     assert cfg.llm.get("model"), "兜底单模型的 model 不应为空"
     assert cfg.agent_profiles, "照 .env.example 填完，智能体池不应为空"
+
+    # 必填变量（config 里无默认值的 ${...}）必须都在模板里有对应行，否则用户无处可填
+    declared = set(_parse_env_example())
+    required = sorted(k for k, default in _config_referenced_vars() if default is None)
+    assert required, "应当存在必填变量（如 ${LLM_API_KEY}），否则本测试失去目标"
+    for key in required:
+        assert key in declared, f"{key} 在 config.yaml 里必填，但 .env.example 没有对应行"
+
+    # 补上值 → 必须真的生效
+    for key in required:
+        monkeypatch.setenv(key, f"filled-{key}")
+    filled = _interpolate(data)
+    assert filled["llm"]["api_key"] == "filled-LLM_API_KEY", (
+        f"补上必填变量后 api_key 仍未生效：{filled['llm'].get('api_key')!r}"
+    )
 
 
 # ---------------- ${VAR:-默认值} 插值语义 ----------------
