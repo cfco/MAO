@@ -131,7 +131,12 @@ def test_default_fanout_is_bounded(monkeypatch):
 
 
 def test_explicit_workers_are_not_capped(monkeypatch):
-    """调用方显式点名的工人照做（上限只管"缺省名单"的选取）。"""
+    """调用方显式点名的工人照做（上限只管"缺省名单"的选取）。
+
+    断言"被叫到哪些人"和"返回结果的组织顺序"，不断言"调用的先后"：
+    ask_many 是并发派工，各工人线程调 ask 的时序天然抖动（CI 上 m6 就抢在 m5 前）。
+    顺序契约在结果层——ask_many 按入参顺序收集输出（见其 docstring），故这里锁它。
+    """
     pool = _pool("m1,m2,m3,m4,m5,m6", cap=2)
     calls: list[str] = []
 
@@ -140,8 +145,13 @@ def test_explicit_workers_are_not_capped(monkeypatch):
         return f"答案[{worker}]"
 
     monkeypatch.setattr(pool, "ask", spy)
-    pool.ask_many(["st:m4", "st:m5", "st:m6"], "q")
-    assert calls == ["st:m4", "st:m5", "st:m6"]
+    out = pool.ask_many(["st:m4", "st:m5", "st:m6"], "q")
+    assert sorted(calls) == ["st:m4", "st:m5", "st:m6"], "cap=2 不得截断显式名单"
+    assert [b.splitlines()[0] for b in out.split("\n\n")] == [
+        "### 工人 st:m4 的结果",
+        "### 工人 st:m5 的结果",
+        "### 工人 st:m6 的结果",
+    ], "输出必须按入参工人顺序排列"
 
 
 # ---------------- 3) MCP 连接共享 ----------------
