@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MAO 逻辑图表 · 架构 / 流程 / 状态机 + 问题清单</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#ffffff; --ink:#1f2733; --sub:#5b6673;
+    --line:#c9d2dc; --accent:#2f6fed; --accent2:#0f9d76;
+    --warn:#c2740a; --warnbg:#fdf3e3; --bad:#c0392b; --badbg:#fbecea;
+    --ok:#1a7f4b; --okbg:#eaf6ef; --chip:#eef2f7;
+    --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,"Segoe UI",Roboto,"Helvetica Neue","Microsoft YaHei",sans-serif;
+    line-height:1.6;font-size:15px}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 80px}
+  h1{font-size:26px;margin:0 0 4px}
+  .lead{color:var(--sub);margin:0 0 26px;font-size:14px}
+  h2{font-size:19px;margin:38px 0 2px;padding-top:14px;border-top:2px solid var(--line)}
+  h2 .n{display:inline-block;width:26px;height:26px;line-height:26px;text-align:center;
+    background:var(--accent);color:#fff;border-radius:6px;font-size:14px;margin-right:8px;vertical-align:middle}
+  .cap{color:var(--sub);font-size:13px;margin:0 0 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  /* generic flow boxes */
+  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:stretch}
+  .col{display:flex;flex-direction:column;gap:10px}
+  .box{border:1.5px solid var(--line);border-radius:9px;padding:10px 12px;background:#fbfcfe;min-width:150px;flex:1}
+  .box b{display:block;font-size:14px}
+  .box small{color:var(--sub);font-size:12px;display:block;margin-top:2px}
+  .box.core{border-color:var(--accent);background:#eef4ff}
+  .box.store{border-color:var(--accent2);background:#eafaf3}
+  .box.ext{border-style:dashed}
+  .arrow{align-self:center;color:var(--accent);font-size:22px;font-weight:700;padding:0 2px}
+  .vsep{display:flex;justify-content:center;color:var(--accent);font-size:20px;font-weight:700;margin:2px 0}
+  code,.mono{font-family:var(--mono);font-size:12.5px;background:var(--chip);padding:1px 6px;border-radius:5px}
+  .tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;vertical-align:middle}
+  .t-hi{background:var(--badbg);color:var(--bad)}
+  .t-mid{background:var(--warnbg);color:var(--warn)}
+  .t-low{background:var(--chip);color:var(--sub)}
+  /* decision ladder */
+  .ladder{list-style:none;margin:0;padding:0}
+  .ladder li{position:relative;padding:8px 12px 8px 40px;border-left:3px solid var(--line);margin:0}
+  .ladder li:before{content:"";position:absolute;left:-9px;top:12px;width:14px;height:14px;border-radius:50%;
+    background:var(--accent);border:2px solid #fff}
+  .ladder li.stop:before{background:var(--bad)}
+  .ladder li.ok:before{background:var(--ok)}
+  /* issues */
+  .issue{border:1px solid var(--line);border-left-width:5px;border-radius:8px;padding:12px 14px;margin:12px 0;background:#fff}
+  .issue.hi{border-left-color:var(--bad)}
+  .issue.mid{border-left-color:var(--warn)}
+  .issue.low{border-left-color:var(--sub)}
+  .issue h4{margin:0 0 4px;font-size:15px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .issue p{margin:4px 0;font-size:14px}
+  .loc{font-family:var(--mono);font-size:11.5px;color:var(--sub)}
+  .fix{color:var(--ok)}
+  ul.tight{margin:6px 0;padding-left:20px}
+  ul.tight li{margin:2px 0}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;margin:8px 0}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#eef2f7;font-weight:700}
+  .foot{color:var(--sub);font-size:12px;margin-top:40px;border-top:1px solid var(--line);padding-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>MAO 逻辑图表</h1>
+  <p class="lead">读代码梳理 · 2026-09-22 · 定位：谁启动并驱动本项目，谁就是「外部主 AI」；MAO 只做<b>执行器</b>（本机工具 / MCP / Skill）＋<b>免费模型工人池</b>，目标是帮主 AI 干脏活、并行/交叉验证、省 token。入口只剩 <code>python -m agent bridge</code>。</p>
+
+  <!-- 1 -->
+  <h2><span class="n">1</span>模块与依赖全景</h2>
+  <p class="cap">实线＝进程内直接依赖；虚线＝外部世界。共享状态（工人池 / 健康档案 / MCP 连接组）都是进程内单例，避免多实例互相覆写。</p>
+  <div class="card">
+    <div class="row">
+      <div class="box ext"><b>外部主 AI</b><small>千问办公 / WorkBuddy 等</small></div>
+      <div class="arrow">⇄</div>
+      <div class="box ext"><b>各中转站 / 官方 API</b><small>OpenAI 兼容端点（免费 key 池）</small></div>
+    </div>
+    <div class="vsep">▲ stdin/stdout JSON 行（UTF-8）</div>
+    <div class="row">
+      <div class="box core"><b>agent/__main__.py</b><small>CLI：仅 bridge 子命令，先归一 stdio 再 load_config</small></div>
+      <div class="box core"><b>agent/bridge.py · Bridge</b><small>协议循环 serve() + 指令分发 handle()</small></div>
+    </div>
+    <div class="vsep">▼ 组装并驱动</div>
+    <div class="row">
+      <div class="box"><b>core.orchestrator · WorkerPool</b><small>ask / ask_many / collect / vote / pick / health_status</small></div>
+      <div class="box"><b>tools.base · ToolRegistry</b><small>统一 name+schema+execute，call_tool 走它</small></div>
+      <div class="box"><b>config · Config / load_config</b><small>AgentProfile 池 + 分层 dotenv + 类型安全读取</small></div>
+    </div>
+    <div class="row">
+      <div class="box store"><b>core.health · ModelHealth</b><small>当日失败隔离，get_health(path) 进程内共享单例</small></div>
+      <div class="box store"><b>core.llm · LLMClient</b><small>OpenAI 兼容 + 分类重试退避；工人按名缓存复用</small></div>
+      <div class="box store"><b>tools.builtin / mcp_client / skills_manager</b><small>run_shell+文件 / MCP 共享连接组 / Skill 工具</small></div>
+    </div>
+  </div>
+
+  <!-- 2 -->
+  <h2><span class="n">2</span>bridge 协议处理流程</h2>
+  <p class="cap">一条 stdin 行 → 一个 stdout 行；<b>串行</b>处理，单条指令抛异常不拖垮循环。诊断/警告一律 stderr，保证 stdout 纯 JSON。</p>
+  <div class="card">
+    <div class="row">
+      <div class="box"><b>启动握手</b><small>发 1 行 ready：version / agents / mcp 状态</small></div>
+      <div class="arrow">→</div>
+      <div class="box"><b>读一行</b><small>strip 空行跳过 → json.loads</small></div>
+      <div class="arrow">→</div>
+      <div class="box core"><b>handle(req)</b><small>按 cmd 分发</small></div>
+      <div class="arrow">→</div>
+      <div class="box"><b>写一行响应</b><small>{"ok":...} + flush</small></div>
+    </div>
+    <table>
+      <tr><th>cmd</th><th>落到哪里</th><th>返回形状</th></tr>
+      <tr><td><code>ping / list_agents / list_tools / health</code></td><td>cfg / registry / workers.health_status</td><td>结构化清单</td></tr>
+      <tr><td><code>call_tool</code></td><td>registry.run(name,args)</td><td>ok=<b>真实成败</b>, result=<b>文本</b>；失败附 error（#3 修复）</td></tr>
+      <tr><td><code>ask</code>（带 agent）</td><td>workers.ask_result → render</td><td>ok=<b>真实成败</b>, answer=<b>文本</b>, status∈ok/error/冷却中/当日失败隔离/missing</td></tr>
+      <tr><td><code>ask</code>（不带 agent）</td><td>_fallback_client().chat()</td><td>成功 ok:true；失败归一成 {ok:false,status:error,error}（不再冒泡成另一种形状）</td></tr>
+      <tr><td><code>ask_many / run_review</code></td><td>workers.ask_many_structured</td><td>ok:true, workers=[{worker,ok,status,answer,elapsed_ms}]</td></tr>
+      <tr><td><code>ask_vote</code></td><td>workers.vote</td><td>ok:true, result=<b>投票文本块</b></td></tr>
+    </table>
+  </div>
+
+  <!-- 3 -->
+  <h2><span class="n">3</span>单个工人派工 + 容错状态机</h2>
+  <p class="cap">这是全项目最关键的"免费节点友好"逻辑。<code>ask_result()</code> 返回结构化 {ok,status,answer,error}、不抛异常——批量路径（collect/vote）按 status 判定，<code>ask()</code> 是其文本包装。</p>
+  <div class="card">
+    <ol class="ladder">
+      <li>worker 在池里吗？<small>否 → status=missing，返回「错误：子智能体不存在」</small></li>
+      <li class="stop">冷却中？<small>_cooldowns 未到期 → status=cooldown，跳过提示（到期自动回来）</small></li>
+      <li class="stop">当日失败隔离？<small>ModelHealth 今天记过<b>终态</b>失败 → status=quarantined，"明天再试"</small></li>
+      <li class="ok">都通过 → <code>_call_result()</code>：取缓存 LLMClient → chat → 按性质记账</li>
+    </ol>
+    <div class="vsep">▼ _call_result 结果分路记账（_record_result(name, ok, fatal)）</div>
+    <div class="row">
+      <div class="box" style="border-color:var(--ok)"><b>成功</b><small>清冷却、连击归零</small></div>
+      <div class="box" style="border-color:var(--warn)"><b>可重试失败</b><small>timeout/429/5xx/连接/意外异常 → fatal=False：连击+1、达阈值进<b>短时冷却</b>；<b>不</b>当日隔离，当天仍可回来（#1 修复）</small></div>
+      <div class="box" style="border-color:var(--bad)"><b>终态不可重试失败</b><small>auth / 非重试 4xx → fatal=True：冷却 + 记 health.record_failure → <b>当天隔离</b></small></div>
+    </div>
+    <p class="cap" style="margin-top:10px">✅ #1/#2 修复后：冷却与当日隔离各司其职——一次瞬时抖动只短时退避，不会"一失败就封一整天"把整池打空。</p>
+  </div>
+
+  <!-- 4 -->
+  <h2><span class="n">4</span>批量派工 & 两步投票</h2>
+  <div class="card">
+    <b>ask_many / run_review（一次收集）</b>
+    <div class="row" style="margin-top:6px">
+      <div class="box"><b>pick()</b><small>跳过冷却/隔离 + 可选 tags 过滤；<b>跨调用 round-robin 轮转</b>取 max_participants（单次内确定性窗口，首次取头部）</small></div>
+      <div class="arrow">→</div>
+      <div class="box"><b>ThreadPool</b><small>并发 = max_workers（默认 3）</small></div>
+      <div class="arrow">→</div>
+      <div class="box"><b>_wait_gather</b><small>自适应总限时 = 批次数×llm.timeout+30s；超时工人标 timeout</small></div>
+      <div class="arrow">→</div>
+      <div class="box"><b>结构化结果</b><small>status∈{ok,error,冷却中,当日失败隔离,timeout}</small></div>
+    </div>
+    <div style="height:14px"></div>
+    <b>vote（两步：先出方案，再投票）</b>
+    <div class="row" style="margin-top:6px">
+      <div class="box"><b>collect(pool)</b><small>各工人给方案，失败/跳过/空淘汰，顺序确定性</small></div>
+      <div class="arrow">→</div>
+      <div class="box"><b>编号 ballot</b><small>[1][2]…附 80 字预览，全体回编号</small></div>
+      <div class="arrow">→</div>
+      <div class="box"><b>_run_ballot</b><small>先剔"错误/跳过"再抓数字；分母只算有效票</small></div>
+      <div class="arrow">→</div>
+      <div class="box"><b>阈值判共识</b><small>最高票/有效票 ≥ vote_threshold(0.5)</small></div>
+    </div>
+  </div>
+
+  <!-- 5 -->
+  <h2><span class="n">5</span>配置分层与热加载</h2>
+  <p class="cap">后层覆盖前层；<code>${VAR}</code> 运行时插值。约定 .env 只放 key（保密、AI 不读），.env.example 放接口/模型清单（随仓库维护、真实参与运行时）。</p>
+  <div class="card">
+    <div class="row">
+      <div class="box"><b>shell 环境变量</b><small>最高，不被文件覆盖</small></div>
+      <div class="arrow">&gt;</div>
+      <div class="box"><b>.env</b><small>只放 *KEY；混入非 key 变量→启动提醒删掉</small></div>
+      <div class="arrow">&gt;</div>
+      <div class="box"><b>.env.example</b><small>base_url / MODELS 清单，#前缀=临时屏蔽</small></div>
+      <div class="arrow">→</div>
+      <div class="box core"><b>Config</b><small>每站展开多模型成 AgentProfile；mtime 变化才重载</small></div>
+    </div>
+    <p class="cap" style="margin-top:10px">数值项走 as_int/as_float/as_list：类型写错只告警回退默认、绝不崩。</p>
+  </div>
+
+  <!-- ISSUES -->
+  <h2><span class="n">!</span>读代码时发现的隐患清单</h2>
+  <p class="cap">按影响排序。<b style="color:var(--ok)">✅ #1–#6 已于 2026-09-22 全部修复</b>（离线全量 126 测试通过 + 变异回归 14 项全绿）；#7–#9 为低优先级，暂未动。各条下方保留原始问题描述，末尾「建议」即落地方案。</p>
+
+  <div class="issue hi">
+    <h4><span class="tag" style="background:var(--okbg);color:var(--ok)">✅已修</span> #1 任何一次失败即"全天隔离"，对免费节点过于激进 <span class="loc">orchestrator._call_result → _record_result → health.record_failure</span></h4>
+    <p>失败路径<b>无条件</b>记当日隔离——包括一次网络 timeout、一次连接抖动、一次 429 限流。免费中转站天天限流/抖动是常态，于是「早上 9 点被限一次 → 该模型今天彻底不派工」。叠加 <code>pick()</code> 只取池内<b>前 5 个存活</b>，很容易把头部 5 个打空后整批隔离，而后面的 35 个模型全程闲置、当天也不轮转。</p>
+    <p class="fix">可考虑：只对"终态不可重试错误"（auth / 4xx）做当日隔离，可重试类（timeout/429/5xx/连接）仅进冷却；或在隔离判定里加"当天失败次数阈值"。</p>
+  </div>
+
+  <div class="issue hi">
+    <h4><span class="tag" style="background:var(--okbg);color:var(--ok)">✅已修</span> #2 冷却层基本被隔离层架空 <span class="loc">orchestrator._skip_reason / _record_result</span></h4>
+    <p>设计是双层：连击达 <code>cooldown_fails</code>(默认2)进<b>冷却</b>（短时、会恢复），终态失败进<b>当日隔离</b>。但两者都由同一次失败触发，而隔离第一次就生效 → 冷却几乎永远轮不到起作用，"指数冷却、成功即恢复"这套逻辑实质被短路。这与 #1 是同一根因的两面。</p>
+  </div>
+
+  <div class="issue mid">
+    <h4><span class="tag" style="background:var(--okbg);color:var(--ok)">✅已修</span> #3 ok 字段不反映真实成败，外部主得靠字符串猜 <span class="loc">bridge.handle / ToolRegistry.run / WorkerPool.ask_result</span></h4>
+    <p><code>call_tool</code>、<code>ask</code>(带 agent)、<code>ask_many</code> 即使底层失败，也回 <code>{"ok":true, "result/answer":"错误：…"}</code>；而 <code>ask</code> 不带 agent 时 <code>LLMError</code> 会冒泡成 <code>{"ok":false}</code>。同一个"ask 失败"有两种契约形状，且成败信息藏在文本前缀里。外部主要么按 <code>"错误："/"失败："</code> 前缀解析，要么只能盲信 ok。</p>
+    <p class="fix">可考虑：tool/单 ask 路径也回结构化 status；或统一把底层错误归一到 ok:false + error，answer 只放成功内容。</p>
+  </div>
+
+  <div class="issue mid">
+    <h4><span class="tag" style="background:var(--okbg);color:var(--ok)">✅已修</span> #4 全靠"错误：/失败：/子智能体"魔法前缀做分类 <span class="loc">orchestrator.ask_result / collect / vote / _run_ballot</span></h4>
+    <p>collect/vote 用 <code>out.startswith("错误：")</code> 判失败、用「错误：子智能体 + 标记词」判跳过。这是 stringly-typed 耦合：<b>工人正常回答若以"错误："开头会被当失败丢弃</b>，反过来正常文本里出现冷却字样也可能误判。投票里已经专门为此加注释（怕 429 数字被当成选票）——说明这套脆弱契约已在打补丁。</p>
+    <p class="fix">内部传结构化对象（ok/answer/kind），只在最后渲染成人读文本时再拼前缀。</p>
+  </div>
+
+  <div class="issue mid">
+    <h4><span class="tag" style="background:var(--okbg);color:var(--ok)">✅已修</span> #5 run_shell 黑名单可被解释器轻易绕过 <span class="loc">builtin._check_command_safety / _scan_code_body</span></h4>
+    <p>黑名单锚定"命令首词"，但 <code>python -c "import os,shutil; ..."</code>、<code>powershell -f evil.ps1</code>、<code>node -e</code> 等首词是解释器，正文从不扫描——任意代码照跑，del/format 防护形同虚设。文件工具（read/write/list_dir）有 <code>_resolve</code> 越界防护，但 <code>run_shell</code> 除 cwd + 重定向启发式外<b>不受工作区约束</b>，两套边界不一致：可用 <code>python -c open('/绝对路径','w')</code> 绕过文件沙箱。</p>
+    <p class="fix">若确要"给主一双不受限的手"，就把这点在文档/工具描述里讲明（当前是纵深防御非边界）；否则黑名单应升级为"解释器 -c/-e/脚本文件"的额外拦截，或文件类工具与 shell 共用同一套根约束。</p>
+  </div>
+
+  <div class="issue mid">
+    <h4><span class="tag" style="background:var(--okbg);color:var(--ok)">✅已修</span> #6 pick() 固定取头部 N，默认派工从不轮转、负载不均 <span class="loc">orchestrator.pick / _pick_cursor</span></h4>
+    <p><code>pick() = live[:cap]</code>，顺序是池内声明序。默认 ask_many/vote/run_review 永远只打<b>同样那 5 个头部节点</b>，其余模型闲置；头部被限流隔离后窗口才缓慢后移。与"多免费 key 分摊额度省 token"的初衷相悖。</p>
+    <p class="fix">默认按 tags / 上次使用时间 / 轮转选 N 个，把额度摊到整池（保持一次调用内顺序确定性即可，无需跨调用固定）。</p>
+  </div>
+
+  <div class="issue low">
+    <h4><span class="tag t-low">低</span> #7 bridge 请求串行，外部主无法并发/中途取消 <span class="loc">bridge.serve</span></h4>
+    <p>for 循环逐行处理，一条长 ask_many（自适应限时可能几分钟）会阻塞整个连接；外部主期间发来的行排队、也无法发"取消"。要并行只能开多个子进程（各自重建 MCP/池）。</p>
+  </div>
+
+  <div class="issue low">
+    <h4><span class="tag t-low">低</span> #8 兜底单模型 ask 不进任何健康体系 <span class="loc">bridge._fallback_client</span></h4>
+    <p>不带 agent 的 ask 直连 LLMClient，不记冷却/隔离、不复用工人缓存，与主路线容错语义割裂；且 <code>Config.raw = data</code> 存的是插值后数据（命名易误解为原始）。属边角一致性。</p>
+  </div>
+
+  <div class="issue low">
+    <h4><span class="tag t-low">低</span> #9 文档 / 注释漂移 <span class="loc">config.yaml 头注释 · orchestrator 头注释</span></h4>
+    <ul class="tight">
+      <li>config.yaml 仍写"被选中/指定的那个当主智能体""solo/兜底路径"，但这些入口已随"仅 bridge"移除。</li>
+      <li>orchestrator 头注释提"swarm 模式/ask_worker 工具/M5 LRU 缓存"，正文已删；<code>health.record_failure</code> 的 model/models_env 参数、<code>active_dates</code> 均已成死字段。</li>
+      <li><code>_split_models</code> 把 <code>@128k</code> 按 1024 折 token，与"k≈1000"惯例有偏差（影响极小）。</li>
+    </ul>
+  </div>
+
+  <div class="foot">
+    以上仅为静态读码观察，未运行测试。#1/#2 同源，是这批里最值得先定夺的策略问题（隔离该不该覆盖"可重试的瞬时失败"）。要我针对其中某条深入验证或给改法，说一声即可。
+  </div>
+</div>
+</body>
+</html>
