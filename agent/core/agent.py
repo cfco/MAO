@@ -17,6 +17,7 @@ from ..config import DEFAULT_CONTEXT, ROOT, AgentProfile, Config
 from ..skills_manager import SkillManager, register_skill_tools
 from ..tools.base import ToolRegistry
 from ..tools.builtin import build_builtin_tools
+from .health import ModelHealth
 from .llm import LLMClient, LLMError
 from .orchestrator import WorkerPool, register_worker_tools
 from .pipeline import Pipeline, register_pipeline_tool
@@ -116,6 +117,16 @@ class Agent:
                 register_worker_tools(self.registry, pool)
                 # 固定流水线工具：run_pipeline（起草→评审→修订）
                 register_pipeline_tool(self.registry, lambda: Pipeline(pool))
+
+        # 模型健康档案：有工人池时共用同一本账（池负责派工侧记账与隔离），
+        # 没有池（solo/池空）也单独建一份——主智能体请求失败同样记账、计连击。
+        self.health: ModelHealth = (
+            self.worker_pool.health
+            if self.worker_pool is not None
+            else ModelHealth(
+                cfg.model_health_path, cfg.env_example_path, retire_days=cfg.health_retire_days
+            )
+        )
 
         # 会话级工具隔离：白名单裁剪（在全部工具注册完成后执行）
         # 无条件初始化默认值，去掉外部依赖 getattr(bot, "removed_tools", []) 兜底
@@ -242,6 +253,7 @@ class Agent:
                 msg = self.llm.chat(messages, tools=schemas or None)
             except LLMError as e:
                 # 免费节点友好：主节点失败不崩整体，给出可行动的错误说明
+                self._note_model_failure()  # 记入健康档案（只记账不隔离主，见方法注释）
                 msg_err = (f"模型调用失败[{e.error_type}]：{e}"
                            + ("（提示：稍后可重试；也可换一个可用节点当主或让工人代跑）" if e.retryable else ""))
                 self.session.add("assistant", msg_err)
@@ -249,6 +261,7 @@ class Agent:
                 emit({"type": "final", "content": msg_err})
                 return msg_err
             except Exception as e:  # noqa: BLE001 - 非 LLMError 的意外异常（网络库裸异常等）也不该崩整轮
+                self._note_model_failure()
                 msg_err = f"模型调用异常：{type(e).__name__}: {e}"
                 self.session.add("assistant", msg_err)
                 emit({"type": "error", "message": msg_err})
@@ -294,6 +307,29 @@ class Agent:
         self.session.add("assistant", fallback)
         emit({"type": "final", "content": fallback})
         return fallback
+
+    def _note_model_failure(self) -> None:
+        """把主智能体一次终态失败记入模型健康档案（当日标记 + 连击计数）。
+
+        语义边界：主节点是用户/启动方式明确选中的，记档但**不**据此拦截主的
+        下一轮运行（拦截等于替用户换主，行为不可预期）；当日隔离只作用于工人
+        派工。连击达 retire_days 个运行日时同样会在 .env.example 给该模型标 #——
+        下次加载配置起，它既不在池里、也不再能被选为默认主（显式指定的
+        --agent/solo 仍按用户意志放行，仅继续记账）。
+        """
+        p = self.profile
+        # getattr 兜底：这是失败收尾路径，llm 被替换成缺属性的测试替身/适配器时
+        # 也不能让记账再把整轮炸掉（真 LLMClient 恒有 .model）。
+        llm_model = str(getattr(self.llm, "model", "") or "llm")
+        name = p.name if p else f"solo:{llm_model}"
+        model = p.model if p else llm_model
+        env = p.models_env if p else ""
+        try:
+            notice = self.health.record_failure(name, model, env)
+        except Exception:  # noqa: BLE001 - 档案异常不影响整轮收尾
+            return
+        if notice:
+            print(notice, file=sys.stderr)  # stdout 必须留给 --stream/bridge 的 JSON 行
 
     def _interrupted(self, emit: EventCallback) -> str:
         """协作式取消的统一收尾：写入会话历史再发 final，

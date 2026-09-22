@@ -2,6 +2,11 @@
 
 v2：智能体池（agents 列表）——每个条目是一个 AgentProfile。
 主智能体=被启动方式选中/指定的那一条，其余自动成为工人（子智能体）。
+
+配置分层（环境变量注入顺序，后层覆盖前层）：
+    shell 环境变量 > .env（只放 key，保密不进 git）> .env.example（接口+模型清单，随仓库维护）
+.env.example 不只是示例：它作为基础层在运行时真实加载，git pull 更新模型清单即生效；
+.env 只需写几行 KEY=... 覆盖同名空占位。
 """
 from __future__ import annotations
 
@@ -44,7 +49,7 @@ def _interpolate(value: Any) -> Any:
         if default is not None:
             return default
         if key not in _missing_logged:
-            print(f"[配置警告] ${key} 未在 .env 或环境变量中找到，插值为空串", file=sys.stderr)
+            print(f"[配置警告] ${key} 未在 .env / .env.example / 环境变量中定义，插值为空串", file=sys.stderr)
             _missing_logged.add(key)
         return ""
 
@@ -109,6 +114,9 @@ class AgentProfile:
     model: str
     context_length: int = 0  # 上下文窗口(token)；0=未指定按 DEFAULT_CONTEXT
     note: str = ""
+    # 该模型清单来自哪个环境变量（如 NODE_A_MODELS）；模型健康下线时
+    # 据此精确改写 .env.example 对应行。值写死在 config.yaml（非 ${VAR}）时为空。
+    models_env: str = ""
 
     def brief(self) -> dict:
         """对外展示用（不含 key）。"""
@@ -122,7 +130,12 @@ class AgentProfile:
 
 
 class Config:
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, raw: dict | None = None):
+        """data：已完成 ${VAR} 插值的配置；raw：插值前的原始数据（可选）。
+
+        raw 用于反查「agents[*].models 来自哪个环境变量」（记录到 AgentProfile.models_env），
+        模型健康自动下线时据此改写 .env.example 的对应行。缺省（如测试直接构造）留空。
+        """
         self.raw = data
         self.llm_cfg: dict = data.get("llm", {}) or {}
         self.server: dict = data.get("server", {}) or {}
@@ -130,6 +143,12 @@ class Config:
         self.collab_cfg: dict = data.get("collaboration", {}) or {}
         self.session_cfg: dict = data.get("session", {}) or {}
         self.mcp_servers: list = data.get("mcp_servers", []) or []
+
+        # 站名 → 插值前的原始条目（只为提取 models_env，其余字段不依赖）
+        raw_items: dict[str, dict] = {}
+        for item in (raw or {}).get("agents", []) or []:
+            if isinstance(item, dict) and "name" in item:
+                raw_items[str(item["name"])] = item
 
         self.agent_profiles: list[AgentProfile] = []
         seen: set[str] = set()
@@ -144,9 +163,14 @@ class Config:
             model_list = _split_models(models)
             if not model_list:
                 continue
-            for m, ctx_len in model_list:
+            # models 字段插值前形如 ${NODE_A_MODELS} → 提取变量名 NODE_A_MODELS
+            raw_item = raw_items.get(station) or {}
+            raw_models = str(raw_item.get("models") or raw_item.get("model") or "")
+            m = _ENV_PATTERN.search(raw_models)
+            models_env = m.group(1) if m else ""
+            for mi, ctx_len in model_list:
                 # 一站单模型保留站名（简洁），多模型加模型后缀保证可识别
-                pname = station if len(model_list) == 1 else f"{station}:{m}"
+                pname = station if len(model_list) == 1 else f"{station}:{mi}"
                 if pname in seen:
                     continue
                 seen.add(pname)
@@ -155,9 +179,10 @@ class Config:
                         name=pname,
                         base_url=base_url,
                         api_key=api_key,
-                        model=m,
+                        model=mi,
                         context_length=ctx_len,
                         note=str(item.get("note", "")),
+                        models_env=models_env,
                     )
                 )
 
@@ -172,6 +197,32 @@ class Config:
     @property
     def max_workers(self) -> int:
         return max(1, int(self.collab_cfg.get("max_workers", 3)))
+
+    # ---------- 模型健康档案（collaboration.*） ----------
+
+    @property
+    def model_health_path(self) -> Path:
+        """模型健康档案（当日失败隔离/连续失败下线记录）落盘位置。
+
+        优先级：环境变量 MAO_HEALTH_FILE > collaboration.health_file > 默认
+        data/model_health.json。环境变量主要是给测试用：每个用例指到
+        tmp_path，避免共享档案造成跨用例隔离污染。
+        """
+        rel = os.environ.get("MAO_HEALTH_FILE") or str(
+            self.collab_cfg.get("health_file", "data/model_health.json")
+        )
+        p = Path(rel)
+        return p if p.is_absolute() else ROOT / p
+
+    @property
+    def env_example_path(self) -> Path:
+        """模型清单所在的分层配置基础层（健康下线时改写此文件）。"""
+        return ROOT / ".env.example"
+
+    @property
+    def health_retire_days(self) -> int:
+        """连续多少个"运行日"（程序实际启动过的天）都失败后自动给模型标 # 下线。最小 1。"""
+        return max(1, int(self.collab_cfg.get("retire_days", 7)))
 
     # ---------- 兼容旧配置的兜底单模型 ----------
 
@@ -231,14 +282,19 @@ class Config:
 
 
 def _load_dotenv(path: Path) -> None:
-    """把 .env 文件里的 KEY=VALUE 注入 os.environ（供 ${VAR} 插值使用）。
+    """把一个 KEY=VALUE 文件注入 os.environ（供 ${VAR} 插值使用）。
+
+    分层加载（调用方按序调两次，后层覆盖前层同名变量）：
+    1) .env.example —— 基础层：接口地址与模型清单，随仓库维护，git pull 即更新；
+    2) .env         —— 覆盖层：通常只放几行 KEY=...（保密，不进 git）。
+    优先级：shell 启动前已 export 的变量 > .env > .env.example。
 
     保密约定：.env 以点开头，AI 不读取其内容；这里只负责在运行时加载，
-    不打印、不落盘、不返回任何值。缺失的 .env 不影响启动（静默跳过）。
+    不打印、不落盘、不返回任何值。缺失的文件不影响启动（静默跳过）。
 
     热加载语义：
-    - 进程启动前已在 shell 里 export 的变量优先级最高（不被 .env 覆盖）；
-    - 由本函数从 .env 注入的变量（记录在 _dotenv_keys）在 .env 变化时会被更新，
+    - 进程启动前已在 shell 里 export 的变量优先级最高（不被 dotenv 文件覆盖）；
+    - 由本函数注入的变量（记录在 _dotenv_keys）在文件变化时会被更新，
       避免「只改 .env 不改 config.yaml」时旧值被 setdefault 钉死、缓存永远不刷新。
     """
     global _dotenv_keys
@@ -254,7 +310,8 @@ def _load_dotenv(path: Path) -> None:
             val = val.strip().strip('"').strip("'")
             if not key:
                 continue
-            # 区分"shell 预置"与".env 注入"：前者不覆盖，后者每次都更新
+            # 区分"shell 预置"与"dotenv 注入"：前者不覆盖，后者每次都更新
+            # （后者规则同时保证分层顺序：先读 example 后读 .env，.env 覆盖 example）
             if key in os.environ and key not in _dotenv_keys:
                 continue  # shell 里已有，尊重 shell 的值
             os.environ[key] = val
@@ -275,26 +332,32 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     """加载 config.yaml 并做环境变量插值。
 
     设计：
-    - 带进程内缓存，默认 config.yaml 与 .env 的 mtime 均未变则直接复用。
-      （只盯 config.yaml 不够：用户换 API key 通常只改 .env，旧插值会被缓存钉死。）
+    - 分层 dotenv：先 .env.example（接口/模型基础层）再 .env（key 覆盖层），
+      同名变量后者胜出、shell 预置最高（见 _load_dotenv）。
+    - 带进程内缓存，config.yaml / .env / .env.example 三者 mtime 均未变则直接复用。
+      （.env.example 现在参与运行时配置——模型健康下线会改写它，必须纳入失效判断。）
     - force=True 强制重读并重新构建 Config（热加载场景）。
     - 返回新 Config 对象，调用方用它替换自己的 cfg 引用；已有 Agent 持有的旧 cfg
       不受影响，避免 MCP 连接被意外重连。
 
     调用方（web/server._get_cfg）可频繁调用本函数，只有配置真正变化时才解析。
     """
-    global _cfg_cache, _cfg_cache_mtime, _cfg_cache_dotenv_mtime
+    global _cfg_cache, _cfg_cache_mtime, _cfg_cache_dotenv_mtime, _cfg_cache_example_mtime
     p = path or (ROOT / "config.yaml")
+    example_path = ROOT / ".env.example"
     dotenv_path = ROOT / ".env"
-    _load_dotenv(dotenv_path)
+    _load_dotenv(example_path)  # 基础层：接口与模型清单
+    _load_dotenv(dotenv_path)   # 覆盖层：只放 key
 
     cfg_mtime = _safe_mtime(p)
     dotenv_mtime = _safe_mtime(dotenv_path)
+    example_mtime = _safe_mtime(example_path)
     if (
         not force
         and _cfg_cache is not None
         and _cfg_cache_mtime == cfg_mtime
         and _cfg_cache_dotenv_mtime == dotenv_mtime
+        and _cfg_cache_example_mtime == example_mtime
     ):
         return _cfg_cache
     # mtime 变化 / 强制重载 / 首次加载：读磁盘 → 构建 Config → 更新缓存
@@ -302,14 +365,16 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     data: dict = {}
     if p.exists():
         data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    _cfg_cache = Config(_interpolate(data))
+    _cfg_cache = Config(_interpolate(data), raw=data)
     _cfg_cache_mtime = cfg_mtime
     _cfg_cache_dotenv_mtime = dotenv_mtime
+    _cfg_cache_example_mtime = example_mtime
     return _cfg_cache
 
 
 # ---------- 进程内配置缓存（热加载用）----------
 _cfg_cache: Config | None = None
-_cfg_cache_mtime: float = 0.0       # config.yaml 的 mtime，变化即重载
-_cfg_cache_dotenv_mtime: float = 0.0  # .env 的 mtime，变化即重载
-_dotenv_keys: set[str] = set()      # 由 .env 注入的变量名（热加载时需更新）
+_cfg_cache_mtime: float = 0.0             # config.yaml 的 mtime，变化即重载
+_cfg_cache_dotenv_mtime: float = 0.0      # .env 的 mtime，变化即重载
+_cfg_cache_example_mtime: float = 0.0     # .env.example 的 mtime，变化即重载
+_dotenv_keys: set[str] = set()            # 由 dotenv 文件注入的变量名（热加载时需更新）

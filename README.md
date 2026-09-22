@@ -90,23 +90,25 @@ MAO/
 
 ### 配置智能体池
 
-**第 1 步：配密钥（写进 `.env`，不进 git）**
+**第 1 步：填 key（写进 `.env`，不进 git）**
 
-```
-cp .env.example .env      # Windows PowerShell: Copy-Item .env.example .env
-```
-
-打开 `.env` 填你的中转站/官方 API：
+接口地址与模型清单已经直接写在 `.env.example` 里（bynara + kilo 免费站，随仓库维护，
+`git pull` 即更新模型）。你只需要在项目根目录建一个 `.env`，**只写 key**：
 
 ```ini
-NODE_A_ENDPOINT=https://你的中转站/v1
-NODE_A_KEY=sk-你的key
-NODE_A_MODELS=model-a-1@128k,model-a-2@64k,#model-a-3@32k   # @=上下文窗口；#=临时屏蔽
-
-LLM_API_KEY=sk-你的key      # 兜底单模型的 key（池里节点全挂时用）
+NODE_A_KEY=sk-你的bynara-key
+NODE_B_KEY=sk-你的kilo-key    # 不用 kilo 可不写
+LLM_API_KEY=sk-同一个bynara-key  # 兜底单模型（池里节点全挂时用）
 ```
 
-变量名必须与 `config.yaml` 里的 `${...}` 一致，否则填了不生效（`tests/test_config_contract.py` 会守住这条契约）。
+加载优先级：shell 环境变量 > `.env` > `.env.example`。要改接口/增删模型改
+`.env.example`（或设环境变量）即可，不必碰 `.env`。变量名必须与 `config.yaml`
+里的 `${...}` 一致，否则填了不生效（`tests/test_config_contract.py` 会守住这条契约）。
+
+模型会自动体检：某模型一次请求终态失败 → 当天不再派工给它；连续 7 个"运行日"
+（程序实际启动过的天，周末没开机不计入也不打断）都失败 →
+自动在 `.env.example` 对应模型前加 `#` 下线（stderr 会提示；删掉 `#` 即恢复）。
+阈值可调：`config.yaml` 的 `collaboration.retire_days`。
 
 **第 2 步：配池（编辑 `config.yaml` 的 `agents`）**
 

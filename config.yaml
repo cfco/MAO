@@ -49,6 +49,11 @@ collaboration:
   cooldown_base: 10              # 冷却时长基数(秒)，连续失败越多冷却越久(基数×次数)
   inflight_timeout: 120          # 在飞去重兜底：并发同 key 时发起者超过该秒数未返回，
                                  # 首个超时的跟随者接管重新打网络，避免无限阻塞（默认 120）
+  # ---- 模型健康（当日失败隔离 + 连续失败自动下线，见 agent/core/health.py）----
+  retire_days: 7                 # 某模型连续 N 个"运行日"（程序实际启动过的天，周末没
+                                 # 开机不计入也不打断）都有失败记录：自动在 .env.example
+                                 # 对应 *_MODELS 行给该模型加 # 下线（删 # 即人工恢复）
+  health_file: data/model_health.json  # 健康档案落盘位置（当日失败标记/下线记录，无密钥）
 
 server:
   host: 127.0.0.1

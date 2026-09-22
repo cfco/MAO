@@ -447,10 +447,11 @@ def test_ask_concurrent_initiator_failure_shared_with_followers():
         # 跟随者拿到的是失败文本（不是异常），且与发起者一致
         assert all(r.startswith("错误：") for r in results + [lead_result])
         assert all(r == lead_result for r in results)
-        # 失败结果不入缓存：后续同 key 重新打网络（calls 变 2）
+        # 失败不入缓存；且终态失败打了当日隔离标记：同天再派同一工人
+        # 直接快速失败，不再打网络（calls 保持 1）——两重语义一起验证。
         again = real_ask(worker, "boom")
-        assert calls["n"] == 2
-        assert again.startswith("错误：")
+        assert calls["n"] == 1, "当日隔离生效：不该再为该工人打网络"
+        assert again.startswith("错误：") and "隔离" in again
     finally:
         orch.LLMClient = orig
 

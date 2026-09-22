@@ -62,6 +62,8 @@
 | 畸形响应归一 | 中转站内容过滤会返回 `choices: []`：显式归类为可重试的服务端错误（原本是裸 `IndexError`，会绕过错误分类与重试编排一路冒到调用方）；模型给出空 content 且无工具调用时返回明确说明，不再静默输出空白答复 |
 | 并发隔离 | 线程池并行派工，单工人失败/超时以文本如实带回，不拖垮整体 |
 | 整体限时 | `ask_many`/`vote`/`collect` 用 `concurrent.futures.wait` 对收集阶段整体限时（默认 300s），超时工人标记"未完成"放弃等待，后台线程按 LLM 超时自行收尾 |
+| 当日失败隔离 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**终态失败**（重试后仍败）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示）；已缓存的回答不受影响（命中零成本）；主智能体失败同样记档，但**不**据此拦截主——主是用户明确选的，只计连击 |
+| 连续失败自动下线 | 取最近 `collaboration.retire_days`（默认 7）个**运行日**（程序实际启动过的天，记录在档案 `active_dates`；周末没开机既不计入也不打断连击），若该模型每个运行日都失败过 ⇒ 自动在 `.env.example` 对应 `*_MODELS` 行给该模型条目加 `#`（多站共用同模型一起下线），stderr 提示；档案记 `disabled` 防每日重复改写。运行日样本不足 retire_days 个时不判定（新装程序不会当天下线模型）。恢复是人工决策：删掉 `#` 即重新上线。`LLM_MODEL` 兜底行不自动动（注释掉会让 solo 路径直接失效），找不到条目时如实提示人工确认 |
 
 ## 5. 工具与能力
 
@@ -101,22 +103,22 @@
 
 | 段 | 关键项 |
 |---|---|
-| `agents` | 智能体池，按"站"组织（一 Endpoint+Key 挂多 model）；`models` 逗号分隔，`#` 前缀临时屏蔽，`@128k` 标注上下文窗口 |
+| `agents` | 智能体池，按"站"组织（一 Endpoint+Key 挂多 model）；`models` 逗号分隔，`#` 前缀临时屏蔽，`@128k` 标注上下文窗口；变量来源（如 `${NODE_A_MODELS}`）会被反查记入 `AgentProfile.models_env`，供健康自动下线精确改写 `.env.example` 对应行 |
 | `llm` | 兜底单模型 + temperature / max_iterations / timeout / max_retries |
-| `collaboration` | max_workers / vote_threshold / cache_size / cooldown_fails / cooldown_base / inflight_timeout |
+| `collaboration` | max_workers / vote_threshold / cache_size / cooldown_fails / cooldown_base / inflight_timeout / retire_days / health_file |
 | `session` | flush_batch / flush_interval（env `MAO_SESSION_*` 优先） |
 | `server` | host(127.0.0.1) / port(8000) |
 | `tools` | shell_timeout |
 | `mcp_servers` | MCP 接入列表 |
 
-`${VAR}` 引用环境变量或 `.env`（缺失插值为空串并告警一次）。API key 建议只放 `.env`，勿外传 `config.yaml`。
+**配置分层**（`load_config`）：`${VAR}` 的取值优先级为 **shell 环境变量 > `.env` > `.env.example`**。`.env.example` 不只是示例——它作为基础层在运行时真实加载，承载接口地址与模型清单（随仓库维护，`git pull` 即更新，且它的 mtime 参与配置缓存失效判断）；`.env` 是覆盖层，用户只需写几行 `KEY=...`。key 占位行留在 `.env.example` 供契约测试核对变量名，真实 key 只进 `.env`（保密约定不变：`.gitignore` 永不提交、AI 不读取内容）。
 
 ## 9. 质量门禁
 
 - `uv run ruff check .`：E/F/W/I/B/UP，line-length 100；用 `extend-exclude = ["data"]` 追加排除运行时产物与隔离区（**不要用 `exclude`**——那是替换语义，会顶掉 ruff 默认排除表把 `.venv`/`.git` 重新纳入扫描）。
 - 解释器版本以仓库根 `.python-version` 为唯一来源（CI 用不带参数的 `uv python install` 跟随它，不写死版本号）。
 - 质量门禁的守卫测试：`tests/test_config_contract.py`（`.env.example` ↔ `config.yaml` 变量名契约）、`tests/test_repo_hygiene.py`（`.gitignore` 规则真生效、ruff 用 extend-exclude）。
-- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避、会话限流落盘、WorkerPool 冷却/去抖/超时接管、投票编号确定性、ask_many 整体限时、流水线择优、路径防穿越、MCP 断线重连持续重试与连接回滚、同会话并发闸门、缓存命中不受冷却、bridge stderr UTF-8、should_stop 协作式取消（迭代顶部/工具前检查点）、Web SSE 断开传导取消、默认会话 id 防碰撞等。
+- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避、会话限流落盘、WorkerPool 冷却/去抖/超时接管、投票编号确定性、ask_many 整体限时、流水线择优、路径防穿越、MCP 断线重连持续重试与连接回滚、同会话并发闸门、缓存命中不受冷却、bridge stderr UTF-8、should_stop 协作式取消（迭代顶部/工具前检查点）、Web SSE 断开传导取消、默认会话 id 防碰撞、配置分层（.env.example 基础层/.env 覆盖层/shell 最高/清单变更失效缓存）、模型健康（当日隔离、缓存旁路、运行日语义——周末断档不打断连击/出现未失败的运行日才清零/运行日样本不足不判定、旧 v1 档案兼容、达阈值改写 .env.example 加 #、幂等、跨进程持久化、主失败只记档；`tests/conftest.py` 用 `MAO_HEALTH_FILE` 给每个用例独立档案，防共享落盘跨用例污染）等。
 - GitHub Actions CI：ruff + pytest。
 
 ## 10. 安全边界

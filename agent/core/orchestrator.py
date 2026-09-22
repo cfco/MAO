@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -19,6 +20,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 
 from ..config import AgentProfile, Config
 from ..tools.base import FunctionTool, ToolRegistry
+from .health import ModelHealth
 from .llm import LLMClient, LLMError
 
 WORKER_SYSTEM = (
@@ -38,13 +40,24 @@ class WorkerPool:
 
     免费节点友好：单节点抖动/限流/不可用不拖垮整体——连续失败进入冷却期，
     冷却中跳过该节点（ask 直接返回冷却提示），其它节点照常工作。
+    健康档案（ModelHealth）叠加在冷却之上：某模型当天出现终态失败，当天不再
+    派工（缓存命中不受影响）；连续多个"运行日"失败达到阈值自动在 .env.example 标 # 下线。
     """
 
-    def __init__(self, cfg: Config, exclude: str | None = None):
+    def __init__(self, cfg: Config, exclude: str | None = None,
+                 health: ModelHealth | None = None):
         self.cfg = cfg
         self.profiles: dict[str, AgentProfile] = {
             p.name: p for p in cfg.agent_profiles if p.name != exclude
         }
+        # 模型健康档案：默认按配置落盘（data/model_health.json），测试可注入独立实例。
+        # 派工失败时据此做当日隔离；连续失败达 retire_days 天自动改写 .env.example 下线。
+        self.health = health if health is not None else ModelHealth(
+            cfg.model_health_path, cfg.env_example_path, retire_days=cfg.health_retire_days,
+        )
+        # 下线改写需要模型名与清单变量名（如 NODE_A_MODELS），一次性建好映射
+        self._model_of = {n: p.model for n, p in self.profiles.items()}
+        self._env_of = {n: p.models_env for n, p in self.profiles.items()}
         # 工人回答 LRU 缓存：同(工人,任务,角色)不重复调用，省额度和时延。
         # 只缓存成功回答，失败结果不缓存（便于下次重试）。
         self._cache: OrderedDict[tuple, str] = OrderedDict()
@@ -75,8 +88,11 @@ class WorkerPool:
     def overview(self) -> str:
         if not self.profiles:
             return "（当前池里没有其它智能体，所有工作由你自己完成）"
+        # 当日隔离直接标注在清单里：主智能体选工人时就避开，不用挨个撞错误提示
         return "\n".join(
-            f"- {p.name}: model={p.model}" + (f"（{p.note}）" if p.note else "")
+            f"- {p.name}: model={p.model}"
+            + ("（今日调用已失败，当天隔离中，勿派工）" if self.health.quarantined(p.name) else "")
+            + (f"（{p.note}）" if p.note else "")
             for p in self.profiles.values()
         )
 
@@ -86,10 +102,23 @@ class WorkerPool:
             until = self._cooldowns.get(name, 0.0)
         return time.time() < until
 
+    def _skip_reason(self, name: str) -> str | None:
+        """该工人当前不可派工的原因（'冷却中' / '当日失败隔离'），None=可派。
+
+        缓存命中不受此限制（ask 里先查缓存），这里服务 ask_many/collect 的预过滤。
+        """
+        if self._is_in_cooldown(name):
+            return "冷却中"
+        if self.health.quarantined(name):
+            return "当日失败隔离"
+        return None
+
     def _record_result(self, name: str, ok: bool) -> None:
         """更新节点健康状态：失败累计，达阈值进冷却（时长指数上升）；成功清零。
 
-        全程持有 self._lock，避免并发派工时 _cooldowns / _fail_streak 互相踩踏。
+        失败同时记入持久健康档案（ModelHealth）：当天不再派工；连续失败达
+        retire_days 个"运行日"（程序实际启动过的天）则在 .env.example 标 # 下线。
+        档案落盘在池锁外做，失败路径不在热路径上，多一次小文件写无碍。
         """
         now = time.time()
         with self._lock:
@@ -102,6 +131,14 @@ class WorkerPool:
             if streak >= self._cooldown_threshold:
                 # 连续失败越多，冷却越久：base×streak
                 self._cooldowns[name] = now + self._cooldown_base * streak
+        try:
+            notice = self.health.record_failure(
+                name, self._model_of.get(name, ""), self._env_of.get(name, "")
+            )
+        except Exception:  # noqa: BLE001 - 健康档案异常绝不影响派工主流程
+            notice = None
+        if notice:
+            print(notice, file=sys.stderr)  # stderr：bridge/--stream 的 stdout 必须纯净
 
     @staticmethod
     def _is_error(out: str) -> bool:
@@ -114,7 +151,8 @@ class WorkerPool:
         """派一个子任务给单个工人，返回其回答文本（含失败说明，不抛异常）。
 
         命中缓存直接返回（成功回答才进缓存，刷新 LRU 热度在锁内完成）。
-        免费节点友好：节点在冷却期直接快速跳过并提示，不傻等。
+        免费节点友好：节点在冷却期、或当天已出现终态失败（当日隔离）时直接
+        快速跳过并提示，不傻等；两者都不挡缓存命中。
         并发去抖：多个线程同时派同一 (工人,任务,角色) 且都未命中缓存时，
         只有第一个线程（发起者）真正打网络，其余线程（跟随者）等待并复用同一结果，
         避免重复烧钱；发起者挂死/超长未返回时，跟随者带超时兜底接管（见 _follow），
@@ -130,12 +168,17 @@ class WorkerPool:
         key = (worker, prompt, sys_norm)
         with self._lock:  # 缓存命中 + 冷却判定 + 在飞去重需在同一把锁内（并发派工安全）
             if key in self._cache:
-                # 缓存命中零成本，不应被冷却挡住：冷却的意义是别再打坏节点，
+                # 缓存命中零成本，不应被冷却/当日隔离挡住：它们的意义是别再打坏节点，
                 # 已存下的答案照用。原实现先查冷却后查缓存，误伤命中缓存的请求。
                 self._cache.move_to_end(key)
                 return self._cache[key]
             if time.time() < self._cooldowns.get(worker, 0.0):
                 return f"错误：子智能体 '{worker}' 近期连续失败，正在冷却中，建议稍后再试或换其它工人"
+            if self.health.quarantined(worker):
+                return (
+                    f"错误：子智能体 '{worker}' 今日调用已失败，当天隔离不再派工，"
+                    "请换其它工人或明天再试"
+                )
             # 并发同 key 去重：已有在飞请求则当前线程作为跟随者等待结果，
             # 不重复打网络；否则成为发起者，建立 Future 后离开锁做网络。
             fut = self._inflight.get(key)
@@ -300,10 +343,10 @@ class WorkerPool:
         与 ask_many 的区别：只返回成功回答的 (工人, 回答) 列表，且顺序与
         workers 入参顺序一致，不随完成先后漂移——投票编号、流水线择优
         依赖该确定性（as_completed 完成序会导致同一任务两次运行编号互换）。
-        失败/冷却/超时/空回复的工人不进结果。
+        失败/冷却/当日隔离/超时/空回复的工人不进结果。
         """
         valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
-        live = [w for w in valid if not self._is_in_cooldown(w)]
+        live = [w for w in valid if self._skip_reason(w) is None]
         if not live:
             return []
         got = self._run_parallel(live, prompt, system, timeout)
@@ -319,18 +362,18 @@ class WorkerPool:
         退出会 join 全部线程，timeout 参数实际约束不了总时长）。
         """
         valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
-        # 冷却中的节点跳过（失败也用进度提示带回，不阻塞整体）
-        skipped = [w for w in valid if self._is_in_cooldown(w)]
-        live = [w for w in valid if w not in skipped]
+        # 冷却中 / 当日隔离的节点跳过（原因用进度提示如实带回，不阻塞整体）
+        reasons = {w: r for w in valid if (r := self._skip_reason(w))}
+        live = [w for w in valid if w not in reasons]
         if not live:
             got = ", ".join(self.profiles) or "无"
-            hint = f"（其中冷却中: {', '.join(skipped)}）" if skipped else ""
+            hint = f"（其中不可用: {', '.join(reasons)}）" if reasons else ""
             return f"错误：没有可用的子智能体{hint}。可用：{got}"
         got = self._run_parallel(live, prompt, system, timeout)
         results: list[str] = []
-        for w in valid:  # 按入参顺序输出，含冷却跳过项
-            if w in skipped:
-                results.append(f"### 工人 {w} 的结果\n错误：工人冷却中，本轮跳过")
+        for w in valid:  # 按入参顺序输出，含跳过项
+            if w in reasons:
+                results.append(f"### 工人 {w} 的结果\n错误：工人{reasons[w]}，本轮跳过")
                 continue
             out = got.get(w)
             if out is None:
