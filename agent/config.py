@@ -281,16 +281,19 @@ class Config:
         return int(self.server.get("port", 8000))
 
 
-def _load_dotenv(path: Path) -> None:
-    """把一个 KEY=VALUE 文件注入 os.environ（供 ${VAR} 插值使用）。
+def _load_dotenv(path: Path) -> list[str]:
+    """把一个 KEY=VALUE 文件注入 os.environ（供 ${VAR} 插值使用），返回文件里出现的变量名。
+
+    只返回名字、不返回值：调用方据此做分层体检（.env 应只放 key），返回值设计
+    上就拿不走任何密钥内容。
 
     分层加载（调用方按序调两次，后层覆盖前层同名变量）：
     1) .env.example —— 基础层：接口地址与模型清单，随仓库维护，git pull 即更新；
-    2) .env         —— 覆盖层：通常只放几行 KEY=...（保密，不进 git）。
+    2) .env         —— 覆盖层：约定只放几行 KEY=...（保密，不进 git）。
     优先级：shell 启动前已 export 的变量 > .env > .env.example。
 
     保密约定：.env 以点开头，AI 不读取其内容；这里只负责在运行时加载，
-    不打印、不落盘、不返回任何值。缺失的文件不影响启动（静默跳过）。
+    不打印、不落盘、不返回任何值。缺失的文件不影响启动（静默跳过，返回空列表）。
 
     热加载语义：
     - 进程启动前已在 shell 里 export 的变量优先级最高（不被 dotenv 文件覆盖）；
@@ -298,8 +301,9 @@ def _load_dotenv(path: Path) -> None:
       避免「只改 .env 不改 config.yaml」时旧值被 setdefault 钉死、缓存永远不刷新。
     """
     global _dotenv_keys
+    names: list[str] = []
     if not path.exists():
-        return
+        return names
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -310,6 +314,7 @@ def _load_dotenv(path: Path) -> None:
             val = val.strip().strip('"').strip("'")
             if not key:
                 continue
+            names.append(key)
             # 区分"shell 预置"与"dotenv 注入"：前者不覆盖，后者每次都更新
             # （后者规则同时保证分层顺序：先读 example 后读 .env，.env 覆盖 example）
             if key in os.environ and key not in _dotenv_keys:
@@ -318,6 +323,7 @@ def _load_dotenv(path: Path) -> None:
             _dotenv_keys.add(key)
     except OSError:
         pass  # 读取失败不拖垮启动，交给原环境变量
+    return names
 
 
 def _safe_mtime(p: Path) -> float:
@@ -346,8 +352,8 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     p = path or (ROOT / "config.yaml")
     example_path = ROOT / ".env.example"
     dotenv_path = ROOT / ".env"
-    _load_dotenv(example_path)  # 基础层：接口与模型清单
-    _load_dotenv(dotenv_path)   # 覆盖层：只放 key
+    _load_dotenv(example_path)          # 基础层：接口与模型清单
+    env_names = _load_dotenv(dotenv_path)  # 覆盖层：只放 key
 
     cfg_mtime = _safe_mtime(p)
     dotenv_mtime = _safe_mtime(dotenv_path)
@@ -362,6 +368,19 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
         return _cfg_cache
     # mtime 变化 / 强制重载 / 首次加载：读磁盘 → 构建 Config → 更新缓存
     _missing_logged.clear()  # 新 config 可能引用不同的 ${VAR}，重置警告
+    # 分层守卫：.env 是"AI 不可修改区"（约定只放 key），健康下线等自动改写
+    # 只会发生在 .env.example。若 .env 里混进了接口/模型等非 key 变量，会静默
+    # 压住 .env.example 的更新（# 下线看似失效），必须显式提醒——只报变量名，
+    # 绝不回显任何值（含误粘的 key 内容）。
+    strays = [n for n in env_names if not (n.endswith("_KEY") or n.startswith("MAO_"))]
+    if strays:
+        print(
+            f"[配置分层提醒] .env 中出现非 key 变量：{', '.join(strays)}。"
+            "约定 .env 只放 *KEY；接口/模型清单由 .env.example 维护（模型健康自动下线"
+            "也只改写 .env.example，不会碰 .env）。.env 里的同名变量会覆盖 .env.example，"
+            "导致 git pull 更新的清单和自动下线看似失效——建议删掉这几行。",
+            file=sys.stderr,
+        )
     data: dict = {}
     if p.exists():
         data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}

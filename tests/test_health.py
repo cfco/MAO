@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -143,6 +145,34 @@ def test_hash_blocked_model_untouched_by_layering(cfg_home):
     assert cfg.profile("node-a:m-two") is None
 
 
+def test_env_stray_vars_warn_by_name_only(cfg_home, capsys):
+    """.env 混进非 key 变量（会静默压住 .env.example 的更新/自动下线）⇒
+    重载配置时在 stderr 点名提醒；只报变量名，绝不回显任何值。"""
+    _write_layers(cfg_home, env_lines=("NODE_A_KEY=sk-secret-do-not-print",
+                                       "NODE_A_MODELS=evil@1"))
+    load_config()
+    err = capsys.readouterr().err
+    assert "分层提醒" in err and "NODE_A_MODELS" in err
+    assert "sk-secret-do-not-print" not in err, "告警不得回显 .env 里的任何值"
+    # 纯 key 的 .env 不该触发提醒
+    (cfg_home / ".env").write_text("NODE_A_KEY=sk-real\n", encoding="utf-8")
+    os.utime(cfg_home / ".env", (time.time() + 5, time.time() + 5))
+    load_config(force=True)
+    assert "分层提醒" not in capsys.readouterr().err
+
+
+def test_real_env_example_never_carries_key_values():
+    """守卫分层契约：随仓库维护（AI 可改、进 git）的 .env.example 里，
+    *_KEY 行只能是空占位——真实 key 只允许进 .env（AI 不可修改区）。"""
+    real_example = Path(ac.__file__).resolve().parent.parent / ".env.example"
+    lines = [ln.strip() for ln in real_example.read_text(encoding="utf-8").splitlines()]
+    key_lines = [ln for ln in lines if "=" in ln and not ln.startswith("#")
+                 and ln.split("=", 1)[0].strip().endswith("_KEY")]
+    assert key_lines, ".env.example 应保留 *_KEY= 空占位行（契约测试核对变量名用）"
+    for ln in key_lines:
+        assert ln.split("=", 1)[1].strip() == "", f"git 维护层出现疑似真实 key：{ln.split('=')[0]} 行有值"
+
+
 # ---------------- 2) ModelHealth 单元 ----------------
 
 
@@ -212,6 +242,7 @@ def test_retire_rewrites_env_example(tmp_path):
     (tmp_path / ".env.example").write_text(
         "NODE_A_MODELS=m-one@128k,m-two@256k,#m-three@64k\n"
         "NODE_B_MODELS=m-two@512k,other@256k\n"
+        "NODE_A_KEY=sk-fake-not-a-real-key\n"
         "LLM_MODEL=m-one\n",
         encoding="utf-8",
     )
@@ -226,6 +257,8 @@ def test_retire_rewrites_env_example(tmp_path):
     assert lines["NODE_A_MODELS"] == "m-one@128k,#m-two@256k,#m-three@64k"
     assert lines["NODE_B_MODELS"] == "#m-two@512k,other@256k"
     assert lines["LLM_MODEL"] == "m-one"
+    # key 行永不参与下线改写（匹配范围只限 *_MODELS，不含 *_KEY）
+    assert lines["NODE_A_KEY"] == "sk-fake-not-a-real-key"
     # 已 disabled 后继续失败：不再重复提示、不再重复加 #
     assert h.record_failure("node-a:m-two", "m-two", "NODE_A_MODELS") is None
     text2 = (tmp_path / ".env.example").read_text(encoding="utf-8")

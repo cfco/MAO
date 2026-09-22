@@ -111,14 +111,14 @@
 | `tools` | shell_timeout |
 | `mcp_servers` | MCP 接入列表 |
 
-**配置分层**（`load_config`）：`${VAR}` 的取值优先级为 **shell 环境变量 > `.env` > `.env.example`**。`.env.example` 不只是示例——它作为基础层在运行时真实加载，承载接口地址与模型清单（随仓库维护，`git pull` 即更新，且它的 mtime 参与配置缓存失效判断）；`.env` 是覆盖层，用户只需写几行 `KEY=...`。key 占位行留在 `.env.example` 供契约测试核对变量名，真实 key 只进 `.env`（保密约定不变：`.gitignore` 永不提交、AI 不读取内容）。
+**配置分层**（`load_config`）：`${VAR}` 的取值优先级为 **shell 环境变量 > `.env` > `.env.example`**。`.env.example` 不只是示例——它作为基础层在运行时真实加载，承载接口地址与模型清单（随仓库维护，`git pull` 即更新，且它的 mtime 参与配置缓存失效判断）；`.env` 是覆盖层，用户只需写几行 `KEY=...`。key 占位行留在 `.env.example` 供契约测试核对变量名，真实 key 只进 `.env`（保密约定不变：`.gitignore` 永不提交、AI 不读取内容）。分层边界由双向守卫闭环：`.env.example` 的 `*_KEY` 行必须为空占位（`test_real_env_example_never_carries_key_values` 守着，真实 key 不会随 git 泄漏）；`.env` 出现非 `*_KEY`/非 `MAO_*` 变量时重载配置即打 `[配置分层提醒]`（只报变量名绝不回显值——这些变量会盖住 `.env.example` 的清单更新与自动下线效果）；模型健康下线只改写 `*_MODELS` 行，永不触碰 `*_KEY` 行（有断言）。
 
 ## 9. 质量门禁
 
 - `uv run ruff check .`：E/F/W/I/B/UP，line-length 100；用 `extend-exclude = ["data"]` 追加排除运行时产物与隔离区（**不要用 `exclude`**——那是替换语义，会顶掉 ruff 默认排除表把 `.venv`/`.git` 重新纳入扫描）。
 - 解释器版本以仓库根 `.python-version` 为唯一来源（CI 用不带参数的 `uv python install` 跟随它，不写死版本号）。
 - 质量门禁的守卫测试：`tests/test_config_contract.py`（`.env.example` ↔ `config.yaml` 变量名契约）、`tests/test_repo_hygiene.py`（`.gitignore` 规则真生效、ruff 用 extend-exclude）。
-- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避、会话限流落盘、WorkerPool 冷却/去抖/超时接管、投票编号确定性、ask_many 整体限时、流水线择优、路径防穿越、MCP 断线重连持续重试与连接回滚、同会话并发闸门、缓存命中不受冷却、bridge stderr UTF-8、should_stop 协作式取消（迭代顶部/工具前检查点）、Web SSE 断开传导取消、默认会话 id 防碰撞、配置分层（.env.example 基础层/.env 覆盖层/shell 最高/清单变更失效缓存）、模型健康（当日隔离、缓存旁路、运行日语义——周末断档不打断连击/出现未失败的运行日才清零/运行日样本不足不判定、旧 v1 档案兼容、达阈值改写 .env.example 加 #、幂等、跨进程持久化、主失败只记档；`tests/conftest.py` 用 `MAO_HEALTH_FILE` 给每个用例独立档案，防共享落盘跨用例污染）等。
+- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避、会话限流落盘、WorkerPool 冷却/去抖/超时接管、投票编号确定性、ask_many 整体限时、流水线择优、路径防穿越、MCP 断线重连持续重试与连接回滚、同会话并发闸门、缓存命中不受冷却、bridge stderr UTF-8、should_stop 协作式取消（迭代顶部/工具前检查点）、Web SSE 断开传导取消、默认会话 id 防碰撞、配置分层（.env.example 基础层/.env 覆盖层/shell 最高/清单变更失效缓存/边界双向守卫：.env.example 的 *_KEY 行必须空、.env 混入非 key 变量按名告警不回显值、下线改写永不触碰 *_KEY 行）、模型健康（当日隔离、缓存旁路、运行日语义——周末断档不打断连击/出现未失败的运行日才清零/运行日样本不足不判定、旧 v1 档案兼容、达阈值改写 .env.example 加 #、幂等、跨进程持久化、主失败只记档；`tests/conftest.py` 用 `MAO_HEALTH_FILE` 给每个用例独立档案，防共享落盘跨用例污染）等。
 - GitHub Actions CI：ruff + pytest。
 
 ## 10. 安全边界
