@@ -298,6 +298,9 @@ def test_run_stream_stdout_decodes_as_utf8():
     实测修正前 UTF-8 归一只覆盖 bridge，`run --stream` 落进管道的中文事件
     按 GBK 编码（0xC4 起头），外部驱动方 json.loads 直接 UnicodeDecodeError。
     LLM 指向必然拒连的端口：走 LLMError 中文提示路径，无需真实网络。
+    必须同时把池钉空（NODE_*_MODELS=""）：--solo 只关工人、主仍从池里选，
+    池非空时请求打到 .env.example 里的免费路由——真回了中文答案，
+    "必然失败"的断言就没了（本地实测翻车系环境耦合，CI 靠 runner 无外网侥幸绿）。
     """
     import os
     import subprocess
@@ -306,7 +309,12 @@ def test_run_stream_stdout_decodes_as_utf8():
 
     root = Path(__file__).resolve().parent.parent
     env = dict(os.environ)
-    env.update({"LLM_API_KEY": "dummy", "LLM_ENDPOINT": "http://127.0.0.1:9/v1"})
+    env.update({
+        "LLM_API_KEY": "dummy",
+        "LLM_ENDPOINT": "http://127.0.0.1:9/v1",
+        "NODE_A_MODELS": "",
+        "NODE_B_MODELS": "",
+    })
     proc = subprocess.run(
         [sys.executable, "-m", "agent", "run", "演示任务", "--solo", "--stream"],
         input=b"", capture_output=True, cwd=str(root), env=env, timeout=120,
