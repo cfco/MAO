@@ -464,6 +464,35 @@ def test_cmd_blacklist_encoded_command_abbrev():
     assert _check_command_safety(f'{ps}-NoProfile -Command "Get-Date"') is None
 
 
+def test_interpreter_inline_code_guard_blocks_bypass():
+    """#5：把破坏藏进 python -c / node -e 等内联代码正文的绕过点必须被拦下。"""
+    from agent.tools.builtin import _check_command_safety
+
+    for cmd in [
+        'python -c "import os; os.system(\'del /q x\')"',
+        'python -c "import shutil; shutil.rmtree(\'C:/proj\')"',
+        'python -c "import os; os.remove(\'C:/secret\')"',
+        'node -e "require(\'child_process\').execSync(\'rm -rf /\')"',
+        'python -c "print(\'删\'); __import__(\'os\').system(\'format C:\')"',
+    ]:
+        assert _check_command_safety(cmd), f"应拦截却放行了内联破坏：{cmd}"
+
+
+def test_interpreter_inline_code_guard_keeps_legit():
+    """#5 反向：正常的内联脚本（含 subprocess 编排安全命令）不得被误伤。"""
+    from agent.tools.builtin import _check_command_safety
+
+    for cmd in [
+        'python -c "print(1)"',
+        'python -c "import json; print(json.dumps({\'a\': 1}))"',
+        'python -c "import subprocess; subprocess.run([\'git\', \'status\'])"',
+        'node -e "console.log(\'hi\')"',
+        'python -m black --format json x.py',  # 解释器但无内联代码开关
+        'python -V',
+    ]:
+        assert _check_command_safety(cmd) is None, f"应放行却被误拦：{cmd}"
+
+
 # ---------------- 空 choices 归类为可重试错误（本轮修正） ----------------
 
 def test_llm_empty_choices_classified_retryable():
@@ -575,8 +604,85 @@ def test_ask_many_structured_ordered_records(monkeypatch):
     assert pool.ask_many_structured(["ghost"], "x") == []
 
 
+def test_answer_starting_with_error_prefix_is_still_success(monkeypatch):
+    """#4：工人正常回答若恰好以「错误：」开头，也不得被当成失败丢弃——
+    成败只由结构化 status（是否抛异常/是否跳过）决定，绝不解析回答文本前缀。"""
+    class Prefixy:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def chat(self, messages, tools=None):
+            return {"role": "assistant", "content": "错误：这里只是正文的开头，不是故障"}
+
+    monkeypatch.setattr(orch, "LLMClient", Prefixy)
+    cfg = Config(_interpolate({"agents": [
+        {"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]},
+    ]}))
+    pool = WorkerPool(cfg, exclude=None)
+    r = pool.ask_result("st:m1", "任务")
+    assert r["status"] == "ok" and r["ok"] is True
+    assert r["answer"].startswith("错误："), "文本原样保留"
+    # 收集 / 结构化批量都不再把它误判为失败
+    assert pool.collect(["st:m1"], "任务") == [("st:m1", r["answer"])]
+    many = pool.ask_many_structured(["st:m1"], "任务")
+    assert many[0]["ok"] and many[0]["status"] == "ok"
+
+
+def test_ask_result_error_leaves_answer_empty(monkeypatch):
+    """#4：派工失败时 answer 必须为空（错误只进 status/error），把「错误文本」与
+    「正文回答」彻底分开——计票/收集层因此不可能再把错误信息里的数字当成内容。"""
+    from agent.core.llm import LLMError
+
+    class Boom:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def chat(self, messages, tools=None):
+            raise LLMError("api", "HTTP 429 错误码 1", retryable=True)
+
+    monkeypatch.setattr(orch, "LLMClient", Boom)
+    cfg = Config(_interpolate({"agents": [
+        {"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]},
+    ]}))
+    pool = WorkerPool(cfg, exclude=None)
+    r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is False and r["status"] == "error"
+    assert r["answer"] == "", "失败不得把错误文本混进 answer"
+    assert "429" in r["error"]
+
+
+def test_ask_many_structured_uses_stable_status_codes():
+    """#3/#4 去兼容后：ask_many_structured 对外统一用稳定英文状态码，供程序化消费。"""
+    import time as _t
+
+    class Instant:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def chat(self, messages, tools=None):
+            return {"role": "assistant", "content": "hi"}
+
+    monkey = Instant
+    orig = orch.LLMClient
+    orch.LLMClient = lambda *a, **k: monkey()
+    try:
+        cfg = Config(_interpolate({"agents": [
+            {"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2", "m3"]},
+        ]}))
+        pool = WorkerPool(cfg, exclude=None)
+        pool._cooldowns["st:m2"] = _t.time() + 999          # 冷却
+        pool.health.record_failure("st:m3", "m3", "")        # 当日隔离（终态）
+        recs = pool.ask_many_structured(["st:m1", "st:m2", "st:m3"], "任务")
+        by = {r["worker"]: r["status"] for r in recs}
+        assert by == {"st:m1": "ok", "st:m2": "cooldown", "st:m3": "quarantined"}, by
+        assert next(r for r in recs if r["worker"] == "st:m1")["answer"] == "hi"
+        assert all(r["answer"] == "" for r in recs if r["status"] != "ok")
+    finally:
+        orch.LLMClient = orig
+
+
 def test_health_status_reflects_cooldown_and_quarantine():
-    """失败后 health_status 标该工人不可用（冷却 + 当日隔离），其它工人照常可用。"""
+    """**终态**失败后 health_status 标该工人不可用（冷却 + 当日隔离），其它照常可用。"""
     cfg = Config(_interpolate({"agents": [
         {"name": "d1", "base_url": "u", "api_key": "k", "model": "m"},
         {"name": "d2", "base_url": "u", "api_key": "k", "model": "m"},
@@ -586,7 +692,7 @@ def test_health_status_reflects_cooldown_and_quarantine():
     assert all(x["available"] for x in hs), "初始应全部可用"
     pool._cooldown_threshold = 1
     pool._cooldown_base = 30.0
-    pool._record_result("d1", ok=False)  # 触发冷却 + 当日隔离（写各自 tmp 档案）
+    pool._record_result("d1", ok=False, fatal=True)  # 终态失败 → 冷却 + 当日隔离
     st = {x["worker"]: x for x in pool.health_status()}
     assert st["d1"]["available"] is False
     assert st["d1"]["quarantined_today"] is True and st["d1"]["cooldown_s"] > 0

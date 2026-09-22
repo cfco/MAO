@@ -24,6 +24,8 @@
   {"cmd":"run_review","draft":"...","context":"可选","workers":["a","b"]}  （外部主给初稿，子 AI 只当评审团）
 
 响应：{"ok":true,...} 或 {"ok":false,"error":"..."}。
+  · ok 反映真实成败：call_tool / ask 失败即 ok:false（不再永远 true 把错误塞进 result/answer）。
+  · ask / ask_many 的结构化条目带稳定 status 码：ok|error|cooldown|quarantined|missing|timeout。
 """
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ from threading import Lock
 
 from . import __version__
 from .config import Config
-from .core.llm import LLMClient
+from .core.llm import LLMClient, LLMError
 from .core.orchestrator import WORKER_SYSTEM, WorkerPool
 from .skills_manager import SkillManager, register_skill_tools
 from .tools.base import ToolRegistry
@@ -121,7 +123,11 @@ class Bridge:
             return {"ok": True, "workers": self.workers.health_status()}
         if cmd == "call_tool":
             name = str(req.get("name", ""))
-            return {"ok": True, "result": self.registry.execute(name, req.get("args") or {})}
+            res = self.registry.run(name, req.get("args") or {})
+            out = {"ok": res["ok"], "result": res["result"]}
+            if not res["ok"]:
+                out["error"] = res["error"]
+            return out
         if cmd == "load_skill":
             return {"ok": True, "content": self.skills.load_full(str(req.get("name", "")))}
         if cmd == "run_skill_script":
@@ -134,14 +140,23 @@ class Bridge:
                 return {"ok": False, "error": "prompt 不能为空"}
             agent = str(req.get("agent", "")).strip()
             if agent:
-                return {"ok": True, "answer": self.workers.ask(agent, prompt, req.get("system"))}
-            # 未指定 agent 时用兜底单模型（懒创建复用，配置读取见 _fallback_client）
+                r = self.workers.ask_result(agent, prompt, req.get("system"))
+                # 统一契约：answer 只放成功正文，失败信息进 error/status（稳定码，不翻译）
+                if r["ok"]:
+                    return {"ok": True, "answer": r["answer"], "status": r["status"]}
+                return {"ok": False, "answer": "", "status": r["status"], "error": r["error"]}
+            # 未指定 agent：用兜底单模型（懒创建复用）。失败归一成与工人 ask 同一种
+            # {ok:false, answer:"", status, error} 形状，不再让 LLMError 冒泡成另一种契约
+            # （#3：同一个 ask 失败此前有两种响应形状）。
             client = self._fallback_client()
-            resp = client.chat([
-                {"role": "system", "content": str(req.get("system") or WORKER_SYSTEM)},
-                {"role": "user", "content": prompt},
-            ])
-            return {"ok": True, "answer": resp.get("content", "")}
+            try:
+                resp = client.chat([
+                    {"role": "system", "content": str(req.get("system") or WORKER_SYSTEM)},
+                    {"role": "user", "content": prompt},
+                ])
+            except LLMError as e:
+                return {"ok": False, "answer": "", "status": "error", "error": str(e)}
+            return {"ok": True, "answer": resp.get("content", ""), "status": "ok"}
         if cmd == "ask_many":
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:

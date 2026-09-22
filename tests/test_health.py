@@ -255,3 +255,34 @@ def test_worker_final_failure_quarantines_it_for_today(tmp_path, monkeypatch):
     assert "隔离" in pool.ask("st:m2", "任务B"), "当天后续派工直接跳过该节点"
     # 隔离只落在失败的那个模型上
     assert not pool.health.quarantined("st:m1")
+
+
+class _Transient:
+    """假 LLMClient：任何调用都抛**可重试**错误（模拟免费节点超时/限流/连接抖动）。"""
+
+    def __init__(self, *_a, model: str = "", **_k):
+        self.model = model
+        self.closed = 0
+
+    def chat(self, messages, tools=None):
+        raise LLMError("timeout", "boom", retryable=True)
+
+    def close(self):
+        self.closed += 1
+
+
+def test_transient_failure_cools_down_but_not_quarantined_today(tmp_path, monkeypatch):
+    """可重试的瞬时失败只进短时冷却，绝不升级成全天封禁（#1/#2 的核心修复）。"""
+    monkeypatch.setattr(orch, "LLMClient", _Transient)
+    pool = _pool(_health(tmp_path))
+    pool._cooldown_threshold = 1  # 一次失败即冷却，方便断言
+    pool._cooldown_base = 5.0
+    out = pool.ask("st:m2", "任务A")
+    assert out.startswith("错误"), "失败要如实带回"
+    assert not pool.health.quarantined("st:m2"), "瞬时失败不该当天隔离——明天/冷却后仍能回来"
+    assert pool._is_in_cooldown("st:m2"), "但应进入短时冷却，暂时别反复打它"
+    # 冷却只挡住当前这一下：到期后（这里手动清冷却）工人立刻恢复可派，且不报"隔离"
+    pool._cooldowns.pop("st:m2", None)
+    assert "隔离" not in pool.ask("st:m2", "任务B")
+    # 终态失败模型不受影响：另一个模型的隔离判定独立
+    assert not pool.health.quarantined("st:m1")

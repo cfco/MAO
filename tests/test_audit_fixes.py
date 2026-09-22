@@ -92,6 +92,35 @@ def test_pick_skips_unavailable_and_zero_means_unlimited():
     assert _pool("m1,m2,m3", cap=0).pick() == ["st:m1", "st:m2", "st:m3"], "0 = 不限"
 
 
+def test_pick_rotates_across_calls():
+    """#6：连续默认派工轮流覆盖整个池，不再每次死取头部 N 个（摊薄免费额度、避单点）。"""
+    pool = _pool("m1,m2,m3,m4", cap=2)
+    assert pool.pick() == ["st:m1", "st:m2"], "首次从头部窗口开始"
+    assert pool.pick() == ["st:m3", "st:m4"], "第二次轮转到后一半"
+    assert pool.pick() == ["st:m1", "st:m2"], "到池尾回绕，负载持续轮转"
+    # 显式点名的批量入口用同一 pick 游标推进：整池都会被轮到
+    seen = set()
+    for _ in range(2):
+        seen.update(pool.pick())
+    assert seen == {"st:m1", "st:m2", "st:m3", "st:m4"}, "轮转应最终覆盖全池"
+
+
+def test_pick_filters_by_tags():
+    """#6：可选 tags 只保留能力标签全部命中的工人，供外部主按任务类型选路。"""
+    cfg = Config(_interpolate({
+        "agents": [
+            {"name": "coder", "base_url": "u", "api_key": "k", "model": "m", "tags": "code,中文"},
+            {"name": "reader", "base_url": "u", "api_key": "k", "model": "m", "tags": "长上下文"},
+        ],
+        "collaboration": {"max_participants": 0},
+    }))
+    pool = WorkerPool(cfg, exclude=None)
+    assert pool.pick(tags="code") == ["coder"]
+    assert pool.pick(tags="长上下文") == ["reader"]
+    assert pool.pick(tags="code,长上下文") == [], "无人同时具备 → 空"
+    assert sorted(pool.pick()) == ["coder", "reader"], "不带 tags 则全给"
+
+
 def test_effective_timeout_scales_with_batches_and_respects_explicit():
     pool = _pool("m1,m2,m3,m4,m5", cap=5, max_workers=3)
     assert pool._effective_timeout(1, None) == 150.0, "1 批 = 120 + 30 余量"
@@ -108,9 +137,10 @@ def test_default_fanout_is_bounded(monkeypatch):
 
     def spy(worker, prompt, system=None):
         calls.append(worker)
-        return f"答案[{worker}]"
+        return {"worker": worker, "ok": True, "status": "ok",
+                "answer": f"答案[{worker}]", "error": ""}
 
-    monkeypatch.setattr(pool, "ask", spy)
+    monkeypatch.setattr(pool, "ask_result", spy)
 
     calls.clear()
     pool.ask_many(pool.pick(), "q")
@@ -128,7 +158,7 @@ def test_explicit_workers_are_not_capped(monkeypatch):
     """调用方显式点名的工人照做（上限只管"缺省名单"的选取）。
 
     断言"被叫到哪些人"和"返回结果的组织顺序"，不断言"调用的先后"：
-    ask_many 是并发派工，各工人线程调 ask 的时序天然抖动（CI 上 m6 就抢在 m5 前）。
+    ask_many 是并发派工，各工人线程调 ask_result 的时序天然抖动（CI 上 m6 就抢在 m5 前）。
     顺序契约在结果层——ask_many 按入参顺序收集输出（见其 docstring），故这里锁它。
     """
     pool = _pool("m1,m2,m3,m4,m5,m6", cap=2)
@@ -136,9 +166,10 @@ def test_explicit_workers_are_not_capped(monkeypatch):
 
     def spy(worker, prompt, system=None):
         calls.append(worker)
-        return f"答案[{worker}]"
+        return {"worker": worker, "ok": True, "status": "ok",
+                "answer": f"答案[{worker}]", "error": ""}
 
-    monkeypatch.setattr(pool, "ask", spy)
+    monkeypatch.setattr(pool, "ask_result", spy)
     out = pool.ask_many(["st:m4", "st:m5", "st:m6"], "q")
     assert sorted(calls) == ["st:m4", "st:m5", "st:m6"], "cap=2 不得截断显式名单"
     assert [b.splitlines()[0] for b in out.split("\n\n")] == [
@@ -186,17 +217,29 @@ def test_no_cache_still_reports_skip_in_many():
 # ---------------- 6) 计票不采信错误文本 ----------------
 
 def test_ballot_ignores_error_text(monkeypatch):
-    """错误文本里的合法编号（如"错误码 1"）不得被算成一张选票。"""
-    pool = _pool("m1,m2", cap=2)
-    worker = pool.names()[0]
+    """派工失败的投票人不得贡献选票（#4：计票按结构化 status 判定，绝不解析文本前缀）。
 
-    class ErrClient:
-        def chat(self, messages):
-            return {"role": "assistant", "content": "错误：子智能体 'm1' 失败 [api]：错误码 1"}
+    构造：好工人 a 正常投 1 号；坏工人 b/c 派工失败，但其文本里带"改投 2 号"的合法编号。
+    正确实现只认 ST_OK → 只有 [1] → 胜出 cand1。若把失败票也计入（回归），会变成
+    [1,2,2] → 反而胜出 cand2。用 3 候选 + 让错误票指向同一编号制造确定性差距，避免并发
+    完成顺序导致的平票抖动。
+    """
+    pool = _pool("m1,m2,m3", cap=3)
+    a, b, c = pool.names()
 
-    monkeypatch.setattr(orch, "LLMClient", lambda *a, **k: ErrClient())
-    pool._clients.clear()
-    assert pool.select_best([("a", "AAA"), ("b", "BBB")], voters=[worker]) is None
+    def fake(worker, prompt, system=None):
+        if worker == a:
+            return {"worker": a, "ok": True, "status": "ok", "answer": "1", "error": ""}
+        return {"worker": worker, "ok": False, "status": "error",
+                "answer": "错误：节点挂了，改投 2 号", "error": "boom"}
+
+    monkeypatch.setattr(pool, "ask_result", fake)
+    picked = pool.select_best(
+        [("cand1", "AAA"), ("cand2", "BBB"), ("cand3", "CCC")], voters=[a, b, c]
+    )
+    assert picked is not None and picked[0] == "cand1", (
+        "只有成功票 a 的『1』算数；b/c 是失败票，其文本里的『2』不得计入"
+    )
 
 
 def test_ballot_still_parses_normal_vote(monkeypatch):

@@ -157,7 +157,26 @@ def test_bridge_ask_fallback_uses_llm_config(monkeypatch):
         b.close()
 
 
+def test_bridge_call_tool_reports_failure_shape():
+    """#3：call_tool 未知工具/失败必须回 ok:false，不再永远 ok:true 把错误塞进 result。"""
+    from agent import bridge as br
+    cfg = Config(_interpolate({
+        "agents": [],
+        "llm": {"base_url": "u", "api_key": "k", "model": "m"},
+    }))
+    b = br.Bridge(cfg)
+    try:
+        bad = b.handle({"cmd": "call_tool", "name": "does_not_exist", "args": {}})
+        assert bad["ok"] is False, "未知工具应如实判失败"
+        assert "未知工具" in bad["result"] and bad.get("error")
+        ok = b.handle({"cmd": "call_tool", "name": "list_dir", "args": {"path": "."}})
+        assert ok["ok"] is True and "result" in ok
+    finally:
+        b.close()
+
+
 # ---------------- bridge：stderr 必须是 UTF-8 ----------------
+
 
 def test_bridge_stderr_decodes_as_utf8():
     """诊断走 stderr，但 Windows 重定向流默认本地代码页（GBK）。

@@ -102,23 +102,40 @@ class ToolRegistry:
     def openai_schemas(self) -> list[dict]:
         return [t.to_openai_schema() for t in self._tools.values()]
 
-    def execute(self, name: str, arguments: str | dict, ctx: Any | None = None) -> str:
-        """执行一次工具调用，永不抛异常，错误以文本返回给模型自行处理。
+    # 工具用「返回值文本首词」自报失败的统一约定（内置 / MCP / Skill 三条来源一致）。
+    # 注意这是文本边界的启发式：极少数正常输出恰好以这些前缀开头会被判失败，
+    # 属工具层未彻底结构化的历史约定（比 call_tool 一律 ok:true 已前进一大步）。
+    _ERROR_PREFIXES = (
+        "错误：", "工具执行出错：", "未知工具",
+        "MCP 工具调用失败：", "MCP 工具返回错误：",
+    )
 
-        ctx 可选地携带 {"emit": fn, "cancel_event": Event}，透传给声明了双参签名的
-        工具（见 FunctionTool）。无 ctx 的调用路径（bridge call_tool、单测）照常工作。
+    def run(self, name: str, arguments: str | dict, ctx: Any | None = None) -> dict:
+        """执行一次工具调用，返回结构化 {ok, result, error}（#3：让 ok 反映真实成败）。
+
+        ok=False 覆盖四类：未知工具、参数非合法 JSON、工具抛异常、工具按前缀约定自报失败。
+        result 恒为给人/给模型读的文本；error 仅在失败时给出（成功为空串）。
         """
         tool = self._tools.get(name)
         if tool is None:
-            return f"错误：未知工具 '{name}'，可用工具：{', '.join(self._tools)}"
+            msg = f"错误：未知工具 '{name}'，可用工具：{', '.join(self._tools)}"
+            return {"ok": False, "result": msg, "error": msg}
         try:
             if isinstance(arguments, str):
                 args = json.loads(arguments) if arguments.strip() else {}
             else:
                 args = arguments
         except json.JSONDecodeError as e:
-            return f"错误：工具参数不是合法 JSON：{e}"
+            msg = f"错误：工具参数不是合法 JSON：{e}"
+            return {"ok": False, "result": msg, "error": msg}
         try:
-            return tool.execute(args, ctx)
+            text = tool.execute(args, ctx)
         except Exception as e:  # noqa: BLE001 - 工具错误必须转成文本回给模型
-            return f"工具执行出错：{type(e).__name__}: {e}"
+            msg = f"工具执行出错：{type(e).__name__}: {e}"
+            return {"ok": False, "result": msg, "error": msg}
+        ok = not str(text).startswith(self._ERROR_PREFIXES)
+        return {"ok": ok, "result": text, "error": "" if ok else str(text)}
+
+    def execute(self, name: str, arguments: str | dict, ctx: Any | None = None) -> str:
+        """执行一次工具调用，返回文本（永不抛异常）。run() 的文本包装，向后兼容。"""
+        return self.run(name, arguments, ctx)["result"]

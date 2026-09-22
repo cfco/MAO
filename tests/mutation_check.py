@@ -50,8 +50,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M3 pick() 不再限制人数",
         "agent/core/orchestrator.py",
-        "        return live[:cap]",
-        "        return live",
+        "        return window[:cap]",
+        "        return window",
         f"{TESTFILE}::test_pick_caps_participants_and_keeps_order",
     ),
     (
@@ -69,11 +69,11 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         f"{TESTFILE}::test_mcp_group_shared_and_refcounted",
     ),
     (
-        "M8 计票不过滤错误文本",
+        "M8 计票不过滤非成功票",
         "agent/core/orchestrator.py",
-        """            if self._is_error(raw):
+        """            if res is None or res["status"] != ST_OK:
                 continue""",
-        """            if False:
+        """            if res is None:
                 continue""",
         f"{TESTFILE}::test_ballot_ignores_error_text",
     ),
@@ -134,6 +134,13 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "            if code >= 500 or code in _RETRYABLE_STATUS:",
         "            if code >= 500:  # mutated",
         "tests/test_audit2_fixes.py::test_http_status_retry_classification",
+    ),
+    (
+        "M19 解释器内联代码不再扫描",
+        "agent/tools/builtin.py",
+        "            return interp, _strip_wrapping_quotes(tokens[i + 1])",
+        '            return interp, ""  # mutated',
+        "tests/test_core.py::test_interpreter_inline_code_guard_blocks_bypass",
     ),
 ]
 

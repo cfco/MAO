@@ -4,8 +4,13 @@
 - 文件读写/目录浏览工具的活动范围限制在「允许的根目录」内 = MAO 项目根 +
   config 的 `tools.workspace` 所列目录（默认为空 → 仅项目根，边界不变）。
   禁止通过 .. 或绝对路径穿越到这些根之外，防止会话级工具隔离被绕过。
-- run_shell 有三层防护：命令黑名单拦截不可逆操作、shell 注入模式拦截、
-  优先用参数模式（shell=False）避免命令拼接风险。
+- run_shell 是「命令卫生黑名单」，属**纵深防御、不是沙箱**：它有意给被沙箱限制
+  的外部主一双能操作本机的"手"，真要硬隔离得靠 OS/容器层。防护三层：
+  ① 危险命令黑名单（锚定命令首词）+ shell 注入模式拦截；
+  ② python -c / node -e 等「解释器内联代码」正文再扫一遍高危 API/内嵌命令/越界写（#5）；
+  ③ 优先参数模式（shell=False）规避拼接，工作目录与重定向目标受允许根约束。
+  启发式不可能穷尽：解释器可读写其内部路径不经文件工具的根校验，确需越界操作的
+  合法场景请引导用户在终端手动执行。
 """
 from __future__ import annotations
 
@@ -204,6 +209,88 @@ def _command_heads(command: str) -> list[str]:
 _PS_PATTERNS = [(re.compile(p, re.IGNORECASE), desc) for p, desc in _PS_DANGEROUS]
 
 
+# ==============================================================
+# 解释器内联代码防护（#5）：python -c / node -e / perl -e … 首词是解释器、
+# 破坏逻辑藏在代码正文里，只扫"命令首词"会被整体绕过。这里对"内联代码正文"
+# 再扫一遍危险 API / 内嵌 shell 命令 / 重定向越界。纵深防御、非沙箱。
+# ==============================================================
+_INTERP_INLINE = {
+    "python", "python3", "python2", "py", "pypy", "pypy3",
+    "node", "nodejs", "deno", "bun",
+    "ruby", "perl", "php", "osascript", "tclsh", "wish", "expect",
+}
+# 携带"内联代码字符串"的开关（powershell/pwsh 的 -Command 走它自己的分支）
+_INLINE_CODE_FLAGS = {"-c", "-e", "--eval", "-r", "--rc", "-import", "--import"}
+# POSIX 侧破坏性命令（内联代码常调 sh/os.system，补齐 Windows 集合看不到的词）
+_POSIX_DANGEROUS_SET = {"rm", "rmdir", "mkfs", "dd", "shred", "mkfstools", "truncate"}
+_ALL_DANGEROUS_SET = _CMD_DANGEROUS_SET | _POSIX_DANGEROUS_SET
+# 内联代码里的"高危 API"：无 shell 对应词、破坏性/绕过黑名单意图明显
+_CODE_HIGH_RISK = [
+    (r"\bshutil\s*\.\s*rmtree\b", "shutil.rmtree（递归删除）"),
+    (r"\bos\s*\.\s*(remove|unlink|removedirs|kill|killpg|startfile|ftruncate)\b", "os 文件/进程删除"),
+    (r"\bos\s*\.\s*execv?[e]?\b", "os.exec*（替换进程执行）"),
+    (r"\bpty\s*\.\s*spawn\b", "pty.spawn"),
+    (r"\bctypes\b", "ctypes 直连系统 API"),
+    (r"__import__\s*\(", "__import__ 动态导入"),
+    (r"\beval\s*\(", "eval() 动态求值"),
+    (r"\bexec\s*\(", "exec() 动态执行"),
+    (r"\bchild_process\b", "Node child_process"),
+    (r"\bfs\s*\.\s*(rm|rmdir|unlink)\w*Sync\s*\(", "Node fs 删除"),
+    (r"\.Delete\s*\(", ".Delete() 删除"),
+]
+# 代码里以引号包裹的"内嵌 shell 命令串"（os.system('del ...') 等）
+_EMBEDDED_Q = re.compile(r"'([^']*)'|\"([^\"]*)\"")
+
+
+def _split_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command, posix=False)
+    except ValueError:
+        return []
+
+
+def _extract_inline_code(tokens: list[str]) -> tuple[str | None, str]:
+    """若首 token 是内联解释器且带内联代码开关，返回 (解释器名, 代码正文)；否则 (None, "")。"""
+    if not tokens:
+        return None, ""
+    interp = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if interp.endswith(".exe"):
+        interp = interp[:-4]
+    if interp not in _INTERP_INLINE:
+        return None, ""
+    for i, t in enumerate(tokens[1:], start=1):
+        flag = _strip_wrapping_quotes(t).strip().lower()
+        if flag in _INLINE_CODE_FLAGS and i + 1 < len(tokens):
+            return interp, _strip_wrapping_quotes(tokens[i + 1])
+    return None, ""  # 是解释器但无内联代码（如 python script.py：正文不可静态扫描，放行）
+
+
+def _scan_code_body(body: str) -> str | None:
+    """扫描"代码正文 / 内联脚本"里的破坏性内容：PS 模式、危险命令首词、
+    高危 API、内嵌 shell 命令、重定向越界。命中返回拦截说明，安全返回 None。
+    """
+    if not body or not body.strip():
+        return None
+    for pat, desc in _PS_PATTERNS:
+        if pat.search(body):
+            return f"命令拦截：{desc}"
+    for h in _command_heads(body):
+        if h in _ALL_DANGEROUS_SET:
+            return f"命令拦截：检测到危险命令 `{h}`"
+    for pat, why in _CODE_HIGH_RISK:
+        if re.search(pat, body):
+            return f"命令拦截：内联代码调用了 `{why}`（不可逆或绕过黑名单）"
+    for m in _EMBEDDED_Q.finditer(body):
+        inner = m.group(1) or m.group(2) or ""
+        for h in _command_heads(inner):
+            if h in _ALL_DANGEROUS_SET:
+                return f"命令拦截：内联代码里嵌了危险命令 `{h}`"
+    danger = _check_redirect_targets(body)
+    if danger:
+        return danger
+    return None
+
+
 def _is_encoded_cmd_flag(tok: str) -> bool:
     """判断 powershell 参数是否为 -EncodedCommand 或其合法缩写。
 
@@ -262,18 +349,22 @@ def _check_command_safety(command: str) -> str | None:
                 body_start = i + 1
                 break
         body = " ".join(tokens[body_start:])
-        for pat, desc in _PS_PATTERNS:
-            if pat.search(body):
-                return f"命令拦截：{desc}"
-        # 兜底：正文里的 cmd 风格危险命令也拦（powershell -c "format D:"）
-        for h in _command_heads(body):
-            if h in _CMD_DANGEROUS_SET:
-                return f"命令拦截：检测到危险命令 `{h}`"
+        # 正文统一扫描（#5）：PS 危险模式 + cmd 风格首词 + 高危 API + 内嵌命令 + 重定向
+        danger = _scan_code_body(body)
+        if danger:
+            return danger
     else:
         # cmd 或裸命令：按每段的命令首词判定（路径/包装/后缀已归一）
         for h in heads:
             if h in _CMD_DANGEROUS_SET:
                 return f"命令拦截：检测到危险命令 `{h}`"
+        # #5：python -c / node -e / perl -e 等"解释器 + 内联代码"绕过点——
+        # 首词是解释器、破坏藏在正文里，这里对正文再扫一遍。
+        _interp, code = _extract_inline_code(_split_tokens(stripped))
+        if code:
+            danger = _scan_code_body(code)
+            if danger:
+                return danger
 
     return None
 
@@ -567,8 +658,10 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         description=(
             "在本机执行 shell 命令（Windows cmd 语法，如 dir、type、python、pip）。"
             "适合系统操作、批量文件处理、调用本机程序。返回 stdout/stderr 与退出码。"
-            "注意：不要执行 rm/del/format 等危险或不可逆操作；"
-            "工作目录限制在允许的工作区内（默认项目根，可用 config 的 tools.workspace 扩展）。"
+            "注意：内置危险命令拦截（rm/del/format 等，且 python -c / node -e 这类内联代码"
+            "正文也会扫描破坏性调用），但这是命令卫生黑名单、**不是沙箱**；确需的不可逆操作"
+            "请引导用户用终端手动执行。工作目录限制在允许的工作区内（默认项目根，"
+            "可用 config 的 tools.workspace 扩展）。"
         ),
         input_schema={
             "type": "object",
