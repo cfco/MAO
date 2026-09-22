@@ -20,7 +20,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 
 from ..config import AgentProfile, Config
 from ..tools.base import FunctionTool, ToolRegistry
-from .health import ModelHealth
+from .health import ModelHealth, get_health
 from .llm import LLMClient, LLMError
 
 WORKER_SYSTEM = (
@@ -32,7 +32,9 @@ VOTER_SYSTEM = (
     "你是协作团队中的评审工人。下面给你一份方案清单，"
     "请选出你认为最好的那份，只输出它的编号（一个数字），不要输出任何其他内容。"
 )
-WORKER_TIMEOUT = 300
+# 批量派工的整体限时不再是固定常量：按「批次 × 单请求超时」自适应推导，
+# 见 WorkerPool._effective_timeout —— 固定值在「池大 + 并发低」时必然截断尾部批次。
+# 单请求超时直接取 llm.timeout，与主智能体、工人客户端同源。
 
 
 class WorkerPool:
@@ -52,7 +54,10 @@ class WorkerPool:
         }
         # 模型健康档案：默认按配置落盘（data/model_health.json），测试可注入独立实例。
         # 派工失败时据此做当日隔离；连续失败达 retire_days 天自动改写 .env.example 下线。
-        self.health = health if health is not None else ModelHealth(
+        # 默认构造走 get_health()：同一档案路径全进程共享一个实例——WorkerPool 是
+        # "每个 Agent（=Web 每个会话）一份"，各持一份独立账本会互相覆盖写盘、
+        # 且彼此看不到隔离结果（见 health.get_health 的详细说明）。
+        self.health = health if health is not None else get_health(
             cfg.model_health_path, cfg.env_example_path, retire_days=cfg.health_retire_days,
         )
         # 下线改写需要模型名与清单变量名（如 NODE_A_MODELS），一次性建好映射
@@ -61,13 +66,21 @@ class WorkerPool:
         # 工人回答 LRU 缓存：同(工人,任务,角色)不重复调用，省额度和时延。
         # 只缓存成功回答，失败结果不缓存（便于下次重试）。
         self._cache: OrderedDict[tuple, str] = OrderedDict()
-        self._cache_size = max(1, int(self.cfg.collab_cfg.get("cache_size", 32)))
+        self._cache_size = self.cfg.as_int(
+            self.cfg.collab_cfg.get("cache_size", 32), "collaboration.cache_size", 32, minimum=1
+        )
         # 节点健康：连续失败达阈值进入冷却，冷却期内跳过该节点。
         # 冷却时长指数上升，成功即清零。
         self._cooldowns: dict[str, float] = {}  # name -> 冷却到期时间戳
         self._fail_streak: dict[str, int] = {}  # name -> 连续失败次数
-        self._cooldown_threshold = max(1, int(self.cfg.collab_cfg.get("cooldown_fails", 2)))
-        self._cooldown_base = float(self.cfg.collab_cfg.get("cooldown_base", 10))
+        self._cooldown_threshold = self.cfg.as_int(
+            self.cfg.collab_cfg.get("cooldown_fails", 2),
+            "collaboration.cooldown_fails", 2, minimum=1,
+        )
+        self._cooldown_base = self.cfg.as_float(
+            self.cfg.collab_cfg.get("cooldown_base", 10),
+            "collaboration.cooldown_base", 10.0, minimum=0.0,
+        )
         # 并发安全：ask_many/vote 用线程池并发调用 ask，缓存、健康状态与
         # 客户端缓存（_clients）都需加锁保护
         self._lock = threading.Lock()
@@ -76,7 +89,10 @@ class WorkerPool:
         # 在飞去重兜底超时（秒）：发起者超过该时长未返回，跟随者接管重新打网络，
         # 避免发起者挂死/超长导致跟随者线程无限阻塞（ask_many/vote 的外层超时只能中断
         # 调用方，内部跟随者线程仍会卡在 fut.result() 造成线程泄漏）。默认 120s。
-        self._inflight_timeout = float(self.cfg.collab_cfg.get("inflight_timeout", 120.0))
+        self._inflight_timeout = self.cfg.as_float(
+            self.cfg.collab_cfg.get("inflight_timeout", 120.0),
+            "collaboration.inflight_timeout", 120.0, minimum=0.0,
+        )
         # 按 profile.name 缓存 LLMClient，避免每次派工都重建连接池（任务3）
         self._clients: dict[str, LLMClient] = {}
 
@@ -84,6 +100,21 @@ class WorkerPool:
 
     def names(self) -> list[str]:
         return list(self.profiles)
+
+    def pick(self, limit: int | None = None) -> list[str]:
+        """挑出本次批量派工要用的工人：按池内确定性顺序，跳过冷却与当日隔离。
+
+        缺省上限取 collaboration.max_participants（<=0 表示不限，返回全部可用）。
+        为什么需要上限：池子按「一站多模型」组织时轻易几十个模型，而并发上限
+        max_workers 只有个位数 —— 全池派工会一次打出几十个请求，尾部批次撞上
+        整体限时被判"未完成"丢弃。顺序保持确定性，投票编号与流水线候选才不会
+        随运行漂移。
+        """
+        cap = self.cfg.max_participants if limit is None else limit
+        live = [w for w in self.profiles if self._skip_reason(w) is None]
+        if cap is None or cap <= 0:
+            return live
+        return live[:cap]
 
     def overview(self) -> str:
         if not self.profiles:
@@ -146,6 +177,27 @@ class WorkerPool:
         只认明确的错误前缀，避免正常回复被误判（比如以"工具列表"开头的正常回答）。
         """
         return out.startswith("错误：") or out.startswith("失败：")
+
+    # ask 在「冷却中」/「当日隔离」时的固定标记词，供批量路径识别"跳过"（见 _skip_kind）
+    _SKIP_MARKS = {
+        "正在冷却中": "冷却中",
+        "当天隔离不再派工": "当日隔离",
+    }
+
+    @classmethod
+    def _skip_kind(cls, out: str) -> str | None:
+        """识别 ask 返回的是否为"跳过类"提示（冷却/当日隔离），命中返回原因文案。
+
+        批量路径（ask_many）不再预过滤工人，改由这里对结果分类。要求同时命中
+        「错误：子智能体」前缀与固定标记词，避免把工人正常回答里恰好出现这些
+        字样的内容误判成跳过。
+        """
+        if not out.startswith("错误：子智能体"):
+            return None
+        for mark, label in cls._SKIP_MARKS.items():
+            if mark in out:
+                return label
+        return None
 
     def ask(self, worker: str, prompt: str, system: str | None = None) -> str:
         """派一个子任务给单个工人，返回其回答文本（含失败说明，不抛异常）。
@@ -283,8 +335,12 @@ class WorkerPool:
             client = self._clients.get(p.name)
             if client is not None:
                 return client
-            timeout = float(self.cfg.llm_cfg.get("timeout", 120))
-            max_retries = int(self.cfg.llm_cfg.get("max_retries", 2))
+            timeout = self.cfg.as_float(
+                self.cfg.llm_cfg.get("timeout", 120), "llm.timeout", 120.0, minimum=1.0
+            )
+            max_retries = self.cfg.as_int(
+                self.cfg.llm_cfg.get("max_retries", 2), "llm.max_retries", 2, minimum=0
+            )
             client = LLMClient(
                 p.base_url, p.api_key, p.model,
                 timeout=timeout, max_retries=max_retries,
@@ -305,38 +361,90 @@ class WorkerPool:
 
     # ---------- 并行派工 ----------
 
-    def _wait_gather(self, futs: dict[Future, str], timeout: int) -> dict[str, str | None]:
-        """等待一批 {Future: 工人名} 任务，整体限时，返回 {工人: 回答或 None}。
+    def _wait_gather(
+        self, futs: dict[Future, str], timeout: float,
+        on_done=None, cancel_event=None,
+    ) -> dict[str, str | None]:
+        """等待一批 {Future: 工人名}，整体限时，返回 {工人: 回答或 None}。
 
-        用 concurrent.futures.wait 对收集阶段整体限时（原来 fut.result(timeout=)
-        逐个限时但 executor 退出仍 join 全部线程，总时长不受约束）。
-        超时未完成的工人标记 None 并 cancel（未启动的直接取消，已启动的由
-        后台线程按 LLM 超时自行收尾——结算/入缓存不受影响），调用方不 join。
+        用 `wait(..., FIRST_COMPLETED)` 边完成边收集，这样可选地支持：
+        - `on_done(worker, answer)`：每有一个工人回来就回调一次（ask_many 逐工人
+          冒进度事件用）。回调异常被吞，绝不影响派工主流程与最终返回值。
+        - `cancel_event`（threading.Event）：置位后停止继续等待——已完成的结果照常
+          收集，未完成的立即 cancel + 标记 None 返回（用户「采纳已完成、结束派工」）。
+          在途 LLM 请求不追溯撤单（额度已花），由后台线程按 llm.timeout 自行收尾。
+
+        不带这两个参数时（collect/vote/_run_ballot 等）行为与旧的"一把 wait 到底"一致：
+        整体到 deadline 或全部完成才返回，超时/未完成的标 None 并 cancel、不 join。
+        每轮 wait 用 min(remaining, 0.5) 轮询，保证无工人完成时也能在 ~0.5s 内响应取消。
         """
-        done, pending = wait(list(futs), timeout=timeout)
+        fut_to_worker = futs
+        deadline = time.time() + timeout
         out: dict[str, str | None] = {}
-        for fut in done:
-            w = futs[fut]
-            try:
-                out[w] = fut.result()
-            except Exception as e:  # noqa: BLE001
-                out[w] = f"失败：{type(e).__name__}: {e}"
-        for fut in pending:
+        pending = set(fut_to_worker)
+        while pending:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            done, pending = wait(
+                pending, timeout=min(remaining, 0.5),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for fut in done:
+                w = fut_to_worker[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    res = f"失败：{type(e).__name__}: {e}"
+                out[w] = res
+                if on_done is not None:
+                    try:
+                        on_done(w, res)
+                    except Exception:  # noqa: BLE001 - 进度回调异常不影响派工
+                        pass
+        for fut in pending:  # 超时或被取消：放弃等待（已启动的后台自行收尾）
             fut.cancel()
-            out[futs[fut]] = None
+            out[fut_to_worker[fut]] = None
         return out
 
-    def _run_parallel(self, workers: list[str], prompt: str, system: str | None, timeout: int) -> dict[str, str | None]:
-        """并行派工给多个工人并限时收集，调用方拿到后 shutdown(wait=False) 不阻塞。"""
+    def _effective_timeout(self, n: int, timeout: float | None) -> float:
+        """批量派工的整体限时：显式传入优先，缺省按「批次 × 单请求超时」推导。
+
+        为什么不用固定 300s：批次 = ceil(n / max_workers)，每批最长 llm.timeout 秒。
+        池大 + 并发低时（实测 25 个工人 / 3 并发 = 9 批），固定限时在单工人耗时超过
+        「限时 ÷ 批次」秒时（>33s 就触发）会把后面所有批次判为"未完成"丢弃 ——
+        票和草稿都拿不全，额度却已经花掉。自适应后限时随规模伸缩，并加 30s 余量
+        给排队与序列化开销；配合 pick() 的参与人数上限，规模本身也回到可控区间。
+        """
+        if timeout is not None:
+            return float(timeout)
+        per_call = self.cfg.as_float(
+            self.cfg.llm_cfg.get("timeout", 120) or 120, "llm.timeout", 120.0, minimum=1.0
+        )
+        batches = max(1, -(-max(1, n) // self.cfg.max_workers))
+        return batches * per_call + 30.0
+
+    def _run_parallel(
+        self, workers: list[str], prompt: str, system: str | None, timeout: float,
+        on_done=None, cancel_event=None,
+    ) -> dict[str, str | None]:
+        """并行派工给多个工人并限时收集，调用方拿到后 shutdown(wait=False) 不阻塞。
+
+        on_done / cancel_event 透传给 _wait_gather（只有 ask_many 会用，实现逐工人
+        冒进度 + 用户提前结束派工；collect/vote 等不传，保持整批栅栏语义）。
+        """
         ex = ThreadPoolExecutor(max_workers=min(len(workers), self.cfg.max_workers))
         try:
             futs = {ex.submit(self.ask, w, prompt, system): w for w in workers}
-            return self._wait_gather(futs, timeout)
+            return self._wait_gather(futs, timeout, on_done=on_done, cancel_event=cancel_event)
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
 
     def collect(
-        self, workers: list[str], prompt: str, system: str | None = None, timeout: int = WORKER_TIMEOUT
+        self, workers: list[str], prompt: str, system: str | None = None,
+        timeout: float | None = None,
     ) -> list[tuple[str, str]]:
         """并行收集多个工人对同一任务的成功回答，按入参工人顺序返回（确定性）。
 
@@ -344,98 +452,180 @@ class WorkerPool:
         workers 入参顺序一致，不随完成先后漂移——投票编号、流水线择优
         依赖该确定性（as_completed 完成序会导致同一任务两次运行编号互换）。
         失败/冷却/当日隔离/超时/空回复的工人不进结果。
+
+        这里**不做**冷却/隔离预过滤：过滤交给 ask 内部，才能保证"缓存命中优先于
+        冷却判定"（REQUIREMENTS §2.1：缓存命中零成本、不受节点冷却影响）。
+        预过滤会让已缓存答案的工人连缓存都查不到就被剔出候选池，与契约相悖。
         """
         valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
-        live = [w for w in valid if self._skip_reason(w) is None]
-        if not live:
+        if not valid:
             return []
-        got = self._run_parallel(live, prompt, system, timeout)
-        return [(w, got[w]) for w in live if got.get(w) and not self._is_error(got[w])]
+        got = self._run_parallel(
+            valid, prompt, system, self._effective_timeout(len(valid), timeout)
+        )
+        return [(w, got[w]) for w in valid if got.get(w) and not self._is_error(got[w])]
 
     def ask_many(
-        self, workers: list[str], prompt: str, system: str | None = None, timeout: int = WORKER_TIMEOUT
+        self, workers: list[str], prompt: str, system: str | None = None,
+        timeout: float | None = None, emit=None, cancel_event=None,
     ) -> str:
         """同一子任务并行派给多个工人，收集全部回答（失败也如实带回）。
 
-        输出按入参工人顺序排列（确定性）；timeout 对收集阶段整体限时，
-        超时工人以「未完成」如实带回，不再无限等待（原来 executor 上下文
-        退出会 join 全部线程，timeout 参数实际约束不了总时长）。
+        输出按入参工人顺序排列（确定性）；timeout 对收集阶段整体限时，缺省按
+        参与人数与并发上限自适应（见 _effective_timeout），不用固定值——池大时
+        固定值必然截断尾部批次。超时工人以「未完成」如实带回，不无限等待。
+
+        冷却/当日隔离的工人**不在入口预过滤**，交给 ask 内部判定：
+        它们返回"跳过"提示并如实带回分节（原因不变），而**已缓存答案的工人
+        仍能命中缓存**——预过滤会让缓存命中一起被剔掉，与"缓存命中不受冷却影响"
+        的契约冲突。
+
+        emit(event_dict) / cancel_event(threading.Event) 是给 ask_workers 工具用的
+        实时反馈通路（不影响 collect/vote/流水线）：
+        - 派工开始冒 `{"type":"worker_dispatch", workers/total/prompt}`；
+        - 每有一个工人回来冒 `{"type":"worker_result", worker/index/total/elapsed_ms/ok/answer}`，
+          快的工人先亮出来，用户不必等最慢的那个；
+        - cancel_event 置位则停止继续等待，把已完成的部分作为工具返回交给主 LLM 继续，
+          未完成者以「用户提前结束派工」如实标注，并冒 `worker_gather_cancelled`；
+        - 两者都为 None 时退化成纯栅栏调用（bridge ask_many、单测等走这条）。
+        事件只走 emit（不落盘、不改工具返回契约给主 LLM 的仍是完整文本），
+        emit 内部异常吞掉，绝不拖垮派工。
         """
         valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
-        # 冷却中 / 当日隔离的节点跳过（原因用进度提示如实带回，不阻塞整体）
-        reasons = {w: r for w in valid if (r := self._skip_reason(w))}
-        live = [w for w in valid if w not in reasons]
-        if not live:
-            got = ", ".join(self.profiles) or "无"
-            hint = f"（其中不可用: {', '.join(reasons)}）" if reasons else ""
-            return f"错误：没有可用的子智能体{hint}。可用：{got}"
-        got = self._run_parallel(live, prompt, system, timeout)
-        results: list[str] = []
+        if not valid:
+            return f"错误：没有可用的子智能体。可用：{', '.join(self.profiles) or '无'}"
+        limit = self._effective_timeout(len(valid), timeout)
+        t0 = time.monotonic()
+        completed: list[str] = []
+
+        def _on_done(w: str, res: str | None) -> None:
+            if emit is None:
+                return
+            ok = res is not None and not self._is_error(res)
+            completed.append(w)
+            try:
+                emit({
+                    "type": "worker_result", "worker": w,
+                    "index": len(completed), "total": len(valid),
+                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
+                    "ok": ok, "answer": res or "",
+                })
+            except Exception:  # noqa: BLE001 - 事件冒泡失败不能影响派工
+                pass
+
+        if emit is not None:
+            try:
+                emit({"type": "worker_dispatch", "workers": list(valid),
+                      "total": len(valid), "prompt": prompt})
+            except Exception:  # noqa: BLE001
+                pass
+        got = self._run_parallel(valid, prompt, system, limit, on_done=_on_done, cancel_event=cancel_event)
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        skipped = [w for w in valid if got.get(w) is None]
+        if cancelled and emit is not None:
+            try:
+                emit({"type": "worker_gather_cancelled",
+                      "completed": list(completed), "skipped": skipped})
+            except Exception:  # noqa: BLE001
+                pass
+        blocks: list[str] = []
+        if cancelled:
+            blocks.append(
+                "### 派工已由用户提前结束\n"
+                f"用户已采纳已完成的 {len(completed)}/{len(valid)} 份方案；"
+                f"以下工人未完成、已放弃等待（其请求可能仍在后台收尾）："
+                f"{', '.join(skipped) or '无'}"
+            )
         for w in valid:  # 按入参顺序输出，含跳过项
-            if w in reasons:
-                results.append(f"### 工人 {w} 的结果\n错误：工人{reasons[w]}，本轮跳过")
-                continue
             out = got.get(w)
             if out is None:
-                out = f"失败：超过 {timeout}s 未完成，已放弃等待（后台线程会自行收尾）"
-            results.append(f"### 工人 {w} 的结果\n{out}")
-        return "\n\n".join(results)
+                out = (
+                    "失败：用户已提前结束派工，未完成（后台线程会自行收尾）"
+                    if cancelled else
+                    f"失败：超过 {limit:g}s 未完成，已放弃等待（后台线程会自行收尾）"
+                )
+            else:
+                kind = self._skip_kind(out)
+                if kind:
+                    out = f"错误：工人{kind}，本轮跳过"
+            blocks.append(f"### 工人 {w} 的结果\n{out}")
+        return "\n\n".join(blocks)
 
     # ---------- 两步投票（M5：多人投票取共识） ----------
 
     def _run_ballot(
-        self, candidates: list[tuple[str, str]], voters: list[str], th: float, timeout: int
-    ) -> tuple[int, dict[int, int], int, int] | None:
-        """对编号候选方案发起投票（两步投票的第二步），返回 (best_idx, tally, total, best_n)。
+        self, candidates: list[tuple[str, str]], voters: list[str], timeout: float | None = None
+    ) -> tuple[int, dict[int, int], int, int, int] | None:
+        """对编号候选方案发起投票（两步投票的第二步）。
 
+        返回 (best_idx, tally, total, best_n, invalid)：total 是**有效票数**，
+        invalid 是投了不存在编号的废票数（调用方据此如实提示）。
         候选编号与 candidates 下标一一对应（candidates 顺序由调用方保证确定性）。
         无任何可解析选票（超时/工人都没输出编号）返回 None。
+        阈值不在这里判（共识与否由调用方按得票比例决定），故本函数不收阈值参数。
         """
         numbered = [
             f"[{i}] {w}\n预览：{ans[:80]}".replace("\n", " ")
             for i, (w, ans) in enumerate(candidates, 1)
         ]
         ballot = "候选方案：\n" + "\n".join(numbered) + "\n\n请只输出你认可方案的编号数字。"
-        got = self._run_parallel(voters, ballot, VOTER_SYSTEM, timeout)
+        got = self._run_parallel(
+            voters, ballot, VOTER_SYSTEM, self._effective_timeout(len(voters), timeout)
+        )
         votes: list[int] = []
         for raw in got.values():
             if raw is None:
                 continue
-            m = re.search(r"\d+", raw)
+            # 错误/跳过类回答不是"投票意见"，必须排除后再抓数字：
+            # 冷却提示、HTTP 状态码（如 429）、"超过 300s 未完成" 里都带数字，
+            # 用 re.search(r"\d+") 直接抓会把它们算成选票（越界的虽被丢弃，
+            # 落在 1..候选数 区间的就会变成一张假票）。
+            if self._is_error(raw):
+                continue
+            m = re.search(r"(?<!\d)\d+(?!\d)", raw)
             if m:
                 votes.append(int(m.group()))
         if not votes:
             return None
-        total = len(votes)
-        tally: dict[int, int] = {}
-        for v in votes:
-            if 1 <= v <= len(candidates):
-                tally[v] = tally.get(v, 0) + 1
-        if not tally:
+        # 分母只算**有效票**：模型偶尔会随口给个不存在的编号（如候选只有 3 份却投 9），
+        # 这种废票不该出现在共识比例的分母里。原实现 total = len(votes) 把废票也算进
+        # 分母，会出现"有效票 1/1 全投方案一、却被另 2 张废票稀释成 1/3 判为未达共识"
+        # 的错误结论 —— 投票是"取共识"的关键路径，分母错就等于结论错。
+        valid = [v for v in votes if 1 <= v <= len(candidates)]
+        if not valid:
             return None
+        total = len(valid)
+        invalid = len(votes) - total
+        tally: dict[int, int] = {}
+        for v in valid:
+            tally[v] = tally.get(v, 0) + 1
         best_idx, best_n = max(tally.items(), key=lambda kv: kv[1])
-        return best_idx, tally, total, best_n
+        return best_idx, tally, total, best_n, invalid
 
     def select_best(
         self,
         candidates: list[tuple[str, str]],
         voters: list[str] | None = None,
         threshold: float | None = None,
-        timeout: int = WORKER_TIMEOUT,
+        timeout: float | None = None,
     ) -> tuple[str, str, str] | None:
         """对已有候选方案投票择优（复用两步投票的第二步，不重复收集阶段）。
 
         返回 (胜出工人名, 胜出全文, 票况摘要)；无解析选票返回 None。
-        供流水线修订阶段等「候选已就绪」的场景复用。
+        供流水线修订阶段等「候选已就绪」的场景复用。voters 缺省取 pick() 的
+        可用工人子集（受 collaboration.max_participants 约束），不再默认全池。
         """
-        th = threshold if threshold is not None else float(self.cfg.collab_cfg.get("vote_threshold", 0.5))
-        pool = [w for w in dict.fromkeys(voters or self.names()) if w in self.profiles]
+        th = threshold if threshold is not None else self.cfg.as_float(
+            self.cfg.collab_cfg.get("vote_threshold", 0.5),
+            "collaboration.vote_threshold", 0.5, minimum=0.0,
+        )
+        pool = [w for w in dict.fromkeys(voters or self.pick()) if w in self.profiles]
         if not pool:
             return None
-        result = self._run_ballot(candidates, pool, th, timeout)
+        result = self._run_ballot(candidates, pool, timeout)
         if result is None:
             return None
-        best_idx, tally, total, best_n = result
+        best_idx, tally, total, best_n, _invalid = result
         winner = candidates[best_idx - 1]
         summary = (
             f"投票 {best_n}/{total} 票（阈值 {th:.0%}）；票况："
@@ -448,7 +638,7 @@ class WorkerPool:
         prompt: str,
         workers: list[str] | None = None,
         threshold: float | None = None,
-        timeout: int = WORKER_TIMEOUT,
+        timeout: float | None = None,
     ) -> str:
         """两步投票：先让每个工人给出方案，再让全体工人对方案编号投票。
 
@@ -459,10 +649,17 @@ class WorkerPool:
         3) 统计得票：最高票数 / 总票数 >= 阈值（默认 collaboration.vote_threshold，
            通常取 0.5，即过半共识）则宣布达成共识，否则列出票况请主智能体裁决。
 
+        workers 缺省取 pick()（按 collaboration.max_participants 限制参与人数、
+        跳过冷却与当日隔离的工人）—— 全池投票在「一站多模型」的池子里意味着
+        收集 N 次 + 投票 N 次共 2N 个请求，免费额度扛不住且尾部批次必然超时。
+
         返回结构化文本（含每方案得票与共识结论），供主智能体直接采信或人工复核。
         """
-        th = threshold if threshold is not None else float(self.cfg.collab_cfg.get("vote_threshold", 0.5))
-        pool = [w for w in dict.fromkeys(workers or self.names()) if w in self.profiles]
+        th = threshold if threshold is not None else self.cfg.as_float(
+            self.cfg.collab_cfg.get("vote_threshold", 0.5),
+            "collaboration.vote_threshold", 0.5, minimum=0.0,
+        )
+        pool = [w for w in dict.fromkeys(workers or self.pick()) if w in self.profiles]
         if not pool:
             return "错误：没有可投票的子智能体。"
 
@@ -472,15 +669,19 @@ class WorkerPool:
             return "错误：所有工人均未给出可用方案，无法投票。"
 
         # 第二步：编号后发给全体投票
-        result = self._run_ballot(candidates, pool, th, timeout)
+        result = self._run_ballot(candidates, pool, timeout)
         if result is None:
             return "错误：投票结果无法解析（工人未输出编号）。"
-        best_idx, tally, total, best_n = result
+        best_idx, tally, total, best_n, invalid = result
         ratio = best_n / total
         body = ["## 候选方案", *[f"[{i}] {w}：{ans[:96]}…" for i, (w, ans) in enumerate(candidates, 1)]]
         body.append("## 投票结果")
         for i in range(1, len(candidates) + 1):
             body.append(f"方案[{i}]: {tally.get(i, 0)}/{total} 票")
+        if invalid:
+            body.append(
+                f"（另有 {invalid} 张票投了不存在的编号，已忽略；比例按有效票 {total} 张计算）"
+            )
         if ratio >= th:
             winner = candidates[best_idx - 1]
             body.append(f"## 共识达成（{best_n}/{total} 票 ≥ {th:.0%}）")
@@ -529,11 +730,7 @@ def register_worker_tools(registry: ToolRegistry, pool: WorkerPool) -> None:
             },
             "required": ["workers", "prompt"],
         },
-        func=lambda a: pool.ask_many(
-            [str(w) for w in (a.get("workers") or [])],
-            str(a.get("prompt", "")),
-            a.get("system"),
-        ),
+        func=_make_ask_workers_func(pool),
     ))
     registry.register(FunctionTool(
         name="ask_vote",
@@ -562,3 +759,26 @@ def register_worker_tools(registry: ToolRegistry, pool: WorkerPool) -> None:
             a.get("threshold"),
         ),
     ))
+
+
+def _make_ask_workers_func(pool: WorkerPool):
+    """给 ask_workers 工具造一个「双参 (args, ctx)」执行函数。
+
+    双参签名是刻意的：FunctionTool 按签名自动决定是否注入 ctx（见 tools/base.py）。
+    ctx 是 Agent 每次工具调用现造的小对象，带 `.emit(event)` 与 `.cancel_event`
+    （threading.Event 或 None）：
+      - emit 让派工逐工人冒实时进度事件（快工人先亮，用户不必等最慢的）；
+      - cancel_event 被 Agent.cancel_current_tool() 置位后，ask_many 停止继续等待，
+        把已完成的部分作为工具结果交给主 LLM 继续（「采纳已完成、结束派工」）。
+    ctx 为 None（bridge call_tool / 单测 / 无事件通道）时退化成纯栅栏调用，与旧行为一致。
+    """
+
+    def _func(args: dict, ctx=None) -> str:
+        workers = [str(w) for w in (args.get("workers") or [])]
+        prompt = str(args.get("prompt", ""))
+        system = args.get("system")
+        emit = getattr(ctx, "emit", None) if ctx is not None else None
+        cancel_event = getattr(ctx, "cancel_event", None) if ctx is not None else None
+        return pool.ask_many(workers, prompt, system, emit=emit, cancel_event=cancel_event)
+
+    return _func

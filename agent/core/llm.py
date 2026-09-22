@@ -37,6 +37,10 @@ DEFAULT_RETRIES = 2
 _BASE_BACKOFF_RATE_LIMIT = 8.0
 _BASE_BACKOFF_OTHER = 2.0
 _MAX_BACKOFF = 60.0
+# 除 5xx 外这些 HTTP 状态码也值得退避重试：408 请求超时 / 425 Too Early /
+# 429 限流（SDK 一般已归到 RateLimitError，这里是兜底）。免费中转网关超时很常见，
+# 一次失败就放弃会让"单节点抖动不影响整体"的承诺打折。
+_RETRYABLE_STATUS = frozenset({408, 425, 429})
 
 # 错误类型常量
 ERR_TIMEOUT = "timeout"
@@ -152,10 +156,10 @@ class LLMClient:
             raise LLMError(ERR_UNAVAILABLE, "连接失败（节点不可达）") from e
         except openai.APIStatusError as e:
             code = e.status_code
-            if code >= 500:
-                # 5xx 是服务端问题，值得重试
+            if code >= 500 or code in _RETRYABLE_STATUS:
+                # 5xx 是服务端问题；408/425/429 属于"再试一次可能就好"的临时状态
                 raise LLMError(ERR_API, f"服务端错误 HTTP {code}") from e
-            # 4xx 是客户端问题（参数错/鉴权/资源不存在等），重试没用
+            # 其余 4xx 是客户端问题（参数错/鉴权/资源不存在等），重试没用
             raise LLMError(ERR_API, f"API 错误 HTTP {code}: {e.message}", retryable=False) from e
         except Exception as e:  # noqa: BLE001 - 兜底：未知错误保守判定为不可重试
             raise LLMError(ERR_OTHER, f"{type(e).__name__}: {e}", retryable=False) from e

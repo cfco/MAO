@@ -12,12 +12,13 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from types import SimpleNamespace
 
 from ..config import DEFAULT_CONTEXT, ROOT, AgentProfile, Config
 from ..skills_manager import SkillManager, register_skill_tools
 from ..tools.base import ToolRegistry
 from ..tools.builtin import build_builtin_tools
-from .health import ModelHealth
+from .health import ModelHealth, get_health
 from .llm import LLMClient, LLMError
 from .orchestrator import WorkerPool, register_worker_tools
 from .pipeline import Pipeline, register_pipeline_tool
@@ -86,9 +87,13 @@ class Agent:
             base_url=base_url,
             api_key=api_key,
             model=model,
-            temperature=float(cfg.llm.get("temperature", 0.7)),
-            timeout=float(cfg.llm.get("timeout", 120)),
-            max_retries=int(cfg.llm.get("max_retries", 2)),
+            temperature=cfg.as_float(
+                cfg.llm.get("temperature", 0.7), "llm.temperature", 0.7, minimum=0.0
+            ),
+            timeout=cfg.as_float(cfg.llm.get("timeout", 120), "llm.timeout", 120.0, minimum=1.0),
+            max_retries=cfg.as_int(
+                cfg.llm.get("max_retries", 2), "llm.max_retries", 2, minimum=0
+            ),
         )
 
         # 技能 + 内置工具（任何配置下都加载）
@@ -97,15 +102,19 @@ class Agent:
         self.registry: ToolRegistry = build_builtin_tools(cfg)
         register_skill_tools(self.registry, self.skills)
 
-        # MCP 连接（可选，运行时失败不阻塞启动）
-        self.mcp_connections: list = []
+        # MCP 连接（可选，运行时失败不阻塞启动）。
+        # 走进程内共享连接组：Web 每个会话都是一个 Agent，各自连一套会为同一批
+        # server 反复建立连接（stdio = 反复拉起同样的子进程），且每 server 首连
+        # 最长等 90s。共享后同进程只维护一套连接，新会话只把自己的工具注册表
+        # 挂上去；最后一个使用者 close 时才真正断开（引用计数在 mcp_client 里）。
+        self.mcp_group = None
         self.mcp_status: list[str] = []
         if cfg.mcp_servers:
-            from ..tools.mcp_client import connect_and_register
+            from ..tools.mcp_client import acquire_group, register_group_tools
 
-            self.mcp_status = connect_and_register(
-                cfg.mcp_servers, self.registry, self.mcp_connections
-            )
+            self.mcp_group = acquire_group(cfg.mcp_servers)
+            self.mcp_status = list(self.mcp_group.status)
+            register_group_tools(self.registry, self.mcp_group)
 
         # 协作工人池：主启用协作、且池里存在除主之外的模型时才创建。
         # 创建后把 ask_worker / ask_workers 注册为主智能体的派工工具。
@@ -120,10 +129,11 @@ class Agent:
 
         # 模型健康档案：有工人池时共用同一本账（池负责派工侧记账与隔离），
         # 没有池（solo/池空）也单独建一份——主智能体请求失败同样记账、计连击。
+        # 两处都走 get_health()：Web 每个会话一个 Agent，独立账本会互相覆盖写盘。
         self.health: ModelHealth = (
             self.worker_pool.health
             if self.worker_pool is not None
-            else ModelHealth(
+            else get_health(
                 cfg.model_health_path, cfg.env_example_path, retire_days=cfg.health_retire_days
             )
         )
@@ -153,6 +163,19 @@ class Agent:
         # 各起一个线程跑同一个 Agent），并发跑会交错写 session.history 与
         # 落盘缓冲，会话记录错乱。run() 用非阻塞抢锁快速失败，不排队。
         self._run_lock = threading.Lock()
+        # 当前工具调用的取消位：ask_workers 派工时，用户可「采纳已完成、结束派工」。
+        # 每个工具执行前置空、执行中由 cancel_current_tool() 置位。同一时刻只有一轮
+        # run、一轮里工具串行执行（_run_lock 保证），单个 Event 足够；不复用到工具之间
+        # 靠"执行前 clear"隔离，避免上一次取消泄漏到下一次。
+        self._tool_cancel = threading.Event()
+
+    def cancel_current_tool(self) -> None:
+        """请求中断当前正在执行的工具（当前仅 ask_workers 会响应，其余工具忽略该位）。
+
+        不抛异常、不阻塞：只是置位，正在跑的 ask_many 在下一次收集循环（≤0.5s 内）
+        感知后停止继续等待，把已完成部分作为工具结果交回主 LLM 继续本轮。
+        """
+        self._tool_cancel.set()
 
     def close(self) -> None:
         """释放资源：刷盘会话缓冲，关闭 MCP 长连接，并释放 LLM 连接池。调用方（CLI/Web/桥）结束时应调用。"""
@@ -162,11 +185,14 @@ class Agent:
                 session.flush()  # 把未落盘的会话消息写盘，防正常退出时丢历史
             except Exception:  # noqa: BLE001 - 刷盘失败不应影响资源释放
                 pass
-        if self.mcp_connections:
-            from ..tools.mcp_client import stop_all
+        # MCP 走共享连接组：这里只解除本会话的引用，引用归零时组内部才真正断开
+        # （否则关掉一个会话会把别的会话正在用的连接一起掐掉）。
+        group = getattr(self, "mcp_group", None)
+        if group is not None:
+            from ..tools.mcp_client import release_group
 
-            stop_all(self.mcp_connections)
-            self.mcp_connections = []
+            release_group(group)
+            self.mcp_group = None
         # 释放 HTTP 连接池：主模型 + 本 Agent 自有的工人池都持有 httpx 连接池，
         # 不显式关就只能等 GC 回收——Web 会话频繁创建/淘汰、bridge 常驻时会积压废弃连接。
         # WorkerPool 是每个 Agent 各建一个（见 __init__），所以这里关掉不会影响别的会话。
@@ -288,7 +314,11 @@ class Agent:
                     return self._interrupted(emit)
                 name = tc["function"]["name"]
                 emit({"type": "tool_start", "name": name})
-                result = self.registry.execute(name, tc["function"]["arguments"])
+                # 每个工具执行前重建取消位，保证上一次（若有）的取消不泄漏到本次；
+                # ctx 把事件通道 + 取消位交给声明双参的工具（当前只有 ask_workers）。
+                self._tool_cancel.clear()
+                ctx = SimpleNamespace(emit=emit, cancel_event=self._tool_cancel)
+                result = self.registry.execute(name, tc["function"]["arguments"], ctx=ctx)
                 emit({"type": "tool_result", "name": name, "result": result})
                 # 工具结果截断：超长只留前 MAX_TOOL_RESULT_BYTES 字节，防撑爆上下文窗口。
                 # 注意必须按字节截断再解码：中文 UTF-8 占 3B/字，若按字符切片，

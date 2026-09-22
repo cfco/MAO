@@ -127,3 +127,61 @@ def test_agent_close_releases_main_and_worker_clients(tmp_path, monkeypatch):
     assert bot.llm.closed == 1, "主模型连接池应被释放"
     assert pool._clients == {}, "工人池客户端应被清空"
     assert all(c.closed == 1 for c in made), [c.closed for c in made]
+
+
+# ---------------- cmd 内置命令：参数模式失败必须退回 shell ----------------
+# （本轮真浏览器验证时发现：Web 服务里执行 `echo xxx` 报 WinError 2，
+#   因为 echo/dir/type 是 cmd 解释器的内置命令、没有对应 exe，参数模式必然找不到文件）
+
+def test_run_shell_falls_back_to_shell_for_builtins(monkeypatch):
+    """参数模式遇 FileNotFoundError（内置命令）时应回退 shell=True 重跑一次。"""
+    import agent.tools.builtin as bi
+
+    calls: list[tuple] = []
+
+    class FakeProc:
+        stdout = b"ok"
+        stderr = b""
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw.get("shell")))
+        if kw.get("shell") is False:
+            raise FileNotFoundError("[WinError 2] 系统找不到指定的文件。")
+        return FakeProc()
+
+    monkeypatch.setattr(bi.subprocess, "run", fake_run)
+    reg = bi.build_builtin_tools(Config(_interpolate({"agents": []})))
+    out = reg.execute("run_shell", {"command": "echo hi"})
+
+    assert len(calls) == 2, f"应参数模式失败后回退 shell，实际调用 {calls}"
+    assert calls[0][1] is False and calls[1][1] is True, calls
+    assert "ok" in out and "[exit code] 0" in out
+
+
+def test_run_shell_timeout_does_not_retry(monkeypatch):
+    """只有"文件找不到"才回退；超时不重试（别把一次挂死变成两次）。"""
+    import agent.tools.builtin as bi
+
+    calls: list = []
+
+    def fake_run(cmd, **kw):
+        calls.append(kw.get("shell"))
+        raise bi.subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(bi.subprocess, "run", fake_run)
+    reg = bi.build_builtin_tools(Config(_interpolate({"agents": []})))
+    out = reg.execute("run_shell", {"command": "sleep 999"})
+
+    assert "超过" in out and "未完成" in out
+    assert len(calls) == 1, f"超时不应重试，实际 {calls}"
+
+
+def test_run_shell_real_cmd_builtins():
+    """真实子进程：cmd 内置命令（echo）必须能跑通并带回退出码。"""
+    from agent.tools.builtin import build_builtin_tools
+
+    reg = build_builtin_tools(Config(_interpolate({"agents": []})))
+    out = reg.execute("run_shell", {"command": "echo BUILTIN_E2E_OK"})
+    assert "BUILTIN_E2E_OK" in out, out[:300]
+    assert "[exit code] 0" in out, out[:300]

@@ -8,9 +8,17 @@
   {"event":"final","content":"完整最终答案（不截断）"}
   {"event":"error","message":...}          # 单轮内出错
   {"event":"session","session_id":...}     # Web 建会话通知；协议层用 ok+id 响应
+  # —— ask_workers 并行派工的逐工人实时进度（快工人先回来，用户不必等最慢的）——
+  {"event":"worker_dispatch","workers":[...],"total":N,"prompt_preview":"..."}
+  {"event":"worker_result","worker":...,"index":i,"total":N,"elapsed_ms":...,"ok":true|false,"preview":"..."}
+  {"event":"worker_gather_cancelled","completed":[...],"skipped":[...]}
+
+worker_result 的 `ok` 区分"成功带回答案"与"失败/超时/当日隔离"，前端据此把骨架格
+标对勾或叉。`worker_gather_cancelled` 只在用户点「采纳已完成、结束派工」后出现，
+标记哪些工人被放弃等待（其 LLM 请求已在途，不追溯撤单，后台自行收尾）。
 
 从 Agent / Pipeline 内部事件回调（{"type": ...}）转换到统一对外格式。
-长文本只在中间过程截断（tool_result / stage），最终答案(final)不截断。
+长文本只在中间过程截断（tool_result / worker_result / stage），最终答案(final)不截断。
 """
 from __future__ import annotations
 
@@ -46,6 +54,30 @@ def to_event(ev: dict) -> dict:
     if t == "error":
         # 显式归一：将来若 Agent 内部 error 事件结构变化，这里集中处理
         return {"event": "error", "message": str(ev.get("message", ""))}
+    if t == "worker_dispatch":
+        ws = list(ev.get("workers") or [])
+        return {
+            "event": "worker_dispatch",
+            "workers": ws,
+            "total": ev.get("total", len(ws)),
+            "prompt_preview": str(ev.get("prompt", ""))[:TOOL_PREVIEW_LEN],
+        }
+    if t == "worker_result":
+        return {
+            "event": "worker_result",
+            "worker": ev.get("worker"),
+            "index": ev.get("index"),
+            "total": ev.get("total"),
+            "elapsed_ms": ev.get("elapsed_ms"),
+            "ok": bool(ev.get("ok")),
+            "preview": str(ev.get("answer", ""))[:TOOL_PREVIEW_LEN],
+        }
+    if t == "worker_gather_cancelled":
+        return {
+            "event": "worker_gather_cancelled",
+            "completed": list(ev.get("completed") or []),
+            "skipped": list(ev.get("skipped") or []),
+        }
     # 未识别的直接透传（过滤掉 type 字段，避免 {"event":x, "type":x} 同时残留）
     return {"event": t or "event", **{k: v for k, v in ev.items() if k != "type"}}
 

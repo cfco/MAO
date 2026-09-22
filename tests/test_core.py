@@ -1009,8 +1009,15 @@ def test_ask_takeover_does_not_clear_new_inflight():
 
     try:
         threading.Thread(target=_run, args=(lead_future,), name="lead", daemon=True).start()
-        while calls["n"] < 1:
-            time.sleep(0.01)  # 等旧发起者建立 inflight 并进入网络
+        # 等旧发起者建立 inflight 并进入网络。**必须带 deadline**：任何回归（比如当日
+        # 隔离把发起者的 ask 短路、FakeClient 没跑起来）都会让这个 while 空转到天荒地老，
+        # 把整套测试挂死、CI 只能靠 timeout 兜底。同文件另外两处并发等待
+        # （test_ask_concurrent_dedup_same_key / test_ask_concurrent_initiator_failure_shared_with_followers）
+        # 都有 `time.time() < deadline` 保护，这里语义对齐：到期未就位 ⇒ 显式失败。
+        lead_deadline = time.time() + 5.0
+        while calls["n"] < 1 and time.time() < lead_deadline:
+            time.sleep(0.01)
+        assert calls["n"] >= 1, "旧发起者未在 5s 内进入网络段，接管路径无法继续（多半是 ask 被上游短路了）"
 
         threading.Thread(
             target=_run, args=(follower_future,), name="follower", daemon=True
@@ -1061,3 +1068,104 @@ def test_agent_empty_reply_not_silent(tmp_path, monkeypatch):
         assert "空内容" in out
     finally:
         bot.close()
+
+
+# ---------------- 并行派工实时事件 + 提前采纳（方案A + 结束派工） ----------------
+
+def test_to_event_worker_streaming_schemas():
+    """三派工事件在 to_event 里显式归一：preview 截断、ok/计数字段透传。"""
+    d = to_event({"type": "worker_dispatch", "workers": ["a", "b"], "prompt": "P" * 600})
+    assert d["event"] == "worker_dispatch" and d["total"] == 2
+    assert len(d["prompt_preview"]) <= 500
+    r = to_event({"type": "worker_result", "worker": "a", "index": 1, "total": 2,
+                  "elapsed_ms": 1234, "ok": True, "answer": "hi"})
+    assert r["event"] == "worker_result" and r["worker"] == "a"
+    assert r["ok"] is True and r["preview"] == "hi" and r["elapsed_ms"] == 1234
+    r2 = to_event({"type": "worker_result", "worker": "b", "ok": False, "answer": "错误：隔离"})
+    assert r2["ok"] is False
+    c = to_event({"type": "worker_gather_cancelled", "completed": ["a"], "skipped": ["b"]})
+    assert c["event"] == "worker_gather_cancelled"
+    assert c["completed"] == ["a"] and c["skipped"] == ["b"]
+
+
+def test_functiontool_injects_ctx_only_for_two_arg_funcs():
+    """FunctionTool 按签名决定是否注入 ctx：双参收、单参不收；单参工具无 ctx 也照常跑。"""
+    seen = {}
+
+    def needs_ctx(a, ctx=None):
+        seen["ctx"] = ctx
+        return "yes"
+
+    def simple(a):
+        return "no"
+
+    reg = ToolRegistry()
+    reg.register(FunctionTool("n", "d", {}, needs_ctx))
+    reg.register(FunctionTool("s", "d", {}, simple))
+    sentinel = SimpleNamespace(emit=lambda e: None, cancel_event=None)
+    assert reg.execute("n", {}, sentinel) == "yes"
+    assert seen["ctx"] is sentinel, "双参工具必须收到 ctx"
+    assert reg.execute("s", {}) == "no"          # 无 ctx 路径（bridge call_tool/单测）
+    assert reg.execute("s", {}, sentinel) == "no"  # 传了 ctx 也不报错、忽略之
+
+
+def _two_worker_stream_pool() -> WorkerPool:
+    cfg = Config(_interpolate({"agents": [
+        {"name": "fast", "base_url": "u", "api_key": "k", "model": "fast"},
+        {"name": "slow", "base_url": "u", "api_key": "k", "model": "slow"},
+    ]}))
+    return WorkerPool(cfg, exclude=None)
+
+
+def test_ask_many_emits_worker_events(monkeypatch):
+    """ask_many 带 emit：先 worker_dispatch，再每个工人各一条 worker_result（含 ok/answer）。"""
+    class Instant:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def chat(self, messages, tools=None):
+            return {"content": "ok"}
+
+    monkeypatch.setattr(orch, "LLMClient", Instant)
+    pool = _two_worker_stream_pool()
+    evs: list[dict] = []
+    out = pool.ask_many(["fast", "slow"], "任务", emit=lambda e: evs.append(e))
+    types = [e["type"] for e in evs]
+    assert types[0] == "worker_dispatch"
+    assert types.count("worker_result") == 2
+    wr = [e for e in evs if e["type"] == "worker_result"]
+    assert all(e["ok"] and e["answer"] == "ok" for e in wr)
+    assert {e["worker"] for e in wr} == {"fast", "slow"}
+    assert "### 工人 fast 的结果" in out and "### 工人 slow 的结果" in out
+    # 无 emit 时（bridge/单测）退化成纯栅栏调用，不抛异常
+    assert "工人 fast 的结果" in pool.ask_many(["fast", "slow"], "任务2")
+
+
+def test_ask_many_cancel_returns_completed_early(monkeypatch):
+    """快工人一回来就置取消位 → 慢工人被放弃等待、结果里标注提前结束（确定性、无计时竞态）。"""
+    class Timed:
+        def __init__(self, _b, _a, model, **_k):
+            self.model = model
+
+        def chat(self, messages, tools=None):
+            if self.model == "slow":
+                time.sleep(2.0)  # 慢节点：取消后应放弃等待它（此线程后台自行收尾）
+            return {"content": f"ans-{self.model}"}
+
+    monkeypatch.setattr(orch, "LLMClient", Timed)
+    pool = _two_worker_stream_pool()
+    cancel = threading.Event()
+    evs: list[dict] = []
+
+    def emit(e: dict) -> None:
+        evs.append(e)
+        if e["type"] == "worker_result" and e["worker"] == "fast":
+            cancel.set()  # 采纳已完成的 fast，结束对 slow 的等待
+
+    t0 = time.monotonic()
+    out = pool.ask_many(["fast", "slow"], "任务", emit=emit, cancel_event=cancel)
+    dt = time.monotonic() - t0
+    assert dt < 1.5, f"取消未生效：等了 {dt:.2f}s（慢节点未收尾就该放弃等待）"
+    assert "ans-fast" in out, "已完成工人的结果必须保留"
+    assert "提前结束" in out and "slow" in out
+    assert any(e["type"] == "worker_gather_cancelled" for e in evs)

@@ -92,13 +92,22 @@ def pick_orchestrator(cfg: Config, preferred: str | None, interactive: bool, str
     return None
 
 
-def build_agent(cfg: Config, args, interactive: bool = False) -> Agent:
+def build_agent(cfg: Config, args, interactive: bool = False, profile=None) -> Agent:
+    """构造主智能体。
+
+    profile 显式传入时直接沿用、不再走选主流程 —— /new 开新会话时用它保持当前主。
+    否则 interactive=False 会让 pick_orchestrator 直接取池内第一个，用户先前交互
+    选中的主会被悄悄换掉（CLI 与顶栏都没有任何提示）。
+    """
     # --stream 时 stdout 只承载 JSON 事件行，启动期的诊断信息统一走 stderr
     stream = bool(getattr(args, "stream", False))
     err = sys.stderr if stream else sys.stdout
-    profile = pick_orchestrator(
-        cfg, getattr(args, "orchestrator", None), interactive, stream=stream
-    )
+    if profile is not None:
+        print(f"[主智能体] {profile.name} ({profile.model})（沿用当前主）", file=err)
+    else:
+        profile = pick_orchestrator(
+            cfg, getattr(args, "orchestrator", None), interactive, stream=stream
+        )
     bot = Agent(cfg, profile=profile, enable_workers=not getattr(args, "solo", False))
     for line in bot.mcp_status:
         print(line, file=err)
@@ -182,7 +191,13 @@ def main() -> None:
             print("错误：智能体池为空，无法执行流水线。请先在 config.yaml 配置多个智能体。")
             sys.exit(1)
         pipe = Pipeline(pool)
-        print(f"固定流水线 起草→评审→修订 开始（工人：{', '.join(pool.names())}）")
+        # 打印缺省参与名单（受 collaboration.max_participants 约束）：显式传 --draft/--review
+        # 时会覆盖各自阶段，这里给出的是"不指定时"实际会用到的工人。
+        default_participants = pool.pick()
+        print(
+            f"固定流水线 起草→评审→修订 开始"
+            f"（缺省参与 {len(default_participants)} 名：{', '.join(default_participants)}）"
+        )
         result = pipe.run(
             args.task,
             draft_workers=[w for w in args.draft.split(",") if w.strip()] if args.draft else None,
@@ -225,8 +240,9 @@ def main() -> None:
             bot.close()
             return
         if user == "/new":
+            keep_profile = bot.profile  # 保住当前主，别被池内第一个顶掉
             bot.close()
-            bot = build_agent(cfg, args, interactive=False)
+            bot = build_agent(cfg, args, interactive=False, profile=keep_profile)
             print("已开启新会话。")
             continue
         print("助手> ", end="", flush=True)

@@ -60,6 +60,10 @@ class ChatRequest(BaseModel):
     orchestrator: str | None = None
 
 
+class CancelToolRequest(BaseModel):
+    session_id: str
+
+
 def _cleanup_loop() -> None:
     """后台清理线程：定期关闭并移除超时空闲会话。"""
     while not _stop_event.is_set():
@@ -105,15 +109,27 @@ async def lifespan(app: FastAPI):
     for line in bot.mcp_status:
         print(line)
     bot.close()  # 测试用 Agent 也释放连接，不占用后台线程
-    threading.Thread(target=_cleanup_loop, name="session-cleanup", daemon=True).start()
+    # 复位停止信号：_stop_event 是模块级全局，上一次 lifespan 退出时已被 set。
+    # 不复位的话本次新建的清理线程 while 条件立即为假 —— 线程创建即退出，
+    # 会话 30 分钟超时清理从此永久失效（uvicorn --reload、以及二次进入 lifespan
+    # 的场景都会踩到；实测第二次进入存活清理线程数为 0）。
+    _stop_event.clear()
+    cleanup_thread = threading.Thread(
+        target=_cleanup_loop, name="session-cleanup", daemon=True
+    )
+    cleanup_thread.start()
     try:
         yield
     finally:
         _stop_event.set()
+        # 等清理线程真正退出再返回：否则二次进入时会有两个清理线程并存（旧的虽会
+        # 因 set 而退出，但收尾与新的启动存在重叠窗口）。
+        cleanup_thread.join(timeout=1.0)
         with _lock:
             agents = list(_agents.values())
             _agents.clear()
             _last_active.clear()
+            _session_orch.clear()  # 三张会话表一起清，别留孤儿条目
         for a in agents:
             try:
                 a.close()
@@ -304,6 +320,26 @@ def chat(req: ChatRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/chat/cancel_tool")
+def cancel_tool(req: CancelToolRequest):
+    """结束该会话当前正在执行的派工工具（当前仅 ask_workers 响应），采纳已完成部分。
+
+    与"客户端断开即取消整轮"不同：这里只中断当前这一次并行派工，让后台轮次拿着
+    已完成的结果继续（主 LLM 收到带"用户提前结束派工"说明的工具结果，正常进下一轮）。
+    轮次跑在 daemon 线程里、本路由在主事件循环并发受理，所以能在派工进行中断入。
+    """
+    sid = (req.session_id or "").strip()
+    safe = sanitize_session_id(sid)
+    if not safe:
+        return {"ok": False, "error": "session_id 非法"}
+    with _lock:
+        agent = _agents.get(safe)
+    if agent is None:
+        return {"ok": False, "error": "会话不存在或已结束"}
+    agent.cancel_current_tool()
+    return {"ok": True}
 
 
 def main() -> None:

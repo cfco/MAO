@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
 import threading
@@ -287,9 +288,14 @@ class McpConnection:
 
 
 def connect_and_register(
-    server_cfgs: list[dict], registry: ToolRegistry, out_conns: list | None = None
+    server_cfgs: list[dict], registry: ToolRegistry, out_conns: list | None = None,
+    out_tools: list | None = None,
 ) -> list[str]:
-    """连接全部配置的 MCP server 并注册其工具。返回状态日志行。"""
+    """连接全部配置的 MCP server 并注册其工具。返回状态日志行。
+
+    out_conns / out_tools 可选：把建立的连接与注册的工具对象一并带出，
+    供进程内共享连接组复用（见 acquire_group）。
+    """
     status: list[str] = []
     for cfg in server_cfgs:
         name = str(cfg.get("name") or cfg.get("command") or cfg.get("url") or "mcp")
@@ -308,13 +314,16 @@ def connect_and_register(
         prefix = _safe_name(name)
         for t in tools:
             schema = t.inputSchema if isinstance(t.inputSchema, dict) else {}
-            registry.register(McpTool(
+            tool = McpTool(
                 name=f"mcp__{prefix}__{_safe_name(t.name)}",
                 description=f"[MCP:{name}] {getattr(t, 'description', '') or t.name}",
                 input_schema=schema or {"type": "object", "properties": {}},
                 conn=conn,
                 remote_name=t.name,
-            ))
+            )
+            registry.register(tool)
+            if out_tools is not None:
+                out_tools.append(tool)
         status.append(f"[MCP] {name}: 已连接，发现 {len(tools)} 个工具")
     return status
 
@@ -325,3 +334,105 @@ def stop_all(conns: list) -> None:
             c.stop()
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------- 进程内共享连接组（按 servers 配置签名复用） ----------
+
+
+class McpGroup:
+    """一组进程内共享的 MCP 长连接 + 已发现的工具对象，带引用计数。
+
+    为什么要共享：Web 每个会话建一个 Agent，各自 connect_and_register 会为同一批
+    server 反复建立连接（stdio 场景 = 反复拉起同样的子进程），且每个 server 首次
+    连接最长要等 90s。共享后同一进程只维护一套连接，新会话只做"把自己的工具
+    注册表挂上去"这一件轻活。McpTool 本身无状态（只持有 conn 引用），可安全地
+    同时注册到多个会话的注册表里。
+
+    引用计数：最后一个使用者 release 时才真正 stop_all —— 否则一个会话关闭就会
+    把别的会话正在用的连接一起掐掉。
+    """
+
+    def __init__(self, server_cfgs: list[dict]):
+        self.server_cfgs = server_cfgs
+        self.conns: list[McpConnection] = []
+        self.tools: list[McpTool] = []
+        self.status: list[str] = []
+        self._lock = threading.Lock()
+        self._refs = 0
+        self._closed = False
+
+    def start(self) -> None:
+        """建立连接并发现工具（只在首次创建该组时调用一次）。"""
+        collector = ToolRegistry()
+        self.status = connect_and_register(
+            self.server_cfgs, collector, self.conns, out_tools=self.tools
+        )
+
+    def acquire(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("MCP 连接组已关闭")
+            self._refs += 1
+
+    def release(self) -> None:
+        """释放一个使用者；引用归零时关闭全部连接。"""
+        with self._lock:
+            self._refs -= 1
+            if self._refs > 0:
+                return
+            self._closed = True
+        stop_all(self.conns)
+
+    @property
+    def refs(self) -> int:
+        with self._lock:
+            return self._refs
+
+
+_groups_lock = threading.Lock()
+_groups: dict[str, McpGroup] = {}
+
+
+def _group_key(server_cfgs: list[dict]) -> str:
+    """配置签名：内容一致（含键序无关）即视为同一组，可复用同一批连接。"""
+    return json.dumps(server_cfgs, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def acquire_group(server_cfgs: list[dict]) -> McpGroup:
+    """取得（或建立）与配置对应的共享连接组，并登记一个使用者。
+
+    建连在全局锁外完成：单个 server 首连最长 90s，占着锁会把别的会话一起堵住。
+    """
+    key = _group_key(server_cfgs)
+    with _groups_lock:
+        group = _groups.get(key)
+    if group is None:
+        fresh = McpGroup(list(server_cfgs))
+        fresh.start()  # 锁外建连（可能耗时）
+        with _groups_lock:
+            group = _groups.get(key)  # 并发下别人可能已建好，用先到的那个
+            if group is None:
+                group = fresh
+                _groups[key] = group
+        if group is not fresh:
+            stop_all(fresh.conns)  # 自己建的这份多余，释放掉
+    group.acquire()
+    return group
+
+
+def release_group(group: McpGroup) -> None:
+    """释放一个使用者；引用归零时关闭连接并从共享表移除。"""
+    group.release()
+    if group.refs > 0:
+        return
+    with _groups_lock:
+        for key, g in list(_groups.items()):
+            if g is group:
+                _groups.pop(key, None)
+
+
+def register_group_tools(registry: ToolRegistry, group: McpGroup) -> None:
+    """把共享组已发现的工具注册进指定注册表（同批 McpTool 对象跨会话复用）。"""
+    for tool in group.tools:
+        if registry.get(tool.name) is None:
+            registry.register(tool)

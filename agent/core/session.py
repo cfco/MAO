@@ -211,7 +211,14 @@ class Session:
         至少保留最近 MAX_HISTORY 条，避免长工具结果把全场清空。
         """
         msgs: list[dict] = [{"role": "system", "content": system_prompt}]
-        budget = max(MAX_HISTORY, int(context_length * CONTEXT_SAFETY))
+        # system prompt 必须先占掉自己那份额度：它装着技能清单 + 工人池清单 + 工作
+        # 原则，池子按「一站多模型」组织时可以相当长。原先只按 context_length×0.75
+        # 算历史、不扣 system，等于把裁剪边界放宽了整整一个 system prompt 的长度 ——
+        # 技能多、池子大时正好把请求顶出真实窗口。下限仍是 MAX_HISTORY 条的位置。
+        budget = max(
+            MAX_HISTORY,
+            int(context_length * CONTEXT_SAFETY) - self._est_tokens(system_prompt),
+        )
         # 从尾部往回累计，头部溢出即停
         # MAX_HISTORY * 4：扩大候选窗口，避免长工具结果导致候选被过早截断
         kept: list[dict] = []

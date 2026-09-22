@@ -1,8 +1,10 @@
 """工具基类与注册表：内置工具、MCP 工具、Skill 工具统一适配到同一接口。"""
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable
+from typing import Any
 
 
 class Tool:
@@ -12,7 +14,7 @@ class Tool:
     description: str = ""
     input_schema: dict = {}
 
-    def execute(self, args: dict) -> str:
+    def execute(self, args: dict, ctx: Any | None = None) -> str:
         raise NotImplementedError
 
     def to_openai_schema(self) -> dict:
@@ -27,16 +29,39 @@ class Tool:
 
 
 class FunctionTool(Tool):
-    """用 Python 函数直接构造一个工具。"""
+    """用 Python 函数直接构造一个工具。
 
-    def __init__(self, name: str, description: str, input_schema: dict, func: Callable[[dict], str]):
+    `func` 可写成单参 `func(args)`（绝大多数工具），也可写成双参 `func(args, ctx)`
+    ——双参版本用于需要「边执行边冒进度事件」或「响应用户取消」的工具（如 ask_workers）。
+    是否传 ctx 由本类按签名自动判定：单参工具即便注册表传了 ctx 也不会收到（保持向后
+    兼容，bridge call_tool / 测试等无 ctx 的调用路径照常工作）。
+    """
+
+    def __init__(self, name: str, description: str, input_schema: dict, func: Callable[..., str]):
         self.name = name
         self.description = description
         self.input_schema = input_schema
         self._func = func
+        self._wants_ctx = _accepts_ctx(func)
 
-    def execute(self, args: dict) -> str:
+    def execute(self, args: dict, ctx: Any | None = None) -> str:
+        if self._wants_ctx:
+            return self._func(args, ctx)
         return self._func(args)
+
+
+def _accepts_ctx(func: Callable[..., Any]) -> bool:
+    """该工具函数是否需要接收第二个参数 ctx。"""
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    positional = [
+        p for p in sig.parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    has_varargs = any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values())
+    return has_varargs or len(positional) >= 2
 
 
 class ToolRegistry:
@@ -77,8 +102,12 @@ class ToolRegistry:
     def openai_schemas(self) -> list[dict]:
         return [t.to_openai_schema() for t in self._tools.values()]
 
-    def execute(self, name: str, arguments: str | dict) -> str:
-        """执行一次工具调用，永不抛异常，错误以文本返回给模型自行处理。"""
+    def execute(self, name: str, arguments: str | dict, ctx: Any | None = None) -> str:
+        """执行一次工具调用，永不抛异常，错误以文本返回给模型自行处理。
+
+        ctx 可选地携带 {"emit": fn, "cancel_event": Event}，透传给声明了双参签名的
+        工具（见 FunctionTool）。无 ctx 的调用路径（bridge call_tool、单测）照常工作。
+        """
         tool = self._tools.get(name)
         if tool is None:
             return f"错误：未知工具 '{name}'，可用工具：{', '.join(self._tools)}"
@@ -90,6 +119,6 @@ class ToolRegistry:
         except json.JSONDecodeError as e:
             return f"错误：工具参数不是合法 JSON：{e}"
         try:
-            return tool.execute(args)
+            return tool.execute(args, ctx)
         except Exception as e:  # noqa: BLE001 - 工具错误必须转成文本回给模型
             return f"工具执行出错：{type(e).__name__}: {e}"

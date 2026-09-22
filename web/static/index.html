@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>多功能智能体</title>
+<!-- 空 data URI 图标：浏览器默认会去请求 /favicon.ico，本服务没有该路由 → 每次都留一条
+     404 资源错误（实测在控制台里出现"Failed to load resource: 404"），干扰排查真实 JS 问题。 -->
+<link rel="icon" href="data:,">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -75,6 +78,26 @@
   code { background: #eef1f6; border-radius: 4px; padding: 1px 5px; font-size: 13px; }
   .bubble pre.codeblock { background: #f0f2f7; padding: 8px 10px; border-radius: 8px;
     overflow-x: auto; margin: 6px 0; white-space: pre-wrap; }
+  /* 并行派工卡：逐工人实时进度 + 「采纳已完成、结束派工」 */
+  .wcard { background: #fff; border: 1px solid #e5e8ef; border-radius: 10px;
+    margin-bottom: 12px; overflow: hidden; }
+  .wcard .whead { padding: 8px 12px; font-size: 12.5px; color: #5b6472;
+    display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #eef0f4; }
+  .wcard .wslots { display: flex; flex-direction: column; }
+  .wslot { padding: 8px 12px; font-size: 12.5px; border-top: 1px solid #f4f6f9; }
+  .wslot:first-child { border-top: none; }
+  .wslot .wtop { display: flex; align-items: center; gap: 6px; }
+  .wslot .wname { font-weight: 600; color: #1f2329; }
+  .wslot .wstat { margin-left: auto; font-size: 11.5px; color: #98a1af; }
+  .wslot .wstat.ok { color: #34c77b; }
+  .wslot .wstat.fail { color: #cf1322; }
+  .wslot .wstat.run { color: #4f6ef7; }
+  .wslot .wprev { margin-top: 5px; color: #444; background: #f7f8fa; border-radius: 6px;
+    padding: 6px 9px; max-height: 140px; overflow: auto; white-space: pre-wrap; }
+  .wact { padding: 8px 12px; border-top: 1px solid #eef0f4; display: flex; gap: 8px; align-items: center; }
+  .wact .adopt { background: #34c77b; padding: 6px 14px; font-size: 12.5px; }
+  .wact .adopt:disabled { background: #b9d9c7; }
+  .wact .wnote { font-size: 11.5px; color: #98a1af; }
 </style>
 </head>
 <body>
@@ -208,6 +231,110 @@ function toolResult(d, text) {
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
+// ---- 并行派工卡（ask_workers 实时进度 + 采纳已完成）----
+// worker_dispatch 建卡与逐工人骨架格；worker_result 就地填一格（快工人先亮）；
+// 「采纳已完成」按钮打 /api/chat/cancel_tool 让后端停止等待未完成的工人。
+let wcard = null;            // 当前派工卡根节点
+let wslots = {};             // worker 名 -> {stat, prev} DOM 引用
+let wdone = 0, wtotal = 0;
+let wbtn = null;             // 采纳按钮引用
+
+function startWorkerCard(ev) {
+  wcard = document.createElement('div');
+  wcard.className = 'wcard';
+  const head = document.createElement('div');
+  head.className = 'whead';
+  wtotal = ev.total || (ev.workers || []).length || 0;
+  wdone = 0;
+  wslots = {};
+  head.innerHTML = '👥 并行派工 · ' + wtotal + ' 个工人' +
+    (ev.prompt_preview ? ' <span style="opacity:.6">— ' + escapeHtml(ev.prompt_preview.slice(0, 40)) + (ev.prompt_preview.length > 40 ? '…' : '') + '</span>' : '');
+  const slots = document.createElement('div');
+  slots.className = 'wslots';
+  (ev.workers || []).forEach((w) => {
+    const s = document.createElement('div');
+    s.className = 'wslot';
+    const top = document.createElement('div');
+    top.className = 'wtop';
+    top.innerHTML = '<span class="wname">' + escapeHtml(w) + '</span><span class="wstat run">⏳ 等待中…</span>';
+    s.appendChild(top);
+    slots.appendChild(s);
+    wslots[w] = { root: s, stat: top.querySelector('.wstat'), prev: null };
+  });
+  wcard.appendChild(head);
+  wcard.appendChild(slots);
+  const act = document.createElement('div');
+  act.className = 'wact';
+  wbtn = document.createElement('button');
+  wbtn.className = 'adopt';
+  wbtn.textContent = '✅ 采纳已完成，结束派工';
+  wbtn.disabled = true;  // 一个都没回来前不给点
+  wbtn.onclick = adoptWorkers;
+  const note = document.createElement('span');
+  note.className = 'wnote';
+  note.textContent = '快的先回来；满意就点采纳，不用等最慢的';
+  act.appendChild(wbtn); act.appendChild(note);
+  wcard.appendChild(act);
+  chatEl.appendChild(wcard);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function fillWorkerSlot(ev) {
+  const s = wslots[ev.worker];
+  if (!s) return;
+  wdone++;
+  const ok = ev.ok;
+  s.stat.className = 'wstat ' + (ok ? 'ok' : 'fail');
+  s.stat.textContent = (ok ? '✓ ' : '✕ ') + (ev.elapsed_ms != null ? (ev.elapsed_ms / 1000).toFixed(1) + 's' : (ok ? '完成' : '未完成'));
+  const prev = document.createElement('div');
+  prev.className = 'wprev';
+  const txt = ev.preview || '';
+  prev.textContent = txt.length > 500 ? txt.slice(0, 500) + ' …' : (txt || '(空)');
+  s.root.appendChild(prev);
+  s.prev = prev;
+  if (wbtn && wdone > 0) wbtn.disabled = false;
+  if (wbtn) wbtn.textContent = '✅ 采纳已完成 (' + wdone + '/' + wtotal + ')，结束派工';
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function markWorkersCancelled(ev) {
+  if (!wcard) return;
+  (ev.skipped || []).forEach((w) => {
+    const s = wslots[w];
+    if (s && !s.prev) { s.stat.className = 'wstat fail'; s.stat.textContent = '⏹ 已结束等待'; }
+  });
+  if (wbtn) { wbtn.disabled = true; wbtn.textContent = '已结束派工'; }
+  const n = wcard.querySelector('.wact .wnote');
+  if (n) n.textContent = '已完成 ' + (ev.completed || []).length + ' 份，交给主智能体继续';
+}
+
+function endWorkerCard(finalText) {
+  // ask_workers 的 tool_result 到达：把合并全文折进卡片，收尾并释放引用
+  if (wcard) {
+    const det = document.createElement('details');
+    det.className = 'tool';
+    det.style.margin = '0'; det.style.borderTop = '1px solid #eef0f4'; det.style.borderRadius = '0';
+    det.innerHTML = '<summary>📄 派工合并结果（给主智能体的完整文本）</summary><pre>' +
+      escapeHtml((finalText || '').slice(0, 4000)) + '</pre>';
+    wcard.appendChild(det);
+  }
+  wcard = null; wslots = {}; wbtn = null;
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+async function adoptWorkers() {
+  if (!wbtn) return;
+  wbtn.disabled = true; wbtn.textContent = '结束派工中…';
+  try {
+    await fetch('/api/chat/cancel_tool', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+  } catch (e) {
+    wbtn.disabled = false; wbtn.textContent = '采纳失败，可重试';
+  }
+}
+
 async function send() {
   const text = inputEl.value.trim();
   if (!text || busy) return;
@@ -216,6 +343,7 @@ async function send() {
   appendBubble('user', text);
   const bubble = appendBubble('assistant', '');
   let currentTool = null;
+  wcard = null; wslots = {}; wbtn = null;  // 清掉上一轮可能残留的派工卡引用
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST',
@@ -242,10 +370,18 @@ async function send() {
           statusEl.textContent = '会话 ' + sessionId + ' · 自研主控 + MCP + Skill';
         } else if (ev.event === 'tool_start') {
           bubble.innerHTML = '';
-          currentTool = appendTool(ev.name);
+          // ask_workers 用专门的派工卡渲染实时进度，不再叠一张通用工具卡
+          if (ev.name === 'ask_workers') { currentTool = null; }
+          else { currentTool = appendTool(ev.name); }
+        } else if (ev.event === 'worker_dispatch') {
+          startWorkerCard(ev);
+        } else if (ev.event === 'worker_result') {
+          fillWorkerSlot(ev);
+        } else if (ev.event === 'worker_gather_cancelled') {
+          markWorkersCancelled(ev);
         } else if (ev.event === 'tool_result') {
-          if (currentTool) toolResult(currentTool, ev.preview);
-          currentTool = null;
+          if (wcard) { endWorkerCard(ev.preview); }
+          else if (currentTool) { toolResult(currentTool, ev.preview); currentTool = null; }
         } else if (ev.event === 'final') {
           bubble.innerHTML = renderMd(ev.content || '(空回复)');
         } else if (ev.event === 'error') {

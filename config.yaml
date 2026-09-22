@@ -43,6 +43,10 @@ llm:
 
 collaboration:
   max_workers: 3                 # ask_workers 并行派工时的最大并发
+  max_participants: 5            # 一次批量派工最多带几个工人（0/负数=不限，用池内全部）
+                                 # 为什么要有：池子一站多模型时轻易几十个，全池派工会一次
+                                 # 打出几十个请求，并发上限只有 3 → 尾部批次必被整体限时
+                                 # 丢弃。默认取前 5 个可用工人（跳过冷却/当日隔离）
   vote_threshold: 0.5            # ask_vote 达成共识的票数占比（0-1，0.5=过半）
   cache_size: 32                 # 工人回答 LRU 缓存条数（同工同题不重复调用）
   cooldown_fails: 2              # 工人连续失败 N 次后进入冷却（暂停调用该节点）

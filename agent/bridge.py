@@ -29,6 +29,7 @@
   {"cmd":"chat","message":"...","session_id":"...","stream":true} （用会话跑一轮，可续历史）
   {"cmd":"list_sessions"}
   {"cmd":"session_tools","session_id":"..."}                       （查某会话的工具白名单/被裁剪项）
+  {"cmd":"cancel_tool","session_id":"..."}                         （结束当前工具派工；bridge 串行下 best-effort，Web 才实时）
   {"cmd":"close_session","session_id":"..."}
 
 响应：{"ok":true,...} 或 {"ok":false,"error":"..."}；启动后先发一行 ready 事件。
@@ -83,13 +84,15 @@ class Bridge:
         self.skills.scan()
         self.registry: ToolRegistry = build_builtin_tools(cfg)
         register_skill_tools(self.registry, self.skills)
-        self.mcp_connections: list = []
+        # MCP 走进程内共享连接组：bridge 与它临时建的 Agent（run_task）共享同一套
+        # 连接，避免同进程内重复拉起 stdio 子进程、重复等最长 90s 的首连。
+        self.mcp_group = None
         self.mcp_status: list[str] = []
         if cfg.mcp_servers:
-            from .tools.mcp_client import connect_and_register
-            self.mcp_status = connect_and_register(
-                cfg.mcp_servers, self.registry, self.mcp_connections
-            )
+            from .tools.mcp_client import acquire_group, register_group_tools
+            self.mcp_group = acquire_group(cfg.mcp_servers)
+            self.mcp_status = list(self.mcp_group.status)
+            register_group_tools(self.registry, self.mcp_group)
         self.workers = WorkerPool(cfg)
         # 持久会话：外部主可开多个话茬，各带独立 Agent（含 JSONL 落盘的会话历史）
         # 用字符串延迟引用避免循环导入（Agent 在 _new_session 里局部引入）
@@ -117,9 +120,15 @@ class Bridge:
                     str(llm.get("base_url", "")),
                     str(llm.get("api_key", "")),
                     str(llm.get("model", "")),
-                    temperature=float(llm.get("temperature", 0.7)),
-                    timeout=float(llm.get("timeout", 120) or 120),
-                    max_retries=int(llm.get("max_retries", 2) or 0),
+                    temperature=self.cfg.as_float(
+                        llm.get("temperature", 0.7), "llm.temperature", 0.7, minimum=0.0
+                    ),
+                    timeout=self.cfg.as_float(
+                        llm.get("timeout", 120) or 120, "llm.timeout", 120.0, minimum=1.0
+                    ),
+                    max_retries=self.cfg.as_int(
+                        llm.get("max_retries", 2) or 0, "llm.max_retries", 2, minimum=0
+                    ),
                 )
             return self._fallback_llm
 
@@ -177,6 +186,25 @@ class Bridge:
             pass
         return {"ok": True, "session_id": session_id}
 
+    def _cancel_tool(self, req: dict) -> dict:
+        """请求结束当前会话正在执行的工具（当前仅 ask_workers 会响应）。
+
+        注意 bridge 的局限：bridge 是单线程串行读 stdin，`chat`/`run_task` 会阻塞整
+        个循环直到本轮跑完，这条指令只能排在其后、事后送达，起不到「跑一半时打断」
+        的作用。真正能用的是 Web 入口（轮次在后台线程跑，主循环可并发受理
+        /api/chat/cancel_tool）。这里保留指令是为了协议对称与将来支持异步 chat。
+        """
+        sid = str(req.get("session_id", "")).strip()
+        with self._sessions_lock:
+            bot = self._sessions.get(sid)
+        if bot is None:
+            return {"ok": False, "error": f"会话 '{sid}' 不存在"}
+        fn = getattr(bot, "cancel_current_tool", None)
+        if fn is None:
+            return {"ok": False, "error": "该会话不支持工具取消"}
+        fn()
+        return {"ok": True, "session_id": sid}
+
     # ---------- 指令分发 ----------
 
     def handle(self, req: dict, out=None) -> dict:
@@ -219,7 +247,7 @@ class Bridge:
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
             return {"ok": True, "results": self.workers.ask_many(
-                _norm_workers(req.get("workers")) or self.workers.names(),
+                _norm_workers(req.get("workers")) or self.workers.pick(),
                 prompt,
                 req.get("system"),
             )}
@@ -248,6 +276,8 @@ class Bridge:
                     "allowed_tools": bot.registry.names(), "removed_tools": removed}
         if cmd == "close_session":
             return self._close_session(str(req.get("session_id", "")))
+        if cmd == "cancel_tool":
+            return self._cancel_tool(req)
         if cmd == "chat":
             return self._chat(req, out)
 
@@ -341,7 +371,8 @@ class Bridge:
                 b.close()
             except Exception:  # noqa: BLE001
                 pass
-        # 共享工人池与兜底单模型客户端都持有 httpx 连接池，进程退出前显式释放
+        # 共享工人池与兜底单模型客户端都持有 httpx 连接池，进程退出前显式释放。
+        # MCP 只解除本使用者的引用（引用归零时组内部断开）。
         for holder in (self.workers, self._fallback_llm):
             if holder is None:
                 continue
@@ -349,6 +380,10 @@ class Bridge:
                 holder.close()
             except Exception:  # noqa: BLE001
                 pass
+        if self.mcp_group is not None:
+            from .tools.mcp_client import release_group
+            release_group(self.mcp_group)
+            self.mcp_group = None
 
 
 def reconfigure_streams() -> None:

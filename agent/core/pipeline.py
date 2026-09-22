@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from ..config import DEFAULT_CONTEXT
 from ..tools.base import FunctionTool, ToolRegistry
 from .orchestrator import WorkerPool
 
@@ -36,17 +37,72 @@ REVISE_SYSTEM = (
 
 EventCallback = Callable[[dict], None]
 
+# 阶段间传递预算：初稿/评审意见是"素材"而非交付物，但它们会被整体拼进下一阶段的
+# prompt —— 实测 2 名工人各 6000 字初稿就把评审 prompt 顶到 12086 字符、修订 prompt
+# 顶到 24120 字符；max_participants=5 时约 3 万字符。超过小窗口模型直接吃 4xx
+# （4xx 不可重试）→ 整条流水线中止。预算按**消费方**工人的最小上下文窗口折算，
+# 窗口大的模型几乎不受影响，小窗口模型自动收紧。
+_STAGE_BUDGET_RATIO = 0.5      # 素材最多占用消费方窗口的一半，另一半留给 system/task/输出
+_STAGE_RESERVE_CHARS = 2000    # 固定预留额度（字符≈中文 token）
+_MIN_STAGE_BUDGET = 2000       # 预算下限：小窗口模型也不能把素材压成一行
+_MIN_PER_ITEM_CHARS = 300      # 每份素材的最低可见额度（均分后仍要能看出大意）
+
 
 class Pipeline:
     def __init__(self, pool: WorkerPool):
         self.pool = pool
 
     def _workers(self, spec: list[str] | None) -> list[str] | None:
-        """把用户指定的工人名过滤为池内有效子集；None 表示用池内全部。"""
+        """把用户指定的工人名过滤为池内有效子集；None 表示"未指定，走缺省名单"。"""
         if not spec:
             return None
         valid = [w for w in dict.fromkeys(spec) if w in self.pool.profiles]
         return valid or None
+
+    def _default_workers(self) -> list[str]:
+        """缺省参与名单：走 WorkerPool.pick()（受 max_participants 约束、跳过不可用节点）。
+
+        不用 pool.names()：池子按「一站多模型」组织时轻易几十个模型，三个阶段
+        各自全池派工，一次流水线就会打出上百个请求（实测 25 个模型 = 100 次），
+        而并发上限只有个位数 —— 尾部批次必然撞整体限时被丢弃，额度白烧。
+        """
+        return self.pool.pick()
+
+    def _budget_for(self, workers: list[str]) -> int:
+        """素材可用的字符预算：按这批工人里**最小**的上下文窗口折算。
+
+        用消费方（下一阶段要读素材的工人）的窗口而不是生产方的：撑爆的是消费方的
+        prompt。未标注 @窗口 的模型按 DEFAULT_CONTEXT 处理，等于不限制（真实草稿
+        远小于 128k）。
+        """
+        windows = [
+            self.pool.profiles[w].context_length
+            for w in workers
+            if w in self.pool.profiles and self.pool.profiles[w].context_length > 0
+        ]
+        ctx = min(windows) if windows else DEFAULT_CONTEXT
+        return max(_MIN_STAGE_BUDGET, int(ctx * _STAGE_BUDGET_RATIO) - _STAGE_RESERVE_CHARS)
+
+    @staticmethod
+    def _join_capped(items: list[tuple[str, str]], budget: int, title: str) -> str:
+        """把 (工人, 内容) 拼成一段素材文本，预算**按份均分**，保证每份都有可见内容。
+
+        均分而非整段截尾：整段截尾会让排在后面的工人整份消失，评审/修订阶段就再也
+        看不到他们的稿子 —— 而顺序是确定性的，等于永远偏向池内靠前的那几个工人。
+        """
+        if not items:
+            return ""
+        per = max(_MIN_PER_ITEM_CHARS, budget // len(items))
+        parts: list[str] = []
+        for worker, text in items:
+            body = text.strip()
+            if len(body) > per:
+                parts.append(
+                    f"### {title}（{worker}）\n{body[:per]}\n...[已截断，原始 {len(body)} 字]"
+                )
+            else:
+                parts.append(f"### {title}（{worker}）\n{body}")
+        return "\n\n".join(parts)
 
     def run(
         self,
@@ -67,19 +123,22 @@ class Pipeline:
         if not self.pool.names():
             return "错误：工人池为空，无法执行流水线。请先在 config.yaml 配置多个智能体。"
 
-        # ---- 1. 起草：并行收集候选稿 ----
-        draft_names = self._workers(draft_workers) or self.pool.names()
+        # ---- 1. 起草：并行收集候选稿（结构化，便于按份分配长度预算） ----
+        draft_names = self._workers(draft_workers) or self._default_workers()
         emit("draft", f"起草：{len(draft_names)} 名工人并行出稿中…（{', '.join(draft_names)}）")
-        draft_text = self.pool.ask_many(
+        drafts = self.pool.collect(
             draft_names,
             f"【任务】\n{task}\n\n请作为起草者，直接输出这份任务的完整初稿（方案/代码/文案等）。",
             DRAFT_SYSTEM,
         )
+        if not drafts:
+            return "错误：起草阶段所有工人都未能产出初稿，流水线中止。"
 
-        # ---- 2. 评审：把全部候选稿交给评审工人 ----
-        review_names = self._workers(review_workers) or self.pool.names()
+        # ---- 2. 评审：把候选稿按预算裁剪后交给评审工人 ----
+        review_names = self._workers(review_workers) or self._default_workers()
         emit("review", f"评审：{len(review_names)} 名工人审查草稿并给意见…")
-        review_text = self.pool.ask_many(
+        draft_text = self._join_capped(drafts, self._budget_for(review_names), "初稿")
+        reviews = self.pool.collect(
             review_names,
             f"【任务】\n{task}\n\n【以下为候选初稿】\n{draft_text}\n\n"
             f"请作为评审专家，逐条指出问题与改进建议（编号列表）。",
@@ -89,9 +148,13 @@ class Pipeline:
         # ---- 3. 修订择优：修订工人各出一份终稿，投票取最优的那份 ----
         revise_names = self._workers(revise_workers) or draft_names
         emit("revise", f"修订：{len(revise_names)} 名工人综合评审意见出终稿…")
+        # 初稿和评审意见都要进修订 prompt → 共享同一份预算，各分一半
+        revise_budget = self._budget_for(revise_names)
+        draft_for_revise = self._join_capped(drafts, revise_budget // 2, "初稿")
+        review_text = self._join_capped(reviews, revise_budget // 2, "评审意见")
         finals = self.pool.collect(
             revise_names,
-            f"【任务】\n{task}\n\n【初稿】\n{draft_text}\n\n【评审意见】\n{review_text}\n\n"
+            f"【任务】\n{task}\n\n【初稿】\n{draft_for_revise}\n\n【评审意见】\n{review_text}\n\n"
             f"请作为修订者，综合评审意见输出完整终稿。",
             REVISE_SYSTEM,
         )

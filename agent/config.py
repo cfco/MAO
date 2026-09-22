@@ -26,6 +26,19 @@ ROOT = Path(__file__).resolve().parent.parent
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}")
 # 启动时已打印过的缺失变量，避免同一变量在嵌套结构中重复警告
 _missing_logged: set[str] = set()
+# 已警告过的"类型写错"配置项，避免同一 key 每次读取都刷屏
+_bad_value_logged: set[str] = set()
+
+
+def _warn_bad_value(key: str, value: Any, default: Any) -> None:
+    """配置值类型异常时告警一次（走 stderr，保持 stdout 纯净约定）。"""
+    if key in _bad_value_logged:
+        return
+    print(
+        f"[配置警告] {key} 的值 {value!r} 不是合法数字，已按默认值 {default} 处理",
+        file=sys.stderr,
+    )
+    _bad_value_logged.add(key)
 
 
 def _interpolate(value: Any) -> Any:
@@ -194,9 +207,52 @@ class Config:
                 return p
         return None
 
+    # ---------- 数值配置的安全读取 ----------
+
+    @staticmethod
+    def as_int(value: Any, key: str, default: int, minimum: int | None = None) -> int:
+        """把配置值安全转成 int：非法值警告一次并回退默认值，不让程序崩。
+
+        为什么不能裸 int()：配置写错类型（`max_participants: five`）会让程序在
+        启动或首次访问该属性时直接抛 ValueError 崩掉，报错还是 "invalid literal
+        for int()" 这种看不出是哪个配置项的信息。而本项目对配置缺 key 的一贯态度
+        是"不阻启动、只警告"（见 _interpolate），类型错也该同样处理。
+        """
+        try:
+            out = int(value)
+        except (TypeError, ValueError):
+            _warn_bad_value(key, value, default)
+            out = default
+        return out if minimum is None else max(minimum, out)
+
+    @staticmethod
+    def as_float(value: Any, key: str, default: float, minimum: float | None = None) -> float:
+        """同 as_int，用于 float 型配置项。"""
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            _warn_bad_value(key, value, default)
+            out = default
+        return out if minimum is None else max(minimum, out)
+
     @property
     def max_workers(self) -> int:
-        return max(1, int(self.collab_cfg.get("max_workers", 3)))
+        return self.as_int(self.collab_cfg.get("max_workers", 3), "collaboration.max_workers", 3,
+                           minimum=1)
+
+    @property
+    def max_participants(self) -> int:
+        """单次批量派工最多参与的工人数。<=0 表示不限（池内全部可用工人）。
+
+        池子按「一站多模型」组织，很容易到几十个模型（.env.example 里单站就挂了
+        20 个）。"缺省用池内全部工人"在这种配置下等于一次打出几十个网络请求，
+        而并发上限 max_workers 只有个位数：尾部批次必然撞上整体限时被判"未完成"
+        丢弃——额度白烧、结果还拿不全。默认只取前 N 个（按池内确定性顺序、
+        跳过冷却与当日隔离的工人），把派工规模与"免费额度 + 单轮时延"拉回可控范围。
+        """
+        return self.as_int(
+            self.collab_cfg.get("max_participants", 5), "collaboration.max_participants", 5
+        )
 
     # ---------- 模型健康档案（collaboration.*） ----------
 
@@ -222,7 +278,9 @@ class Config:
     @property
     def health_retire_days(self) -> int:
         """连续多少个"运行日"（程序实际启动过的天）都失败后自动给模型标 # 下线。最小 1。"""
-        return max(1, int(self.collab_cfg.get("retire_days", 7)))
+        return self.as_int(
+            self.collab_cfg.get("retire_days", 7), "collaboration.retire_days", 7, minimum=1
+        )
 
     # ---------- 兼容旧配置的兜底单模型 ----------
 
@@ -234,7 +292,9 @@ class Config:
 
     @property
     def shell_timeout(self) -> int:
-        return int(self.tools_cfg.get("shell_timeout", 120))
+        return self.as_int(
+            self.tools_cfg.get("shell_timeout", 120), "tools.shell_timeout", 120, minimum=1
+        )
 
     # ---------- 会话落盘限流（session.*） ----------
 
@@ -252,7 +312,9 @@ class Config:
                 return max(1, int(env))
             except ValueError:
                 pass
-        return max(1, int(self.session_cfg.get("flush_batch", 16)))
+        return self.as_int(
+            self.session_cfg.get("flush_batch", 16), "session.flush_batch", 16, minimum=1
+        )
 
     @property
     def session_flush_interval(self) -> float:
@@ -266,11 +328,15 @@ class Config:
                 return max(0.0, float(env))
             except ValueError:
                 pass
-        return max(0.0, float(self.session_cfg.get("flush_interval", 2.0)))
+        return self.as_float(
+            self.session_cfg.get("flush_interval", 2.0), "session.flush_interval", 2.0, minimum=0.0
+        )
 
     @property
     def max_iterations(self) -> int:
-        return int(self.llm_cfg.get("max_iterations", 25))
+        return self.as_int(
+            self.llm_cfg.get("max_iterations", 25), "llm.max_iterations", 25, minimum=1
+        )
 
     @property
     def host(self) -> str:
@@ -278,7 +344,7 @@ class Config:
 
     @property
     def port(self) -> int:
-        return int(self.server.get("port", 8000))
+        return self.as_int(self.server.get("port", 8000), "server.port", 8000, minimum=1)
 
 
 def _load_dotenv(path: Path) -> list[str]:
@@ -368,6 +434,7 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
         return _cfg_cache
     # mtime 变化 / 强制重载 / 首次加载：读磁盘 → 构建 Config → 更新缓存
     _missing_logged.clear()  # 新 config 可能引用不同的 ${VAR}，重置警告
+    _bad_value_logged.clear()  # 同上：新配置可能已修好类型错，允许重新告警
     # 分层守卫：.env 是"AI 不可修改区"（约定只放 key），健康下线等自动改写
     # 只会发生在 .env.example。若 .env 里混进了接口/模型等非 key 变量，会静默
     # 压住 .env.example 的更新（# 下线看似失效），必须显式提醒——只报变量名，

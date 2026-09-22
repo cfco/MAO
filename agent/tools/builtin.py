@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import re
 import shlex
+import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from ..config import ROOT, Config  # 统一从 config 拿 ROOT，避免多处重复定义漂移
@@ -20,6 +22,9 @@ ROOT_RESOLVED = ROOT.resolve()  # 规范化后的根，用于越界比对
 DEFAULT_READ_LIMIT = 2000
 MAX_READ_BYTES = 64 * 1024    # read_file 单次最多读 64KB，防超长单行/超大文件
 MAX_WRITE_BYTES = 1024 * 1024 # write_file / append_file 单次最多写 1MB，防误操作占满磁盘
+BACKUP_DIR = ROOT / "data" / "backup"   # 覆盖写前的自动留档目录（可回滚）
+BACKUP_KEEP_DAYS = 30          # 留档保留天数，超期惰性清理
+MAX_BACKUP_BYTES = 1024 * 1024 # 超过该大小不做留档（避免大文件反复整份复制）
 
 # ==============================================================
 # run_shell 安全加固：命令黑名单 + 注入模式拦截
@@ -84,6 +89,22 @@ _INJECTION_PATTERNS = [
 
 # shell=False 无法支持的 shell 专有语法特征（检测到则退回 shell=True）
 _SHELL_ONLY_SIGNS = re.compile(r"[|><&]|\|\||&&")
+
+# 成对引号包裹的内容（单/双引号）
+_QUOTED_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+
+
+def _mask_quoted(command: str) -> str:
+    r"""把引号包裹的内容替换为等长占位符，专供注入模式匹配使用。
+
+    为什么：`echo "a|b|c"` 里的管道符是字面量、不是命令拼接，直接对整串匹配会误拦；
+    而 `python -c "print(1|2)"` 又因规则要求两侧都得分隔符而放行 —— 同一类写法两种
+    结果，行为不一致。先屏蔽引号内容再匹配，`cmd1 && cmd2`、`a | b` 这类真实拼接照拦。
+
+    占位符用 \x00：它不属于 \s，不会与分隔符规则混淆；等长替换（按原串长度补位）
+    保证命中位置在原文里能直接取到片段用于提示文案。
+    """
+    return _QUOTED_RE.sub(lambda m: "\x00" * len(m.group()), command)
 
 # shell 重定向操作符：> >> < 2> 2>> 1> &> 等，后跟目标文件名。
 # 用于检测「echo x > ..\..\etc\passwd」这类通过重定向绕过 cwd 限制的写越界。
@@ -198,10 +219,14 @@ def _check_command_safety(command: str) -> str | None:
         return None
 
     # ---- 1. 注入模式扫描 ----
+    # 先屏蔽引号内的字面量：`echo "a|b|c"` 的管道不是命令拼接，不该拦。屏蔽后
+    # `cmd1 && cmd2`、`a | b` 这类真实拼接照拦；命中片段从原串取（等长替换保证位置一致）。
+    scan = _mask_quoted(stripped)
     for pat in _INJECTION_PATTERNS:
-        m = pat.search(stripped)
+        m = pat.search(scan)
         if m:
-            return f"命令拦截：检测到 shell 拼接模式 `{m.group()}`，存在命令注入风险"
+            snippet = stripped[m.start():m.end()]
+            return f"命令拦截：检测到 shell 拼接模式 `{snippet}`，存在命令注入风险"
 
     # ---- 1.5 重定向目标越界检查 ----
     # cwd 只限制命令本身的工作目录，重定向目标不受 cwd 约束，
@@ -297,6 +322,42 @@ def _resolve(p: str) -> Path | None:
         return None
 
 
+def _purge_old_backups() -> None:
+    """清掉超过保留期的留档（惰性调用，不额外起线程）。"""
+    try:
+        cutoff = time.time() - BACKUP_KEEP_DAYS * 86400
+        for stale in BACKUP_DIR.glob("*.bak"):
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _backup_before_overwrite(path: Path) -> str | None:
+    """覆盖已有文件前先留档到 data/backup/，返回留档路径；无需/无法留档返回 None。
+
+    为什么：write_file 是静默覆盖、不可逆，而项目规范要求不可逆操作可恢复
+    （"删除重要文件先隔离"在覆盖场景的等价物）。工具层不引入交互式确认——
+    工具调用是同步的，模型等不了人工回话；改为"自动留一份 + 如实告知位置"，
+    既可回滚又不卡流程。
+    """
+    try:
+        if not path.is_file():
+            return None
+        if path.stat().st_size > MAX_BACKUP_BYTES:
+            return None
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        _purge_old_backups()
+        # 相对路径里的分隔符换成 __，让留档名保留原始层级信息且仍是合法文件名
+        rel = path.relative_to(ROOT_RESOLVED).as_posix().replace("/", "__")
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
+        dest = BACKUP_DIR / f"{rel}.{stamp}.bak"
+        shutil.copy2(path, dest)
+        return str(dest)
+    except (OSError, ValueError):
+        return None  # 留档失败不阻断写入（写入本身是可用的），但不谎报已备份
+
+
 def build_builtin_tools(cfg: Config) -> ToolRegistry:
     registry = ToolRegistry()
     timeout = cfg.shell_timeout
@@ -316,21 +377,35 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
             return f"错误：cwd 超出项目根目录，被拒绝：{cwd_raw}"
         if not cwd.is_dir():
             return f"错误：cwd 不是有效目录：{cwd}"
-        # ---- shell=True 加固：优先用参数模式（shell=False），有管道/重定向才退回 ----
+        # ---- shell=True 加固：优先用参数模式（shell=False），不适用时退回 shell=True ----
         proc = None
+        args_list = _try_split_args(command)
         try:
-            args_list = _try_split_args(command)
             if args_list is not None:
-                # 参数模式：shell=False，避免命令拼接注入
-                proc = subprocess.run(
-                    args_list,
-                    shell=False,
-                    cwd=cwd,
-                    timeout=timeout,
-                    capture_output=True,
-                )
+                try:
+                    # 参数模式：shell=False，避免命令拼接注入
+                    proc = subprocess.run(
+                        args_list,
+                        shell=False,
+                        cwd=cwd,
+                        timeout=timeout,
+                        capture_output=True,
+                    )
+                except FileNotFoundError:
+                    # 首词不是真实可执行文件 → 多半是 cmd 的**内置命令**（echo/dir/type/copy…）。
+                    # 内置命令没有对应 exe，只能由 cmd 解释器执行：参数模式必然 WinError 2
+                    # （实测 `echo` 在中转环境报"系统找不到指定的文件"，而工具描述明确写了支持 dir/type）。
+                    # 该命令已通过黑名单与注入检查，这里退回 shell=True 不降低既有防护强度
+                    # （有 `&`/`|`/`;` 的命令本来也走 shell=True）。
+                    proc = subprocess.run(
+                        command,
+                        shell=True,
+                        cwd=cwd,
+                        timeout=timeout,
+                        capture_output=True,
+                    )
             else:
-                # 有 shell 专有语法（管道/重定向等），退回 shell=True
+                # 有 shell 专有语法（管道/重定向等），直接用 shell=True
                 proc = subprocess.run(
                     command,
                     shell=True,
@@ -382,8 +457,11 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         content = str(args.get("content", ""))
         if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
             return f"错误：写入内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）"
+        backup = _backup_before_overwrite(p)  # 覆盖前留档，保证可回滚
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+        if backup:
+            return f"已写入 {p}（原文件已留档到 {backup}，需要回滚时直接复制回来）"
         return f"已写入 {p}"
 
     def append_file(args: dict) -> str:
@@ -446,7 +524,10 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     ))
     registry.register(FunctionTool(
         name="write_file",
-        description="写入文本文件（覆盖），父目录不存在会自动创建。",
+        description=(
+            "写入文本文件（覆盖），父目录不存在会自动创建。"
+            "目标文件已存在时，写入前会自动留档到 data/backup/（返回文本里给出留档路径，可回滚）。"
+        ),
         input_schema={
             "type": "object",
             "properties": {
