@@ -49,6 +49,7 @@ collaboration:
   # ---- 模型健康：当日失败隔离 + 连续运行日失败自动下线（见 agent/core/health.py）----
   health_file: ${COLLAB_HEALTH_FILE:-data/model_health.json}  # 健康档案落盘（当日失败标记，无密钥）
   retire_days: ${COLLAB_RETIRE_DAYS:-7}  # 连续 N 个"运行日"调用失败 → 在 model_registry.txt 给该模型加 # 下线
+  fallback_models: ${COLLAB_FALLBACK_MODELS:-2}  # 单模型可重试失败后，同中转站最多回退的额外模型数（0=关闭）
 
 tools:
   shell_timeout: ${TOOLS_SHELL_TIMEOUT:-120}  # 单条命令最长执行秒数

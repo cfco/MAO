@@ -2,7 +2,7 @@
 
 > 项目：MAO（agent/ 包，入口 `mao = "agent.__main__:main"`）
 > 目标：**三个臭皮匠顶个诸葛亮**——用多个免费、较慢、较弱的模型分工协作，产出比单模型更好的结果。
-> 本文档描述当前已实现的架构与行为基准（2026-09-21 更新，替代描述旧 `src/mao/multi_ai_orchestrator.py` 骨架的历史版本）。
+> 本文档描述当前已实现的架构与行为基准（2026-09-23 更新，替代描述旧 `src/mao/multi_ai_orchestrator.py` 骨架的历史版本）。
 
 ---
 
@@ -56,6 +56,7 @@ MAO 不再有内部 Agent 循环，也不再持久化会话——它是被外部
 | 超时+分类重试 | 每请求带 `llm.timeout`（默认 120s）；限流(429)/超时/5xx/连接失败指数退避重试（限流退避更长），**408 请求超时与 425 Too Early 同样归入可重试**（免费中转网关超时很常见），认证与其余 4xx 不重试；SDK 内置重试关闭，自定义退避是唯一重试源 |
 | 节点冷却 | 见 2.1 |
 | 畸形响应归一 | 中转站内容过滤会返回 `choices: []`：显式归类为可重试的服务端错误（原本是裸 `IndexError`，会绕过错误分类与重试编排一路冒到调用方）；模型给出空 content 且无工具调用时返回明确说明，不再静默输出空白答复 |
+| 同站模型回退 | 支持多模型的中转站上：某模型发生**可重试瞬时失败**（429/5xx/超时/连接）时，`WorkerPool` 自动切换**同一中转站**（`base_url`+`api_key` 相同）的其它"当前可用"模型重试；每个模型仍保持独立（独立连接池/冷却/健康档案），回退只在同站内、**不跨站**、不重复打已试过的模型。终态错误（认证等）不回退——那类错误在整站级统一出现，回退既无用又浪费其它模型的额度。重试上限由 `collaboration.fallback_models`（默认 2，0=关闭）约束：整站挂时不会把同站几十个模型挨个试穿 |
 | 并发隔离 | 线程池并行派工，单工人失败/超时以文本如实带回，不拖垮整体 |
 | 整体限时 | `ask_many`/`vote`/`collect` 用 `concurrent.futures.wait` 对收集阶段整体限时；限时**按规模自适应** = `ceil(参与人数 ÷ max_workers) × llm.timeout + 30s`（调用方显式传入 `timeout` 时以传入值为准）。原先固定 300s 在「池大 + 并发低」时必然截断尾部批次（25 名 / 3 并发 = 9 批，单工人耗时 >33s 即超标）。超时工人标记"未完成"放弃等待，后台线程按 LLM 超时自行收尾 |
 | 当日失败隔离 + 连续运行日下线 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**不可重试的终态失败**（认证失败、非重试类 4xx）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示，`status=quarantined`）；429/5xx/超时等**可重试瞬时失败**耗尽重试只进短时冷却（`status=cooldown`），不再拉黑全天——免费节点限流是常态，按旧规则一次 429 就报废整天的可用池。档案按路径**进程内共享单实例**（`health.get_health()`）：多工人池/多调用方各持独立内存账本 + 全量覆写会互相抹记录（lost update）、且彼此看不到隔离结果，共享后当日隔离全进程一致。**文件 IO 全部在锁外**（锁内更新内存取快照、锁外原子写盘），避免记账持锁把 health 锁串到 pool 锁卡住派工。某模型连续 `COLLAB_RETIRE_DAYS`（默认 7）个**运行日**（程序实际启动工作的天，未运行日子不计入不打断）调用都失败，自动在 `model_registry.txt` 对应 `*_MODELS` 行给该模型加 `#` 下线（删 `#` 手动恢复；`LLM_MODEL` 兜底行不自动动；已下线幂等不重复改写、不刷频）。 |
@@ -90,7 +91,7 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 |---|---|
 | `agents` | 智能体池，按"站"组织（一 Endpoint+Key 挂多 model）；`models` 逗号分隔，`#` 前缀临时屏蔽，`@128k` 标注上下文窗口，可选 `tags`（能力标签，供外部主选路）、`note` |
 | `llm` | 兜底单模型 + temperature / timeout / max_retries |
-| `collaboration` | max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails / cooldown_base / health_file / retire_days（连续几个运行日失败即自动下线，默认 7） |
+| `collaboration` | max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails / cooldown_base / health_file / retire_days（连续几个运行日失败即自动下线，默认 7）/ fallback_models（同站回退重试上限，默认 2，0=关闭） |
 | `tools` | shell_timeout / workspace（额外允许工具访问的项目目录，默认为空=仅本项目根） |
 | `mcp_servers` | MCP 接入列表 |
 

@@ -1,6 +1,6 @@
 [project]
 name = "mao"
-version = "0.1.0"
+version = "0.2.0"
 description = "自研多智能体协作系统：多个免费/较弱模型分工协作（三个臭皮匠顶个诸葛亮）"
 readme = "README.md"
 authors = [

@@ -294,6 +294,18 @@ class Config:
         )
 
     @property
+    def fallback_models(self) -> int:
+        """单模型可重试失败后，同中转站最多尝试的额外模型数（0=关闭回退）。
+
+        配合「一站多模型」：某模型节点抖动/限流时换同站其它模型往往能成，避免一次
+        抖动废掉一整个免费额度。上限防止整站挂时把同站几十个模型挨个试（额度蔓延）。
+        """
+        return self.as_int(
+            self.collab_cfg.get("fallback_models", 2), "collaboration.fallback_models", 2,
+            minimum=0,
+        )
+
+    @property
     def model_registry_path(self) -> Path:
         """模型清单文件（model_registry.txt）路径，自动下线改写（加 #）的目标文件。
 

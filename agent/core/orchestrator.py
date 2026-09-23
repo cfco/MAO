@@ -102,6 +102,17 @@ class WorkerPool(ParallelMixin, VotingMixin):
         self._pick_cursor = 0
         self._pick_lock = threading.Lock()
 
+        # 同站模型分组：按 (base_url, api_key) 把"一站多模型"聚到一起，供失败回退
+        # 挑选同站其它可用模型。键用 (base_url, api_key) 而非仅 base_url：不同站可能
+        # 共用同一 endpoint 但不同 key，按 key 区分更精确（同 key 才意味着"整站级故障共担"）。
+        self._station_models: dict[tuple[str, str], list[str]] = {}
+        for nm, p in self.profiles.items():
+            self._station_models.setdefault((p.base_url, p.api_key), []).append(nm)
+
+        # 同站回退上限：单模型可重试失败后，最多在同站尝试的额外模型数（0=关闭回退）。
+        # 既利用"一站多模型"冗余，又限制额度蔓延（整站挂时不会把同站几十个模型挨个试）。
+        self._fallback_models = self.cfg.fallback_models
+
     # ---------- 基础派工 ----------
 
     def names(self) -> list[str]:
@@ -267,14 +278,47 @@ class WorkerPool(ParallelMixin, VotingMixin):
         """
         return self.render_answer(self.ask_result(worker, prompt, system))
 
-    def _call_result(self, p: AgentProfile, system: str | None, prompt: str) -> dict:
+    def _fallback_target(self, p: AgentProfile, tried: set[str]) -> AgentProfile | None:
+        """同中转站（base_url + api_key 相同）下挑一个「当前可用且本轮未试过」的模型回退。
+
+        候选 = 同站模型列表里排除：本轮已尝试（tried）、当前冷却中、当日隔离的模型；
+        按 profiles 定义顺序取第一个（确定性）。无候选返回 None（调用方不再回退）。
+        不跨站（只在同 base_url 组），不回避「本批外部主也点名的同站模型」
+        （最多多打一次网络，无害）。
+        """
+        peers = self._station_models.get((p.base_url, p.api_key)) or ()
+        for name in peers:
+            if name in tried:
+                continue
+            if self._skip_reason(name) is not None:  # 冷却/当日隔离的模型不再打
+                continue
+            prof = self.profiles.get(name)
+            if prof is not None:
+                return prof
+        return None
+
+    def _call_result(
+        self, p: AgentProfile, system: str | None, prompt: str,
+        tried: set[str] | None = None, fallbacks_left: int | None = None,
+    ) -> dict:
         """真正打一次网络：取（或复用）LLMClient → chat → 按控制流记结构化成败。
 
-        失败按性质分级记账（#1/#2）：LLMError 且 retryable=False（认证失败、非重试 4xx 等
-        "重试也没用"的终态错误）→ fatal=True，触发当日隔离；其余失败（可重试错误耗尽、
-        意外异常、连取 client 都失败）→ fatal=False，只进短时冷却、当天仍可回来。
+        失败时按性质分级记账（#1/#2），并在「可重试错误 + 同站多模型」场景下自动
+        回退到同一中转站（base_url）的其它「当前可用」模型重试（见 _fallback_target）：
+        免费中转站常挂多个模型，某个模型节点抖动/限流时换同站其它模型往往能成，
+        避免一次抖动就浪费一整个免费额度。回退只在同站、不跨站、不重复试已试过的
+        模型、且受 fallback_models 上限约束；终态不可重试错误（认证等整站级问题）
+        不回退，直接判当日隔离。
+
         无论成败都返回 dict、不抛异常；ask_many/collect/vote 依赖该契约。
+        tried          本轮已尝试过的模型名集合（防回退环 / 重复打同一模型）
+        fallbacks_left 剩余可回退次数（= collaboration.fallback_models，0=关闭回退）
         """
+        if tried is None:
+            tried = set()
+        if fallbacks_left is None:
+            fallbacks_left = self._fallback_models
+        tried.add(p.name)
         try:
             client = self._client_for(p)
             messages = [
@@ -284,11 +328,23 @@ class WorkerPool(ParallelMixin, VotingMixin):
             try:
                 resp = client.chat(messages)
             except LLMError as e:
-                # 不可重试的终态错误才判"当天别碰"；可重试类只冷却
+                # 可重试的瞬时错误 + 同站另有可用模型 ⇒ 回退重试（避免一次抖动废一额度）
+                if e.retryable and fallbacks_left > 0:
+                    fb = self._fallback_target(p, tried)
+                    if fb is not None:
+                        # 当前模型记为瞬时失败（只冷却，当天仍可回来），换同站其它模型
+                        self._record_result(p.name, ok=False, fatal=False)
+                        return self._call_result(fb, system, prompt, tried, fallbacks_left - 1)
+                # 不再回退：按终态与否记账（可重试耗尽只冷却；终态当日隔离）
                 self._record_result(p.name, ok=False, fatal=not e.retryable)
                 return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
                         "error": f"调用子智能体 '{p.name}' 失败 [{e.error_type}]：{e}"}
             except Exception as e:  # noqa: BLE001 - 意外异常按可重试处理，别全天拉黑
+                if fallbacks_left > 0:
+                    fb = self._fallback_target(p, tried)
+                    if fb is not None:
+                        self._record_result(p.name, ok=False, fatal=False)
+                        return self._call_result(fb, system, prompt, tried, fallbacks_left - 1)
                 self._record_result(p.name, ok=False, fatal=False)
                 return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
                         "error": f"调用子智能体 '{p.name}' 失败：{type(e).__name__}: {e}"}
@@ -296,6 +352,11 @@ class WorkerPool(ParallelMixin, VotingMixin):
             return {"worker": p.name, "ok": True, "status": ST_OK,
                     "answer": resp.get("content", "") or "(空回复)", "error": ""}
         except Exception as e:  # noqa: BLE001 - 连取 client 都失败，也不让派工崩（只冷却）
+            if fallbacks_left > 0:
+                fb = self._fallback_target(p, tried)
+                if fb is not None:
+                    self._record_result(p.name, ok=False, fatal=False)
+                    return self._call_result(fb, system, prompt, tried, fallbacks_left - 1)
             self._record_result(p.name, ok=False, fatal=False)
             return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
                     "error": f"调用子智能体 '{p.name}' 异常：{type(e).__name__}: {e}"}

@@ -706,3 +706,116 @@ def test_agentprofile_tags_in_brief_and_health():
     pool = WorkerPool(cfg, exclude=None)
     hs = {x["worker"]: x for x in pool.health_status()}
     assert hs["a"]["tags"] == "code,中文", "能力标签要能在预检快照里看到（供外部主选路）"
+
+
+# ---------------- 同站模型回退（2026-09-23 新增） ----------------
+
+def _fallback_pool() -> WorkerPool:
+    """一站多模型（st: m1/m2/m3）+ 一站单模型（other: x1），便于验证"只回退同站"。"""
+    cfg = Config(_interpolate({
+        "agents": [
+            {"name": "st", "base_url": "u1", "api_key": "k", "models": ["m1", "m2", "m3"]},
+            {"name": "other", "base_url": "u2", "api_key": "k2", "model": "x1"},
+        ],
+    }))
+    return WorkerPool(cfg, exclude=None)
+
+
+def test_fallback_to_peer_on_retryable_failure(monkeypatch):
+    """同站某模型可重试失败 → 自动换同站其它可用模型，返回实际成功模型名。"""
+    class PeerSwitch:
+        def __init__(self, base_url, api_key, model, **kw):
+            self.model = model
+
+        def chat(self, messages, tools=None):
+            if self.model == "m1":
+                raise LLMError("rate_limit", "429", retryable=True)  # 持续瞬时失败
+            return {"role": "assistant", "content": f"ok-from-{self.model}"}
+
+    monkeypatch.setattr(orch, "LLMClient", PeerSwitch)
+    pool = _fallback_pool()
+    r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is True and r["status"] == "ok"
+    assert r["worker"] == "st:m2", f"应回退到同站第一个可用模型，实际 worker={r['worker']}"
+    assert r["answer"] == "ok-from-m2"
+
+
+def test_fallback_respects_cooldown_skip(monkeypatch):
+    """同站候选都在冷却/隔离 → 无可用回退，原模型记失败返回 error。"""
+    class AlwaysBoom:
+        def __init__(self, base_url, api_key, model, **kw):
+            self.model = model
+
+        def chat(self, messages, tools=None):
+            raise LLMError("rate_limit", "429", retryable=True)  # 全部可重试失败
+
+    monkeypatch.setattr(orch, "LLMClient", AlwaysBoom)
+    pool = _fallback_pool()
+    pool._cooldowns["st:m2"] = time.time() + 999   # 同站候选冷却
+    pool._cooldowns["st:m3"] = time.time() + 999
+    r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is False and r["status"] == "error"
+
+
+def test_fallback_not_cross_station(monkeypatch):
+    """回退只在同站：同站无可用模型时，绝不跨到站 other(x1)。"""
+    calls = {"models": []}
+
+    class Recorder:
+        def __init__(self, base_url, api_key, model, **kw):
+            self.model = model
+
+        def chat(self, messages, tools=None):
+            calls["models"].append(self.model)
+            raise LLMError("rate_limit", "429", retryable=True)  # 全站可重试失败
+
+    monkeypatch.setattr(orch, "LLMClient", Recorder)
+    pool = _fallback_pool()
+    pool._cooldowns["st:m2"] = time.time() + 999   # 同站无可用回退
+    pool._cooldowns["st:m3"] = time.time() + 999
+    r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is False and r["status"] == "error"
+    assert calls["models"] == ["m1"], f"回退不得跨站，实际试过：{calls['models']}"
+
+
+def test_fallback_terminal_error_no_fallback(monkeypatch):
+    """终态不可重试错误（认证）不回退：直接当日隔离，不浪费同站其它模型额度。"""
+    calls = {"models": []}
+
+    class AuthBoom:
+        def __init__(self, base_url, api_key, model, **kw):
+            self.model = model
+
+        def chat(self, messages, tools=None):
+            calls["models"].append(self.model)
+            raise LLMError("auth", "bad key", retryable=False)  # 终态
+
+    monkeypatch.setattr(orch, "LLMClient", AuthBoom)
+    pool = _fallback_pool()
+    r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is False and r["status"] == "error"
+    assert calls["models"] == ["m1"], "终态错误不应回退，只打原模型"
+    assert pool.health.quarantined("st:m1"), "终态失败应判当日隔离"
+
+
+def test_fallback_disabled_when_zero(monkeypatch):
+    """fallback_models=0 关闭回退：m1 失败直接返回 error，不调用 m2。"""
+    calls = {"models": []}
+
+    class M1Boom:
+        def __init__(self, base_url, api_key, model, **kw):
+            self.model = model
+
+        def chat(self, messages, tools=None):
+            calls["models"].append(self.model)
+            raise LLMError("rate_limit", "429", retryable=True)
+
+    monkeypatch.setattr(orch, "LLMClient", M1Boom)
+    cfg = Config(_interpolate({
+        "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]}],
+        "collaboration": {"fallback_models": 0},
+    }))
+    pool = WorkerPool(cfg, exclude=None)
+    r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is False and r["status"] == "error"
+    assert calls["models"] == ["m1"], "关闭回退时只打原模型，不回退到 m2"

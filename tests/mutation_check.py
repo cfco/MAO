@@ -142,6 +142,13 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         '            return interp, ""  # mutated',
         "tests/test_core.py::test_interpreter_inline_code_guard_blocks_bypass",
     ),
+    (
+        "M20 同站回退被关闭",
+        "agent/core/orchestrator.py",
+        "        self._fallback_models = self.cfg.fallback_models",
+        "        self._fallback_models = 0  # mutated: 关闭回退",
+        "tests/test_core.py::test_fallback_to_peer_on_retryable_failure",
+    ),
 ]
 
 
