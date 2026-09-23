@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess  # 顶层 import：测试里会 monkeypatch bi.subprocess.run，必须让外部模块能看到
+import sys
 import time
 from pathlib import Path
 
@@ -85,7 +86,7 @@ def set_workspace_roots(extra: list[str] | None = None) -> tuple[Path, ...]:
             # 盘符根（C:\）或文件系统根（/）：一旦成为允许的工作区，越界防护等于
             # 把整台机器交出去。anchor 判定跨平台稳妥（C:/ 的 anchor 是 C:\、
             # / 的 anchor 是 / 自身），p==p.parent 作兜底。
-            print(f'[workspace] 拒绝把根目录设为工作区（会交出整机）: {p}')
+            print(f'[workspace] 拒绝把根目录设为工作区（会交出整机）: {p}', file=sys.stderr)
             continue
         if p not in roots:
             roots.append(p)

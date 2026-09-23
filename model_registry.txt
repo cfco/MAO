@@ -1,0 +1,33 @@
+# ============================================
+# 模型清单（随仓库维护，进 git；AI 可改区）
+# 全项目所有模型名集中在本文件，与 .env（端点 / KEY / LLM 参数等配置）分开：
+#   .env              只写 端点、KEY、LLM 参数、协作参数（.gitignore 排除，永不提交）
+#   model_registry.txt 只写 模型名清单（本文件），git pull 即更新，AI/脚本可安全改写
+#   明确分工：模型名不许写进 .env（那样会盖住本文件的 git 更新和自动下线，
+#   启动时会打 [配置分层提醒] 警告）；配置值也不许写进本文件。
+# 本文件变量与 config.yaml 里的 ${...} 一一对应，填别的名字不生效。
+# 格式同 .env：KEY=VALUE，注释必须独占一行（不支持行内注释）。
+# @数值 = 该模型上下文窗口（k 表示 ×1024）：256k=262144、512k=524288、1024k=1048576(1M)。
+# 临时屏蔽某模型 = 在模型名前加 #（如 #laguna-s-2.1@256k），注释即下线不用删。
+# 新增模型 = 按 "模型名@窗口" 逗号追加。
+# 自动下线机制：某模型连续 7 个"运行日"（程序实际启动过的天，周末没开机不计入也不
+# 打断）每天请求都失败，会自动在本文件对应行的模型名前加 # 屏蔽（删掉 # 即恢复；
+# LLM_MODEL 兜底行不自动动，人工决定）。
+# ============================================
+
+# ---------- 站点 A：router.bynara 免费中转（主站） ----------
+NODE_A_MODELS=agnes-2.5-flash@512k,laguna-s-2.1@256k,ling-3.0-flash-fin-free@256k,ling-3.0-flash-sante-free@256k,ling-3.0-flash-vl-free@256k,nemotron-3-super-free@256k,nemotron-3-ultra-free@1024k,nemotron-3.5-lightning-free@1024k,nex-n2.5-pro@256k
+
+# ---------- 站点 B：kilo.ai 网关（免费模型 id 都带 :free 后缀） ----------
+# 区分方法：kilo 的模型列表是公开接口，浏览器/curl 打开
+#   https://api.kilo.ai/api/gateway/models
+# 即可看到全部模型；id 以 ":free" 结尾的就是免费档，context_length 是它的窗口。
+# kilo-auto/free 不是单个模型，是"自动路由"：每个请求免费档里挑最便宜能干的。
+# 末三项默认屏蔽（#前缀）：小窗口/专用分类模型，当工人性价比低，需要时删掉#启用
+NODE_B_MODELS=kilo-auto/free@250k,thinkingmachines/inkling-small:free@1024k,nvidia/nemotron-3-ultra-550b-a55b:free@1000000,nvidia/nemotron-3.5-lightning:free@1000000,dots-studio/dots-3-note-preview:free@500k,poolside/laguna-s-2.1:free@256k,nex-agi/nex-n2.5-pro:free@256k,nex-agi/nex-n2.5-mini:free@256k,inclusionai/ling-3.0-flash-vl:free@256k,inclusionai/ling-3.0-flash-sante:free@256k,inclusionai/ling-3.0-flash-fin:free@256k,qwen/qwen3.8-27b:free@256k,poolside/laguna-xs-2.1:free@256k,nvidia/nemotron-3-super-120b-a12b:free@256k,stepfun/step-3.7-flash:free@256k,cohere/north-mini-code:free@250k,#nvidia/nemotron-3.5-content-safety:free@125k,#liquid/lfm-2.5-2.6b:free@64k,#z-ai/glm-5.2:free@32k
+
+# ---------- 兜底单模型（solo 模式 / 池内节点全挂时用） ----------
+# LLM_API_KEY 真实值写在 .env（与 NODE_A_KEY 同一个 key 再粘一次）；
+# LLM_MODEL 必须是上面模型列表里的一个。该行不参与自动下线（人工决定），
+# 但删掉 # 手动屏蔽时下面的 config.yaml 插值会取到空串，注意保持一致。
+LLM_MODEL=nex-n2.5-pro

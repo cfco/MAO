@@ -1,22 +1,21 @@
 # ============================================
-# 多功能智能体配置 v2 —— 智能体池
+# 多功能智能体配置 v3 —— 纯结构骨架
+# 本文件不写任何"值"：所有配置值都在 .env（端点/KEY/参数，保密不进 git），
+# 所有模型名都在 model_registry.txt（随仓库维护，自动下线改写它）。
+# 引用格式 ${变量} 或 ${变量:-默认值}（带默认值 = 不配也能跑的最小兜底）。
+# 变量名必须与 .env / model_registry.txt 里的名字一一对应，填错则不生效。
 # 所有 OpenAI 兼容 API 都能进池。池里全部成员都是"工人（子智能体）"——
 # 主智能体由外部 AI 经 bridge/mcp/call 三外壳驱动，本项目不自带选主自己跑的入口。
-# 免费/慢/弱模型都可以进来当"臭皮匠"。
-# 常见免费档示例（以各厂商当前政策为准）：
-#   智谱 GLM:   base_url=https://open.bigmodel.cn/api/paas/v4   model=glm-4-flash
-#   Kimi:       base_url=https://api.moonshot.cn/v1              model=moonshot-v1-8k
-#   Ollama 本地: base_url=http://localhost:11434/v1               model=本地已下载模型名
 # ============================================
 
 # 智能体池：按"站"组织（一个中转站 = 一组 Endpoint+Key，可挂多个 Model）。
-# name 唯一。models 支持逗号分隔多模型；临时屏蔽某模型 = 在该模型前加 # 或直接删掉
-#（免费模型经常变，注释即下线，不用改代码）。
+# name 唯一。models 引用 model_registry.txt 里的清单变量；临时屏蔽某模型 =
+# 在它前面加 #（免费模型经常变，注释即下线，不用改代码）。
 agents:
   - name: node-a                      # 中转站 A
     base_url: ${NODE_A_ENDPOINT}
     api_key: ${NODE_A_KEY}
-    models: ${NODE_A_MODELS}          # 例: gpt-4o-mini@128k,claude-3-haiku@200k,#mixtral@32k（@=上下文窗口，#=临时屏蔽）
+    models: ${NODE_A_MODELS}          # 模型清单变量（model_registry.txt 维护）
     note: 中转站A免费token
   - name: node-b                      # 中转站 B
     base_url: ${NODE_B_ENDPOINT}
@@ -29,33 +28,30 @@ agents:
 #    model: qwen2.5:7b
 #    note: 完全本地免 key
 
-# 兜底单模型：ask 不带 agent 时用它（也可想直连官方 API 时用）。#8 起该路径也纳入
+# 兜底单模型：ask 不带 agent 时用它（也可想直连官方 API 时用）。该路径也纳入
 # 健康体系（合成键 solo:<model>）：终态失败当天隔离、瞬时失败短时冷却。
-# 变量名与 .env.example 一一对应；${VAR:-默认值} 表示「不配就用冒号后的默认」。
-# 也可直接把值写死在这里（注意本文件会进 git，密钥别写在这儿）。
+# 模型名在 model_registry.txt 的 LLM_MODEL 行（不自动下线，人工决定）。
 llm:
-  base_url: ${LLM_ENDPOINT:-https://api.deepseek.com/v1}
-  api_key: ${LLM_API_KEY}          # 必填（在 .env 里配 LLM_API_KEY）
-  model: ${LLM_MODEL:-deepseek-chat}
-  temperature: 0.7
-  # 免费节点友好：请求超时秒数 / 限流等可重试错误的最大重试次数（指数退避）
-  timeout: 120
-  max_retries: 2
+  base_url: ${LLM_ENDPOINT}
+  api_key: ${LLM_API_KEY}          # 在 .env 里配 LLM_API_KEY
+  model: ${LLM_MODEL}
+  temperature: ${LLM_TEMPERATURE:-0.7}
+  # 免费节点友好：请求超时秒数 / 限流等可重试错误的最大重试次数(指数退避)
+  timeout: ${LLM_TIMEOUT:-120}
+  max_retries: ${LLM_MAX_RETRIES:-2}
 
 collaboration:
-  max_workers: 3                 # ask_workers 并行派工时的最大并发
-  max_participants: 5            # 一次批量派工最多带几个工人（0/负数=不限，用池内全部）
-                                 # 为什么要有：池子一站多模型时轻易几十个，全池派工会一次
-                                 # 打出几十个请求，并发上限只有 3 → 尾部批次必被整体限时
-                                 # 丢弃。默认取前 5 个可用工人（跳过冷却/当日隔离）
-  vote_threshold: 0.5            # ask_vote 达成共识的票数占比（0-1，0.5=过半）
-  cooldown_fails: 2              # 工人连续失败 N 次后进入冷却（暂停调用该节点）
-  cooldown_base: 10              # 冷却时长基数(秒)，连续失败越多冷却越久(基数×次数)
-  # ---- 模型健康：当日失败隔离（见 agent/core/health.py）----
-  health_file: data/model_health.json  # 健康档案落盘位置（当日失败标记，无密钥）
+  max_workers: ${COLLAB_MAX_WORKERS:-3}
+  max_participants: ${COLLAB_MAX_PARTICIPANTS:-5}
+  vote_threshold: ${COLLAB_VOTE_THRESHOLD:-0.5}
+  cooldown_fails: ${COLLAB_COOLDOWN_FAILS:-2}
+  cooldown_base: ${COLLAB_COOLDOWN_BASE:-10}
+  # ---- 模型健康：当日失败隔离 + 连续运行日失败自动下线（见 agent/core/health.py）----
+  health_file: ${COLLAB_HEALTH_FILE:-data/model_health.json}  # 健康档案落盘（当日失败标记，无密钥）
+  retire_days: ${COLLAB_RETIRE_DAYS:-7}  # 连续 N 个"运行日"调用失败 → 在 model_registry.txt 给该模型加 # 下线
 
 tools:
-  shell_timeout: 120             # 单条命令最长执行秒数
+  shell_timeout: ${TOOLS_SHELL_TIMEOUT:-120}  # 单条命令最长执行秒数
   # 额外允许工具访问的工作区目录（相对路径基于项目根，绝对路径原样使用）。
   # 为什么需要：MAO 常被用来驱动**别的项目**（在 MAO 里分析/改造另一个仓库），
   # 但工具层原先把路径硬绑在 MAO 自己的根上，主智能体连目标项目的文件都读不到，

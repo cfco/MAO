@@ -1,10 +1,13 @@
-"""配置契约测试：确保「用户照 .env.example 填完就能跑」这件事真的成立。
+"""配置契约测试：确保「config.yaml 引用的每个变量都有出处」这件事真的成立。
 
 背景（实测暴露的真实缺陷）：
-`.env.example` 曾经提供 `LLM_KEY`，而 `config.yaml` 引用的是 `${LLM_API_KEY}` ——
-用户老老实实填完 `.env`，`config.llm.api_key` 仍然是空串，兜底单模型永远不可用，
-启动还提示"$LLM_API_KEY 未找到"（明明他填了）。变量名对不上是纯契约问题，
-单看任一文件都发现不了，只能靠"两边对着比"来防。
+历史上一份 `.env.example` 承载"接口+模型清单+key 占位"，契约测试对照它查
+`${VAR}` 是否全都可填。配置重构二期后分工变为：
+    config.yaml        纯结构骨架（只 ${VAR} 引用）
+    model_registry.txt 全部模型名（随仓库维护、自动下线改写它）
+    .env               全部配置值（端点/KEY/参数，保密不进 git）
+因此「出处」= model_registry.txt ∪ .env（本地，可能存在也可能没有）。
+单看任一文件都发现不了变量名对不上，只能靠"两边对着比"来防。
 """
 from __future__ import annotations
 
@@ -17,13 +20,18 @@ from agent.config import _ENV_PATTERN, Config, _interpolate
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_YAML = ROOT / "config.yaml"
-ENV_EXAMPLE = ROOT / ".env.example"
+MODEL_REGISTRY = ROOT / "model_registry.txt"
+DOTENV = ROOT / ".env"
 
 
-def _parse_env_example() -> dict[str, str]:
-    """把 .env.example 解析成 {变量名: 值}（忽略注释行与空行）。"""
+def _parse_plain(path: Path) -> dict[str, str]:
+    """把 KEY=VALUE 行式文件解析成 {变量名: 值}（忽略注释行与空行）。
+
+    通用实现：.env 与 model_registry.txt 同构。只返回名字/值供断言使用，
+    测试不打印任何值。
+    """
     out: dict[str, str] = {}
-    for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if not s or s.startswith("#") or "=" not in s:
             continue
@@ -68,58 +76,67 @@ def test_env_pattern_distinguishes_missing_default():
     assert [(m.group(1), m.group(2)) for m in ms] == [("A", None), ("B", "x"), ("C", "")]
 
 
-def test_config_referenced_vars_are_covered_by_env_example():
-    """config.yaml 引用的每个 ${VAR}，要么在 .env.example 里有定义，要么带 :-默认值。
+def test_config_referenced_vars_are_covered_by_registry_and_env():
+    """config.yaml 引用的每个 ${VAR}，要么有 :-默认值，要么在 model_registry.txt 或 .env 里有定义。
 
-    只要有一个"引用了但没定义也没默认"的变量，用户照模板填完就会留下空配置。
+    本地没有 .env（如 CI / 新克隆未配置）时跳过：该测试防的是"变量无处可填"，
+    无 .env 便无从核对配置类变量，而模型类变量仍由 registry 覆盖（见下一测试的护栏）。
+    只要有一个"引用了但没定义也没默认"的变量，程序启动就会空配置。
     """
     refs = _config_referenced_vars()
     # 护栏：解析出足够多的引用，避免 pattern/解析失效后测试变成空转
     assert len(refs) >= 6, f"只解析到 {len(refs)} 个引用，解析逻辑可能已失效：{refs}"
-    assert any(default is None for _, default in refs), (
-        "应当存在「无默认值」的引用（如 ${LLM_API_KEY}），否则本测试无法覆盖目标场景"
-    )
-    defined = set(_parse_env_example())
+    defined = set(_parse_plain(MODEL_REGISTRY))
+    if DOTENV.exists():
+        defined |= set(_parse_plain(DOTENV))
 
     uncovered = sorted(k for k, default in refs if default is None and k not in defined)
-    assert not uncovered, (
-        f"这些变量 config.yaml 引用了，但 .env.example 没提供、也没有 :-默认值：{uncovered}；"
-        f"用户照 .env.example 填完它们仍为空。"
-    )
+    if DOTENV.exists():
+        assert not uncovered, (
+            f"这些变量 config.yaml 引用了，但 .env / model_registry.txt 都没提供、"
+            f"也没有 :-默认值：{uncovered}；它们插值后是空串。"
+        )
+    else:
+        pytest.skip(
+            f"无本地 .env，跳过配置类核对；模型类变量 {sorted(defined)} 均已覆盖"
+        )
 
 
-def test_env_example_has_no_dead_vars():
-    """.env.example 里定义的变量必须真的被 config.yaml 引用（否则是死变量，填了没用）。"""
+def test_registry_has_no_dead_vars():
+    """model_registry.txt 里定义的变量必须真的被 config.yaml 引用（否则是死变量，填了没用）。"""
     referenced = {k for k, _ in _config_referenced_vars()}
-    dead = sorted(k for k in _parse_env_example() if k not in referenced)
-    assert not dead, f".env.example 里这些变量没有任何地方引用（填了不生效）：{dead}"
+    dead = sorted(k for k in _parse_plain(MODEL_REGISTRY) if k not in referenced)
+    assert not dead, f"model_registry.txt 里这些变量没有任何地方引用（填了不生效）：{dead}"
 
 
-def test_filling_env_example_activates_llm_section(monkeypatch):
-    """照 .env.example 填完 .env 后，config 的 llm 段与智能体池必须真正生效。
+def test_filling_registry_and_env_activates_llm_section(monkeypatch):
+    """按 model_registry.txt + .env 喂给插值后，config 的 llm 段与智能体池必须真正生效。
 
-    模板可以把"必填项"留空等你手填（本项目的 .env.example 就把两个 KEY 留空，
-    注释要求你粘贴自己的 key），所以这里分两步：
-    1) 按模板原样解析 → 有默认值/有值的项必须解析出非空结果；
-    2) 再把"必填但留空"的变量补上值 → 必须真落到 config 上。
+    两步：
+    1) 原样解析（registry ∪ .env 的真实值）→ 有值的项必须解析出非空结果；
+    2) 把"无默认值"的引用全部覆上 filled- 前缀 → 必须真落到 config 上。
     第 2 步正是修复前的失败场景：填了变量名对不上的项（LLM_KEY vs LLM_API_KEY），
     值再真也不生效。
     """
     data = yaml.safe_load(CONFIG_YAML.read_text(encoding="utf-8"))
-    for key, val in _parse_env_example().items():
+    for key, val in list(_parse_plain(MODEL_REGISTRY).items()) + (
+        list(_parse_plain(DOTENV).items()) if DOTENV.exists() else []
+    ):
         monkeypatch.setenv(key, val)
 
     cfg = Config(_interpolate(data))
-    assert cfg.llm.get("base_url"), "兜底单模型的 base_url 不应为空（模板或默认值应提供）"
-    assert cfg.llm.get("model"), "兜底单模型的 model 不应为空"
-    assert cfg.agent_profiles, "照 .env.example 填完，智能体池不应为空"
+    assert cfg.llm.get("base_url"), "兜底单模型的 base_url 不应为空（.env 或默认值应提供）"
+    assert cfg.llm.get("model"), "兜底单模型的 model 不应为空（registry 应提供）"
+    assert cfg.agent_profiles, "池内应有模型（registry 的 NODE_A_MODELS 提供）"
 
-    # 必填变量（config 里无默认值的 ${...}）必须都在模板里有对应行，否则用户无处可填
-    declared = set(_parse_env_example())
+    # 必填变量（config 里无默认值的 ${...}）必须都在 registry 或 .env 里有对应行
     required = sorted(k for k, default in _config_referenced_vars() if default is None)
-    assert required, "应当存在必填变量（如 ${LLM_API_KEY}），否则本测试失去目标"
+    assert required, "应当存在无默认值的引用，否则本测试失去目标"
+    declared = set(_parse_plain(MODEL_REGISTRY)) | (
+        set(_parse_plain(DOTENV)) if DOTENV.exists() else set()
+    )
     for key in required:
-        assert key in declared, f"{key} 在 config.yaml 里必填，但 .env.example 没有对应行"
+        assert key in declared, f"{key} 在 config.yaml 里必填，但 registry/.env 没有对应行"
 
     # 补上值 → 必须真的生效
     for key in required:

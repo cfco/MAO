@@ -375,14 +375,14 @@ def stop_all(conns: list) -> None:
 class McpGroup:
     """一组进程内共享的 MCP 长连接 + 已发现的工具对象，带引用计数。
 
-    为什么要共享：Web 每个会话建一个 Agent，各自 connect_and_register 会为同一批
-    server 反复建立连接（stdio 场景 = 反复拉起同样的子进程），且每个 server 首次
-    连接最长要等 90s。共享后同一进程只维护一套连接，新会话只做"把自己的工具
-    注册表挂上去"这一件轻活。McpTool 本身无状态（只持有 conn 引用），可安全地
-    同时注册到多个会话的注册表里。
+    为什么要共享：同一进程（CLI / bridge / 外部主）多次派工或并发调用工具时，
+    各自 connect_and_register 会为同一批 server 反复建立连接（stdio 场景 =
+    反复拉起同样的子进程），且每个 server 首次连接最长要等 90s。共享后同一进程
+    只维护一套连接，新调用方只做"把自己的工具注册表挂上去"这一件轻活。McpTool
+    本身无状态（只持有 conn 引用），可安全地同时注册到多个调用方的注册表里。
 
-    引用计数：最后一个使用者 release 时才真正 stop_all —— 否则一个会话关闭就会
-    把别的会话正在用的连接一起掐掉。
+    引用计数：最后一个使用者 release 时才真正 stop_all —— 否则一个调用方关闭就会
+    把别的调用方正在用的连接一起掐掉。
     """
 
     def __init__(self, server_cfgs: list[dict]):

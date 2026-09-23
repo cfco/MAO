@@ -12,3 +12,6 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_model_health_store(tmp_path, monkeypatch):
     monkeypatch.setenv("MAO_HEALTH_FILE", str(tmp_path / "model_health.json"))
+    # 自动下线改写目标（model_registry.txt）同样隔离：worker 集成测试连跑 7 个
+    # 运行日失败也可能触发 retire，绝不能落到真实仓库的模型清单上。
+    monkeypatch.setenv("MAO_MODEL_REGISTRY_FILE", str(tmp_path / "model_registry.txt"))

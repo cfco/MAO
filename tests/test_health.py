@@ -1,12 +1,12 @@
 """模型健康 + 配置分层的回归测试：全部离线，无需 API key / 网络。
 
-覆盖两块（2026-09-21 需求）：
-1) 配置分层：.env.example 承载接口与模型清单（基础层，运行时真实加载），
-   .env 只放 key（覆盖层）；优先级 shell > .env > .env.example；
-   .env.example 变化要让配置缓存失效。
+覆盖两块（2026-09-23 配置重构二期）：
+1) 配置分层：model_registry.txt 承载模型清单（基础层，随仓库维护，自动下线改写它），
+   .env 承载全部配置值（端点 / KEY / 参数，覆盖层）；优先级 shell > .env > registry；
+   registry / .env 变化都要让配置缓存失效；.env 里混进模型清单变量要点名提醒。
 2) 模型健康：一次终态失败 → 当日隔离不再派工（缓存命中不受影响）；
-   连续 retire_days 个"运行日"（程序实际启动过的天，周末没开机不计入也不打断）
-   都失败 → 自动在 .env.example 对应行给模型标 # 下线
+   连续 retire_days 个"运行日"（程序实际启动过的天，未运行的日子不计入也不打断）
+   都失败 → 自动在 model_registry.txt 对应行给模型标 # 下线
    （LLM_MODEL 兜底行不自动动，人工决定）。
 """
 from __future__ import annotations
@@ -45,7 +45,7 @@ def cfg_home(tmp_path, monkeypatch):
     monkeypatch.setattr(ac, "_cfg_cache", None)
     monkeypatch.setattr(ac, "_cfg_cache_mtime", 0.0)
     monkeypatch.setattr(ac, "_cfg_cache_dotenv_mtime", 0.0)
-    monkeypatch.setattr(ac, "_cfg_cache_example_mtime", 0.0)
+    monkeypatch.setattr(ac, "_cfg_cache_registry_mtime", 0.0)
     monkeypatch.setattr(ac, "_dotenv_keys", set())
     monkeypatch.setattr(ac, "_missing_logged", set())
     yield tmp_path
@@ -71,67 +71,75 @@ llm:
 
 
 def _write_layers(home, models_a="m-one@128k,m-two@256k", env_lines=("NODE_A_KEY=sk-real",)):
+    """写三份文件：config.yaml 骨架 + model_registry.txt（模型名）+ .env（配置值）。"""
     (home / "config.yaml").write_text(CONFIG_YAML, encoding="utf-8")
-    (home / ".env.example").write_text(
-        "# 分层基础：接口与模型清单\n"
-        "NODE_A_ENDPOINT=https://a.example/v1\n"
-        "NODE_A_KEY=\n"
+    (home / "model_registry.txt").write_text(
+        "# 分层基础：模型清单\n"
         f"NODE_A_MODELS={models_a}\n"
-        "LLM_ENDPOINT=https://a.example/v1\n"
-        "LLM_API_KEY=\n"
         "LLM_MODEL=m-one\n",
         encoding="utf-8",
     )
+    # .env 默认只给 key；需要端点时由调用方自提（ENDPOINT 属配置层）：
     (home / ".env").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
 
 
-# ---------------- 1) 配置分层 ----------------
+# ---------------- 1) 配置分层（registry + .env） ----------------
 
 
-def test_layers_example_base_env_override(cfg_home):
-    _write_layers(cfg_home)
+def test_layers_registry_base_env_override(cfg_home):
+    """模型名在 model_registry.txt、配置值（端点/key）在 .env：池应能建起来。"""
+    _write_layers(cfg_home, env_lines=("NODE_A_ENDPOINT=https://a.example/v1",
+                                       "NODE_A_KEY=sk-real"))
     cfg = load_config()
-    assert cfg.agent_profiles, "接口/模型在 .env.example、key 在 .env，池应能建起来"
+    assert cfg.agent_profiles, "registry 提供模型名、.env 提供端点/key，池应能建起来"
     p = cfg.profile("node-a:m-one")
     assert p is not None and p.base_url == "https://a.example/v1"
-    assert p.api_key == "sk-real", ".env 的 key 必须覆盖 .env.example 的空占位"
+    assert p.api_key == "sk-real", ".env 的 key 必须生效"
     assert p.models_env == "NODE_A_MODELS", "要能反查模型清单所在变量（健康下线改写用）"
-    assert cfg.llm.get("api_key") == "", "LLM_API_KEY 只有 .env.example 空占位 → 插值为空串"
+    assert cfg.llm.get("model") == "m-one", "LLM_MODEL 由 registry 提供"
+    assert cfg.llm.get("api_key") == "", "LLM_API_KEY 未在 .env 配置 → 插值为空串"
+    assert cfg.retire_days == 7, "collaboration.retire_days 缺省 7 个运行日"
 
 
-def test_shell_env_wins_over_both_dotenv_layers(cfg_home, monkeypatch):
+def test_shell_env_wins_over_both_layers(cfg_home, monkeypatch):
+    """shell 预置变量优先级最高：既盖 .env（key/端点），也盖 registry（模型清单）。"""
     monkeypatch.setenv("NODE_A_ENDPOINT", "http://shell.wins/v1")
-    _write_layers(cfg_home)
-    # shell 预置发生在 dotenv 加载之前也要成立：dotenv 只更新"自己注入过"的键
-    os.environ["NODE_A_KEY"] = "sk-shell"
+    monkeypatch.setenv("NODE_A_MODELS", "shell-only@256k")
+    monkeypatch.setenv("NODE_A_KEY", "sk-shell")
+    _write_layers(cfg_home, env_lines=("NODE_A_ENDPOINT=http://dotenv.lose/v1",
+                                       "NODE_A_KEY=sk-real"))
     cfg = load_config()
-    p = cfg.profile("node-a:m-one")
+    # 只剩 1 个模型 → 名字归一化为站名 node-a（不带 :模型 后缀）；model 只留裸名
+    p = cfg.profile("node-a")
+    assert p is not None and p.model == "shell-only", "shell 的模型清单必须盖掉 registry"
     assert p.base_url == "http://shell.wins/v1"
     assert p.api_key == "sk-shell", "shell 已导出的 key 不被 .env 覆盖"
+    assert cfg.profile("node-a:m-one") is None, "registry 的 m-one 不在 shell 清单里"
 
 
-def test_missing_env_file_still_loads_from_example(cfg_home):
+def test_missing_env_file_still_loads_from_registry(cfg_home):
     _write_layers(cfg_home)
     (cfg_home / ".env").unlink()
     cfg = load_config()
     p = cfg.profile("node-a:m-one")
-    assert p is not None and p.api_key == "", "没有 .env 时池照常构建，key 为空占位"
+    assert p is not None and p.api_key == "", "没有 .env 时池照常构建（registry 管模型名），key 为空占位"
 
 
-def test_env_example_change_invalidates_cache(cfg_home):
+def test_registry_change_invalidates_cache(cfg_home):
     _write_layers(cfg_home)
     cfg1 = load_config()
     assert load_config() is cfg1, "三份文件都没动时应命中缓存"
-    # 只改 .env.example（比如下线了 m-two），并显式推后 mtime 保证跨平台确定性
-    ex = cfg_home / ".env.example"
-    ex.write_text(
-        ex.read_text(encoding="utf-8").replace("NODE_A_MODELS=m-one@128k,m-two@256k", "NODE_A_MODELS=m-one@128k"),
+    # 只改 model_registry.txt（比如 git pull 下线了 m-two），并显式推后 mtime
+    reg = cfg_home / "model_registry.txt"
+    reg.write_text(
+        reg.read_text(encoding="utf-8").replace("NODE_A_MODELS=m-one@128k,m-two@256k",
+                                                "NODE_A_MODELS=m-one@128k"),
         encoding="utf-8",
     )
-    st = ex.stat()
-    os.utime(ex, (st.st_atime + 5, st.st_mtime + 5))
+    st = reg.stat()
+    os.utime(reg, (st.st_atime + 5, st.st_mtime + 5))
     cfg2 = load_config()
-    assert cfg2.profile("node-a:m-two") is None, ".env.example 变化必须让缓存失效重载"
+    assert cfg2.profile("node-a:m-two") is None, "registry 变化必须让缓存失效重载"
     # 删剩单模型后按规则改名为站名（不再带 :模型 后缀）
     assert cfg2.profile("node-a") is not None
 
@@ -142,35 +150,49 @@ def test_hash_blocked_model_untouched_by_layering(cfg_home):
     assert cfg.profile("node-a:m-two") is None
 
 
-def test_env_stray_vars_warn_by_name_only(cfg_home, capsys):
-    """.env 混进非 key 变量（会静默压住 .env.example 的更新/自动下线）⇒
+def test_env_stray_models_vars_warn_by_name_only(cfg_home, capsys):
+    """.env 混进模型清单变量（会静默压住 model_registry.txt 的 git 更新/自动下线）⇒
     重载配置时在 stderr 点名提醒；只报变量名，绝不回显任何值。"""
-    _write_layers(cfg_home, env_lines=("NODE_A_KEY=sk-secret-do-not-print",
-                                       "NODE_A_MODELS=evil@1"))
+    _write_layers(cfg_home, env_lines=("NODE_A_MODELS=evil@1",
+                                       "NODE_A_KEY=sk-secret-do-not-print"))
     load_config()
     err = capsys.readouterr().err
     assert "分层提醒" in err and "NODE_A_MODELS" in err
     assert "sk-secret-do-not-print" not in err, "告警不得回显 .env 里的任何值"
-    # 纯 key 的 .env 不该触发提醒
-    (cfg_home / ".env").write_text("NODE_A_KEY=sk-real\n", encoding="utf-8")
+    # 纯配置的 .env（端点/key/参数）不该触发提醒
+    (cfg_home / ".env").write_text(
+        "NODE_A_ENDPOINT=https://a.example/v1\nNODE_A_KEY=sk-real\nCOLLAB_RETIRE_DAYS=3\n",
+        encoding="utf-8",
+    )
     os.utime(cfg_home / ".env", (time.time() + 5, time.time() + 5))
     load_config(force=True)
     assert "分层提醒" not in capsys.readouterr().err
 
 
-def test_real_env_example_never_carries_key_values():
-    """守卫分层契约：随仓库维护（AI 可改、进 git）的 .env.example 里，
-    *_KEY 行只能是空占位——真实 key 只允许进 .env（AI 不可修改区）。"""
-    real_example = Path(ac.__file__).resolve().parent.parent / ".env.example"
-    lines = [ln.strip() for ln in real_example.read_text(encoding="utf-8").splitlines()]
+def test_inline_comment_stripped_in_dotenv(cfg_home):
+    """.env 值里"空格+#"的行内注释要剥掉——否则数字/端点参数会被注释文本污染成非法值。"""
+    _write_layers(cfg_home, env_lines=("NODE_A_ENDPOINT=https://a.example/v1 # 端点",
+                                       "NODE_A_KEY=sk-real",
+                                       "COLLAB_RETIRE_DAYS=7   # 连续 7 个运行日"))
+    cfg = load_config()
+    assert cfg.retire_days == 7, "COLLAB_RETIRE_DAYS 的行内注释应被剥离"
+    p = cfg.profile("node-a:m-one")
+    assert p is not None and p.base_url == "https://a.example/v1", "端点的行内注释应被剥离"
+
+
+def test_real_registry_never_carries_key_values():
+    """守卫契约：随仓库维护（AI 可改、进 git）的 model_registry.txt 里不得出现
+    *_KEY 行——真实 key 只允许进 .env（保密、不进 git）。"""
+    real_registry = Path(ac.__file__).resolve().parent.parent / "model_registry.txt"
+    lines = [ln.strip() for ln in real_registry.read_text(encoding="utf-8").splitlines()]
     key_lines = [ln for ln in lines if "=" in ln and not ln.startswith("#")
                  and ln.split("=", 1)[0].strip().endswith("_KEY")]
-    assert key_lines, ".env.example 应保留 *_KEY= 空占位行（契约测试核对变量名用）"
-    for ln in key_lines:
-        assert ln.split("=", 1)[1].strip() == "", f"git 维护层出现疑似真实 key：{ln.split('=')[0]} 行有值"
+    assert not key_lines, f"model_registry.txt 出现疑似 key 变量行：{key_lines}"
 
 
 # ---------------- 2) ModelHealth 单元 ----------------
+
+REGISTRY_TXT = "NODE_A_MODELS=m-one@128k,m-two@256k\nLLM_MODEL=m-one\n"
 
 
 def _health(tmp_path):
@@ -206,8 +228,74 @@ def test_corrupt_store_file_recovers(tmp_path):
     assert h.quarantined("w")
 
 
-# ---------------- 3) WorkerPool 集成（派工路径真的被隔离） ----------------
+# ---------------- 3) 自动下线：连续运行日失败 → registry 加 # ----------------
 
+def _registry(tmp_path) -> Path:
+    reg = tmp_path / "model_registry.txt"
+    reg.write_text(REGISTRY_TXT, encoding="utf-8")
+    return reg
+
+
+def _retiring(tmp_path, retire_days=7):
+    return ModelHealth(tmp_path / "h.json", _registry(tmp_path), retire_days=retire_days)
+
+
+def test_retire_marks_model_in_registry_after_retire_days(tmp_path):
+    """连续 retire_days 个运行日都失败 → 在 model_registry.txt 给该模型加 #。"""
+    h = _retiring(tmp_path, retire_days=3)
+    for i in range(3):
+        h.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=_day(i - 3))
+    text = (tmp_path / "model_registry.txt").read_text(encoding="utf-8")
+    assert "#m-one" in text, f"达标后模型必须被标 # 下线：\n{text}"
+    assert "#m-two" not in text, "其它模型不受牵连（m-two 原样无 #）"
+    # 档案里记了 disabled 标记（防二次改写下线提醒重复刷屏）
+    assert h.snapshot()["st:m-one"].get("disabled") == _day(-1)
+
+
+def test_retire_does_not_fire_below_retire_days(tmp_path):
+    h = _retiring(tmp_path, retire_days=3)
+    for i in range(2):  # 只失败 2 个运行日
+        h.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=_day(i - 2))
+    text = (tmp_path / "model_registry.txt").read_text(encoding="utf-8")
+    assert "#m-one" not in text, "运行日样本不足时不许提前下线"
+
+
+def test_unrun_days_not_counted_nor_interrupt(tmp_path):
+    """「没运行项目的天」既不计入、也不打断连击（用户核心诉求）。"""
+    h = _retiring(tmp_path, retire_days=3)
+    # 运行日 = 第 1、3、4 天；第 2 天没开机（不在 active_dates），不打断窗口
+    for d in (_day(-4), _day(-2), _day(-1)):
+        h.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=d)
+    text = (tmp_path / "model_registry.txt").read_text(encoding="utf-8")
+    assert "#m-one" in text, "缺一天没运行不影响：最近 3 个运行日仍全失败 → 下线"
+
+
+def test_success_running_day_breaks_streak(tmp_path):
+    """模型在某运行日没失败（成功或未被调用）→ 该日不算失败日，不得误杀。"""
+    h = _retiring(tmp_path, retire_days=3)
+    h.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=_day(-3))
+    h.note_active(_day(-2))  # 这个运行日模型没失败
+    h.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=_day(-1))
+    text = (tmp_path / "model_registry.txt").read_text(encoding="utf-8")
+    assert "#m-one" not in text, "存在『未失败』的运行日 → 不满足全失败，不许下线"
+
+
+def test_retire_is_idempotent_and_informs_llm_model_untouched(tmp_path):
+    """已 # 下线的模型再失败：不重复改写，仍报提示；LLM_MODEL 兜底行绝不被自动动。"""
+    reg = _registry(tmp_path)
+    h = ModelHealth(tmp_path / "h.json", reg, retire_days=2)
+    for i in range(2):
+        h.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=_day(i - 2))
+    text = reg.read_text(encoding="utf-8")
+    assert "#m-one" in text and "LLM_MODEL=m-one" in text, "LLM_MODEL 行原样保留"
+    # 再模拟一次失败：disabled 标记在案 → 不再重复改写 registry、也不再刷下线提示（幂等）
+    h2 = ModelHealth(tmp_path / "h.json", reg, retire_days=2)
+    notice = h2.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=_day(-1))
+    assert notice is None, "已下线模型再失败不重复提示/改写（防刷屏），实际返回 None"
+    assert reg.read_text(encoding="utf-8") == text, "幂等：registry 内容不再变化"
+
+
+# ---------------- 4) WorkerPool 集成（派工路径真的被隔离） ----------------
 
 def _pool(health: ModelHealth, models: str = "m1,m2") -> WorkerPool:
     cfg = Config(_interpolate({

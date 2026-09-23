@@ -56,7 +56,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M4 限时改回固定 300s",
-        "agent/core/orchestrator.py",
+        "agent/core/parallelism.py",
         "        return batches * per_call + 30.0",
         "        return 300.0",
         f"{TESTFILE}::test_effective_timeout_scales_with_batches_and_respects_explicit",

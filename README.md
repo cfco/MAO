@@ -85,32 +85,41 @@ MAO/
 
 ### 配置智能体池
 
-**第 1 步：填 key（写进 `.env`，不进 git）**
+**第 1 步：配置（写进 `.env`，不进 git）**
 
-接口地址与模型清单已经直接写在 `.env.example` 里（bynara + kilo 免费站，随仓库维护，
-`git pull` 即更新模型）。你只需要在项目根目录建一个 `.env`，**只写 key**：
+全部配置值都写在 `.env`（端点 / KEY / LLM 与协作参数）。仓库已带一份可直接改的 `.env`
+(随时更新并保持进 git 之外)。只需要确认四行真实密钥：
 
 ```ini
+NODE_A_ENDPOINT=https://router.bynara.id/v1
 NODE_A_KEY=sk-你的bynara-key
+NODE_B_ENDPOINT=https://api.kilo.ai/api/gateway
 NODE_B_KEY=sk-你的kilo-key    # 不用 kilo 可不写
-LLM_API_KEY=sk-同一个bynara-key  # 兜底单模型（池里节点全挂时用）
 ```
 
-加载优先级：shell 环境变量 > `.env` > `.env.example`。要改接口/增删模型改
-`.env.example`（或设环境变量）即可，不必碰 `.env`。变量名必须与 `config.yaml`
-里的 `${...}` 一致，否则填了不生效（`tests/test_config_contract.py` 会守住这条契约）。
+**第 2 步：模型清单（写进 `model_registry.txt`，随仓库维护、进 git）**
 
-两层互为守卫，各管各的边界：`.env.example`（AI 可改、进 git）里的 `*_KEY` 行
-永远必须是空占位（有测试守着，真实 key 不会被误提交）；反过来 `.env` 里若混进
-非 key 变量（如复制了整份 `.env.example`），启动时按 `[配置分层提醒]` 点名警告
-（只报变量名、绝不回显值）——因为这些变量会盖住 `.env.example` 的模型清单更新。
+所有模型名集中在 `model_registry.txt`（`NODE_A_MODELS` / `NODE_B_MODELS` / `LLM_MODEL`
+三行），`git pull` 即更新；临时屏蔽某模型 = 在它名字前加 `#`，不用改代码。
+
+加载优先级：shell 环境变量 > `.env` > `model_registry.txt`（config.yaml 只留结构骨架，
+全部用 `${VAR}` 或 `${VAR:-默认}` 引用，授权负责维护默认值）。变量名必须与
+`config.yaml` 里的 `${...}` 一致，否则填了不生效（`tests/test_config_contract.py`
+会守住这条契约）。
+
+两层互为守卫：`model_registry.txt`（AI 可改、进 git）绝不能出现 `*_KEY` 行（有测试守着，
+真实 key 不会被误提交）；反过来 `.env` 里若混进模型清单变量（`*_MODEL(S)`，如整段复制
+registry），启动时按 `[配置分层提醒]` 点名警告（只报变量名、绝不回显值）——因为这些
+变量会盖住 registry 的 git 更新与自动下线标记。
 
 模型会自动体检：某模型出现一次**不可重试的终态失败**（如认证被拒）→ 当天不再派工给它
 （当日隔离）；429/5xx/超时等瞬时失败耗尽重试只进短时冷却——免费 API 的限流抖动是常态，
-不该一次 429 就报废整天可用池。已移除"连续多日失败自动改 `.env.example` 下线"——
-按需驱动下路由取舍交给外部主，可用 `health` 指令查各节点当前是否可用。
+不该一次 429 就报废整天可用池。某模型**连续 7 个"运行日"调用都失败**（运行日 = 程序
+实际启动工作的天，没运行项目的日子不计入、也不打断连击），自动在 `model_registry.txt`
+给它标 `#` 下线（删掉 `#` 即恢复；阈值 `COLLAB_RETIRE_DAYS` 可调，`LLM_MODEL` 兜底行
+不自动动）。可用 `health` 指令查各节点当前是否可用。
 
-**第 2 步：配池（编辑 `config.yaml` 的 `agents`）**
+**第 3 步：配池（编辑 `config.yaml` 的 `agents`）**
 
 按"站"组织：一个 Endpoint + 一个 Key 可以挂多个模型，每个模型自动成为一个智能体。
 可选 `tags`（逗号分隔的能力标签）帮外部主决定"这类活派给谁"——`health`/`list_agents` 会把标签回吐给主。

@@ -1,9 +1,11 @@
 """投票与共识：从多个工人候选方案中挑出最优解。
 
-本模块从 orchestrator.py 拆出，原因：
-- WorkerPool 单文件 602 行，超 500 行约定；投票相关方法（vote / select_best /
+本模块从 orchestrator.py 拆出（2026-09-22），原因：
+- 当时 WorkerPool 单文件 543 行，超 500 行约定；投票相关方法（vote / select_best /
   _run_ballot / render_answer）约 130 行，独立后 orchestrator.py 专注派工与并行，
   voting.py 专注"从候选中挑出最好"的决策逻辑，职责更清晰。
+- 后续（2026-09-23）并行派工段（_wait_gather / _effective_timeout / _spawn /
+  _run_parallel）进一步拆到 parallelism.py，orchestrator.py 已回到 ≤500 行约束。
 - 投票逻辑的复用面（将来外部主 AI 也可能直接调用 select_best 做评审候选）
   比派工更广，独立模块后 import 路径更直观。
 

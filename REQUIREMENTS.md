@@ -58,7 +58,7 @@ MAO 不再有内部 Agent 循环，也不再持久化会话——它是被外部
 | 畸形响应归一 | 中转站内容过滤会返回 `choices: []`：显式归类为可重试的服务端错误（原本是裸 `IndexError`，会绕过错误分类与重试编排一路冒到调用方）；模型给出空 content 且无工具调用时返回明确说明，不再静默输出空白答复 |
 | 并发隔离 | 线程池并行派工，单工人失败/超时以文本如实带回，不拖垮整体 |
 | 整体限时 | `ask_many`/`vote`/`collect` 用 `concurrent.futures.wait` 对收集阶段整体限时；限时**按规模自适应** = `ceil(参与人数 ÷ max_workers) × llm.timeout + 30s`（调用方显式传入 `timeout` 时以传入值为准）。原先固定 300s 在「池大 + 并发低」时必然截断尾部批次（25 名 / 3 并发 = 9 批，单工人耗时 >33s 即超标）。超时工人标记"未完成"放弃等待，后台线程按 LLM 超时自行收尾 |
-| 当日失败隔离 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**不可重试的终态失败**（认证失败、非重试类 4xx）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示，`status=quarantined`）；429/5xx/超时等**可重试瞬时失败**耗尽重试只进短时冷却（`status=cooldown`），不再拉黑全天——免费节点限流是常态，按旧规则一次 429 就报废整天的可用池。档案按路径**进程内共享单实例**（`health.get_health()`）：多工人池/多调用方各持独立内存账本 + 全量覆写会互相抹记录（lost update）、且彼此看不到隔离结果，共享后当日隔离全进程一致。**文件 IO 全部在锁外**（锁内更新内存取快照、锁外原子写盘），避免记账持锁把 health 锁串到 pool 锁卡住派工。（历史"连续 N 运行日失败自动在 `.env.example` 加 `#` 下线"已移除。） |
+| 当日失败隔离 + 连续运行日下线 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**不可重试的终态失败**（认证失败、非重试类 4xx）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示，`status=quarantined`）；429/5xx/超时等**可重试瞬时失败**耗尽重试只进短时冷却（`status=cooldown`），不再拉黑全天——免费节点限流是常态，按旧规则一次 429 就报废整天的可用池。档案按路径**进程内共享单实例**（`health.get_health()`）：多工人池/多调用方各持独立内存账本 + 全量覆写会互相抹记录（lost update）、且彼此看不到隔离结果，共享后当日隔离全进程一致。**文件 IO 全部在锁外**（锁内更新内存取快照、锁外原子写盘），避免记账持锁把 health 锁串到 pool 锁卡住派工。某模型连续 `COLLAB_RETIRE_DAYS`（默认 7）个**运行日**（程序实际启动工作的天，未运行日子不计入不打断）调用都失败，自动在 `model_registry.txt` 对应 `*_MODELS` 行给该模型加 `#` 下线（删 `#` 手动恢复；`LLM_MODEL` 兜底行不自动动；已下线幂等不重复改写、不刷频）。 |
 
 ## 5. 工具与能力
 
@@ -90,20 +90,20 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 |---|---|
 | `agents` | 智能体池，按"站"组织（一 Endpoint+Key 挂多 model）；`models` 逗号分隔，`#` 前缀临时屏蔽，`@128k` 标注上下文窗口，可选 `tags`（能力标签，供外部主选路）、`note` |
 | `llm` | 兜底单模型 + temperature / timeout / max_retries |
-| `collaboration` | max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails / cooldown_base / health_file |
+| `collaboration` | max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails / cooldown_base / health_file / retire_days（连续几个运行日失败即自动下线，默认 7） |
 | `tools` | shell_timeout / workspace（额外允许工具访问的项目目录，默认为空=仅本项目根） |
 | `mcp_servers` | MCP 接入列表 |
 
-**配置分层**（`load_config`）：`${VAR}` 的取值优先级为 **shell 环境变量 > `.env` > `.env.example`**。`.env.example` 不只是示例——它作为基础层在运行时真实加载，承载接口地址与模型清单（随仓库维护，`git pull` 即更新，且它的 mtime 参与配置缓存失效判断）；`.env` 是覆盖层，用户只需写几行 `KEY=...`。key 占位行留在 `.env.example` 供契约测试核对变量名，真实 key 只进 `.env`（保密约定不变：`.gitignore` 永不提交、AI 不读取内容）。
+**配置分层**（`load_config`）：`${VAR}` 的取值优先级为 **shell 环境变量 > `.env` > `model_registry.txt`**。`config.yaml` 只留结构骨架（`${VAR}` / `${VAR:-默认}` 引用）；`.env` 承载**全部配置值**（端点/KEY/LLM 参数/协作参数，保密不进 git，AI 负责维护内容）；`model_registry.txt` 承载**全部模型名**（`NODE_A_MODELS` / `LLM_MODEL` 等，随仓库维护，git pull 即更新，它的 mtime 参与配置缓存失效判断，也是自动下线改写目标）。
 
-**数值配置容错**：所有数值项（`max_workers`/`max_participants`/`max_iterations`/`port`/`shell_timeout`/`vote_threshold`/`llm.timeout` 等）统一走 `Config.as_int()` / `as_float()`。类型写错（如 `max_participants: five`）不再抛 `ValueError` 崩启动，改为**警告一次 + 回退默认值**（提示走 stderr），与"缺 key 不阻启动、只警告"的既有态度保持一致。分层边界由双向守卫闭环：`.env.example` 的 `*_KEY` 行必须为空占位（`test_real_env_example_never_carries_key_values` 守着，真实 key 不会随 git 泄漏）；`.env` 出现非 `*_KEY`/非 `MAO_*` 变量时重载配置即打 `[配置分层提醒]`（只报变量名绝不回显值——这些变量会盖住 `.env.example` 的模型清单更新）。
+**数值配置容错**：所有数值项（`max_workers`/`max_participants`/`retire_days`/`shell_timeout`/`vote_threshold`/`llm.timeout` 等）统一走 `Config.as_int()` / `as_float()`。类型写错（如 `max_participants: five`）不再抛 `ValueError` 崩启动，改为**警告一次 + 回退默认值**（提示走 stderr），与"缺 key 不阻启动、只警告"的既有态度保持一致。分层边界由双向守卫闭环：`model_registry.txt` 绝不出现 `*_KEY` 行（`test_real_registry_never_carries_key_values` 守着，真实 key 不会随 git 泄漏）；`.env` 出现 `*_MODEL(S)` 模型清单变量时重载配置即打 `[配置分层提醒]`（只报变量名绝不回显值——这些变量会盖住 registry 的 git 更新与自动下线）。`.env` 值支持 ` #` 行内注释（剥离后才是真值）。
 
 ## 9. 质量门禁
 
 - `uv run ruff check .`：E/F/W/I/B/UP，line-length 100；用 `extend-exclude = ["data"]` 追加排除运行时产物与隔离区（**不要用 `exclude`**——那是替换语义，会顶掉 ruff 默认排除表把 `.venv`/`.git` 重新纳入扫描）。
 - 解释器版本以仓库根 `.python-version` 为唯一来源（CI 用不带参数的 `uv python install` 跟随它，不写死版本号）。
-- 质量门禁的守卫测试：`tests/test_config_contract.py`（`.env.example` ↔ `config.yaml` 变量名契约）、`tests/test_repo_hygiene.py`（`.gitignore` 规则真生效、ruff 用 extend-exclude）。
-- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避/畸形响应归一、WorkerPool 冷却/当日隔离、ask_many 整体限时与确定性顺序、结构化派工结果（`ask_many_structured`）、`health` 可用性探针、能力标签 `tags`、`run_review` 评审团、路径防穿越（工具/技能脚本）、MCP 断线重连持续重试与连接回滚、bridge stderr UTF-8、配置分层（.env.example 基础层 / .env 覆盖层 / shell 最高 / 清单变更失效缓存 / 边界双向守卫：`*_KEY` 行必须空、`.env` 混入非 key 变量按名告警不回显值）、模型健康（当日隔离、进程内共享、幂等、跨进程持久化；`tests/conftest.py` 用 `MAO_HEALTH_FILE` 给每用例独立档案防跨用例污染）等。（内部 Agent 主循环、会话持久化、LRU 缓存、并发去抖、`run_pipeline`、自动下线的用例已随功能移除。）
+- 质量门禁的守卫测试：`tests/test_config_contract.py`（`model_registry.txt` + `.env` ↔ `config.yaml` 变量名契约）、`tests/test_repo_hygiene.py`（`.gitignore` 规则真生效、ruff 用 extend-exclude）。
+- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避/畸形响应归一、WorkerPool 冷却/当日隔离、ask_many 整体限时与确定性顺序、结构化派工结果（`ask_many_structured`）、`health` 可用性探针、能力标签 `tags`、`run_review` 评审团、路径防穿越（工具/技能脚本）、MCP 断线重连持续重试与连接回滚、bridge stderr UTF-8、配置分层（model_registry.txt 模型名基础层 / .env 全配置覆盖层 / shell 最高 / registry 与 .env 变更失效缓存 / 行内注释剥离 / 边界双向守卫：registry 绝不带 `*_KEY`、`.env` 混入 `*_MODEL(S)` 按名告警不回显值）、模型健康（当日隔离、进程内共享、幂等、跨进程持久化、连续运行日自动下线含"未运行的日子不计入也不打断"；`tests/conftest.py` 用 `MAO_HEALTH_FILE` / `MAO_MODEL_REGISTRY_FILE` 给每用例独立档案与独立 registry 防跨用例污染）等。（内部 Agent 主循环、会话持久化、LRU 缓存、并发去抖、`run_pipeline` 的用例已随功能移除。）
 - 2026-09-22 审计修复的专项回归集中在 `tests/test_audit_fixes.py`：健康档案进程内共享（含"两个实例各自先读盘、再交错记账不得互相覆盖"的 lost update 场景）且直连构造仍独立、缺省派工规模上限（pick）与自适应限时、显式名单不被上限约束、批量路径跳过项如实带回、MCP 连接共享与引用计数、计票不采信错误文本。**配套变异测试**（撤销修复 → 对应用例必须失败）确认用例非恒真。
 - 2026-09-22 第二轮全链路审计的回归集中在 `tests/test_audit2_fixes.py`（27 例）：投票分母只算有效票、健康档案写盘不阻塞隔离查询与并发落盘不留垃圾、6 项数值配置的类型容错、流水线阶段间裁剪（含窗口伸缩与按份均分）、`write_file` 覆盖留档、注入检查不误拦引号内字面量且真实拼接照拦、408/425/429/5xx 与 4xx 的重试分类。变异校验扩到多项（`tests/mutation_check.py`）；本轮变异又抓出 2 个恒真用例并修正（假 `_last_active` 被清理线程连带清理、测试 monkeypatch 掉了被测方法本身）。
 - GitHub Actions CI：ruff + pytest。
