@@ -27,9 +27,8 @@ def test_config_loads():
 def test_builtin_tools_registered():
     cfg = load_config()
     reg = build_builtin_tools(cfg)
-    schemas = reg.openai_schemas()
-    assert len(schemas) >= 1
-    names = {s["function"]["name"] for s in schemas}
+    names = set(reg.names())
+    assert len(names) >= 1
     # 至少应注册内置 shell 工具
     assert "run_shell" in names
 

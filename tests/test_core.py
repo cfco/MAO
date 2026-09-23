@@ -36,6 +36,7 @@ from agent.core.llm import (
     _retryable_from_type,
 )
 from agent.core.orchestrator import WorkerPool
+from agent.core.parallelism import StationMemo
 from agent.tools.base import FunctionTool, ToolRegistry
 
 # ---------------- 工具注册表 ----------------
@@ -55,8 +56,8 @@ def test_registry_execute_unknown_and_bad_json():
     assert "合法 JSON" in reg.execute("t", "not-json{")
     # 正常调用
     assert reg.execute("t", "{}") == "ok"
-    # schema 导出数量与注册一致
-    assert len(reg.openai_schemas()) == 1
+    # 注册数量与工具名清单一致
+    assert len(reg.names()) == 1
 
 
 # ---------------- 配置解析 ----------------
@@ -100,7 +101,7 @@ def test_config_multimodel_expansion_and_lookup():
 # ---------------- LLMClient 重试 / 退避 ----------------
 
 def _fake_response(content: str):
-    msg = SimpleNamespace(content=content, tool_calls=None)
+    msg = SimpleNamespace(content=content)
     return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
 
 
@@ -582,7 +583,7 @@ def test_ask_many_structured_ordered_records(monkeypatch):
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             return {"content": "hi"}
 
     monkeypatch.setattr(orch, "LLMClient", Instant)
@@ -608,7 +609,7 @@ def test_answer_starting_with_error_prefix_is_still_success(monkeypatch):
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             return {"role": "assistant", "content": "错误：这里只是正文的开头，不是故障"}
 
     monkeypatch.setattr(orch, "LLMClient", Prefixy)
@@ -634,7 +635,7 @@ def test_ask_result_error_leaves_answer_empty(monkeypatch):
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             raise LLMError("api", "HTTP 429 错误码 1", retryable=True)
 
     monkeypatch.setattr(orch, "LLMClient", Boom)
@@ -656,7 +657,7 @@ def test_ask_many_structured_uses_stable_status_codes():
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             return {"role": "assistant", "content": "hi"}
 
     monkey = Instant
@@ -727,7 +728,7 @@ def test_fallback_to_peer_on_retryable_failure(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             if self.model == "m1":
                 raise LLMError("rate_limit", "429", retryable=True)  # 持续瞬时失败
             return {"role": "assistant", "content": f"ok-from-{self.model}"}
@@ -746,7 +747,7 @@ def test_fallback_respects_cooldown_skip(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             raise LLMError("rate_limit", "429", retryable=True)  # 全部可重试失败
 
     monkeypatch.setattr(orch, "LLMClient", AlwaysBoom)
@@ -765,7 +766,7 @@ def test_fallback_not_cross_station(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             calls["models"].append(self.model)
             raise LLMError("rate_limit", "429", retryable=True)  # 全站可重试失败
 
@@ -786,7 +787,7 @@ def test_fallback_terminal_error_no_fallback(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             calls["models"].append(self.model)
             raise LLMError("auth", "bad key", retryable=False)  # 终态
 
@@ -806,7 +807,7 @@ def test_fallback_disabled_when_zero(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             calls["models"].append(self.model)
             raise LLMError("rate_limit", "429", retryable=True)
 
@@ -819,3 +820,57 @@ def test_fallback_disabled_when_zero(monkeypatch):
     r = pool.ask_result("st:m1", "任务")
     assert r["ok"] is False and r["status"] == "error"
     assert calls["models"] == ["m1"], "关闭回退时只打原模型，不回退到 m2"
+
+
+def test_station_memo_suppresses_cross_worker_fallback(monkeypatch):
+    """批次内整站故障：首个工人把同站回退链打死后，同站后续工人只发被点名的主调用、
+    不再各自回退撞死站——抑制 N×(1+fallback_models) 的跨工人额度放大。
+
+    确定性起见按序调用同一共享 memo（并发批次里三个工人几乎同时起跑，计数会抖动）；
+    memo 语义与并发无关，串行即可验证抑制逻辑。
+    """
+    calls = {"models": []}
+
+    class AllBoom:
+        def __init__(self, base_url, api_key, model, **kw):
+            self.model = model
+
+        def chat(self, messages):
+            calls["models"].append(self.model)
+            raise LLMError("rate_limit", "429", retryable=True)  # 整站持续可重试失败
+
+    monkeypatch.setattr(orch, "LLMClient", AllBoom)
+    pool = _fallback_pool()  # st: m1/m2/m3 同站；fallback_models 默认 2
+    memo = StationMemo()
+
+    # 工人1：主调用 m1 失败 → 回退链 m2、m3（均失败）→ 链耗尽记该站死。共 3 次网络。
+    pool.ask_result("st:m1", "任务", memo=memo)
+    assert calls["models"] == ["m1", "m2", "m3"], "首个工人应走完同站回退链再判死"
+
+    # 工人2：主调用 m2（点名要求，不能省），但该站本轮已死 → 不再回退，只 1 次网络。
+    before = len(calls["models"])
+    r2 = pool.ask_result("st:m2", "任务", memo=memo)
+    assert r2["ok"] is False and r2["status"] == "error"
+    assert len(calls["models"]) - before == 1, "同站后续工人应只发主调用、不再回退撞死站"
+    assert calls["models"][-1] == "m2", f"最后一次调用应是 m2 主调用，实际={calls['models'][-1]}"
+
+
+def test_memo_absent_preserves_full_fallback_chain(monkeypatch):
+    """不传 memo（顺序单发 / 外部主直调 ask_result）⇒ 回退行为逐字不变：仍走完整同站链。
+
+    与上一个用例对照，证明抑制只在批次共享 memo 时发生，绝不波及单发路径。
+    """
+    calls = {"models": []}
+
+    class AllBoom:
+        def __init__(self, base_url, api_key, model, **kw):
+            self.model = model
+
+        def chat(self, messages):
+            calls["models"].append(self.model)
+            raise LLMError("rate_limit", "429", retryable=True)
+
+    monkeypatch.setattr(orch, "LLMClient", AllBoom)
+    pool = _fallback_pool()
+    pool.ask_result("st:m1", "任务")  # 无 memo
+    assert calls["models"] == ["m1", "m2", "m3"], "无 memo 时单发必须仍打满同站回退链"

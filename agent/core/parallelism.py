@@ -20,6 +20,38 @@ from concurrent.futures import Future, wait
 from .constants import ST_ERROR
 
 
+class StationMemo:
+    """一次并行批次内共享的「某中转站本轮已探明不可用」记忆（见 _run_parallel）。
+
+    为什么需要（治理跨工人回退放大）：ask_many / collect / vote 把一批工人**并发**打出，
+    若它们同属一个中转站（base_url + api_key 相同）而该站整站故障，旧实现里每个工人各自
+    独立走一遍同站回退链（每链最多 fallback_models 次），彼此不知道对方已经在打同一批死站
+    模型——N 个同站工人最坏被放大成 N×(1+fallback_models) 次冗余网络、白烧额度。
+    批次内共享本记忆后：某个工人的回退链因**可重试瞬时失败**彻底耗尽 ⇒ 记该站「本轮已死」，
+    同站后续工人只做自己被点名要求的那一次主调用（不能省），不再额外回退去撞已判死的站。
+
+    边界：
+    - 只记可重试瞬时失败的站（终态认证失败由当日隔离承接，本就不回退，无需此处再判）；
+    - 仅服务单次并行批次，随 _run_parallel 结束即弃；
+    - 顺序单发（ask / 外部主直接调 ask_result）不传 memo ⇒ 回退行为逐字不变。
+    多线程共享 ⇒ 自带锁。
+    """
+
+    __slots__ = ("_dead", "_lock")
+
+    def __init__(self) -> None:
+        self._dead: set[tuple[str, str]] = set()
+        self._lock = threading.Lock()
+
+    def mark_dead(self, station: tuple[str, str]) -> None:
+        with self._lock:
+            self._dead.add(station)
+
+    def is_dead(self, station: tuple[str, str]) -> bool:
+        with self._lock:
+            return station in self._dead
+
+
 class ParallelMixin:
     """并行派工能力，混入 WorkerPool 使用。
 
@@ -123,8 +155,9 @@ class ParallelMixin:
         if not workers:
             return {}
         sem = threading.Semaphore(min(len(workers), self.cfg.max_workers))
+        memo = StationMemo()  # 本批次共享：同站整故障时抑制跨工人回退放大
         futs = {
-            self._spawn(lambda w=w: self.ask_result(w, prompt, system), sem): w
+            self._spawn(lambda w=w: self.ask_result(w, prompt, system, memo=memo), sem): w
             for w in workers
         }
         return self._wait_gather(futs, timeout, on_done=on_done)

@@ -36,7 +36,7 @@ class _InstantClient:
     def __init__(self, *_a, **_k):
         pass
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages):
         return {"role": "assistant", "content": "hi"}
 
     def close(self):
@@ -147,7 +147,7 @@ def test_duplicate_mcp_tool_names_skipped_not_fatal(monkeypatch):
 def test_vote_threshold_string_coerced(monkeypatch):
     pool = _pool("m1,m2")
 
-    def spy(worker, prompt, system=None):
+    def spy(worker, prompt, system=None, memo=None):
         # 投票阶段（ballot 提示词）统一投 1 号；收集阶段给方案文本
         ans = "1" if "请只输出你认可方案的编号" in prompt else "方案内容"
         return {"worker": worker, "ok": True, "status": "ok", "answer": ans, "error": ""}
@@ -224,7 +224,7 @@ def test_run_parallel_uses_daemon_threads(monkeypatch):
     pool = _pool("m1,m2")
     flags: list[bool] = []
 
-    def spy(worker, prompt, system=None):
+    def spy(worker, prompt, system=None, memo=None):
         flags.append(threading.current_thread().daemon)
         return {"worker": worker, "ok": True, "status": "ok", "answer": "a", "error": ""}
 

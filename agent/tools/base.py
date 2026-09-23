@@ -17,16 +17,6 @@ class Tool:
     def execute(self, args: dict, ctx: Any | None = None) -> str:
         raise NotImplementedError
 
-    def to_openai_schema(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.input_schema or {"type": "object", "properties": {}},
-            },
-        }
-
 
 class ToolResult(str):
     """工具返回值：默认（裸 str）即成功；需要显式判失败时返回 `ToolResult(text, ok=False)`。
@@ -103,9 +93,6 @@ class ToolRegistry:
             {"name": t.name, "description": t.description}
             for t in self._tools.values()
         ]
-
-    def openai_schemas(self) -> list[dict]:
-        return [t.to_openai_schema() for t in self._tools.values()]
 
     def run(self, name: str, arguments: str | dict, ctx: Any | None = None) -> dict:
         """执行一次工具调用，返回结构化 {ok, result, error}（#3：让 ok 反映真实成败）。

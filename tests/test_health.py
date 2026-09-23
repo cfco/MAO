@@ -328,7 +328,7 @@ class _Boom:
         self.model = model  # 真 LLMClient 也暴露该属性，主智能体记档要用
         self.closed = 0
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages):
         raise LLMError("api", "boom", retryable=False)
 
     def close(self):
@@ -353,7 +353,7 @@ class _Transient:
         self.model = model
         self.closed = 0
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages):
         raise LLMError("timeout", "boom", retryable=True)
 
     def close(self):

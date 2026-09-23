@@ -135,7 +135,7 @@ def test_default_fanout_is_bounded(monkeypatch):
     pool = _pool(",".join(f"m{i}" for i in range(1, 9)), cap=3)
     calls: list[str] = []
 
-    def spy(worker, prompt, system=None):
+    def spy(worker, prompt, system=None, memo=None):
         calls.append(worker)
         return {"worker": worker, "ok": True, "status": "ok",
                 "answer": f"答案[{worker}]", "error": ""}
@@ -164,7 +164,7 @@ def test_explicit_workers_are_not_capped(monkeypatch):
     pool = _pool("m1,m2,m3,m4,m5,m6", cap=2)
     calls: list[str] = []
 
-    def spy(worker, prompt, system=None):
+    def spy(worker, prompt, system=None, memo=None):
         calls.append(worker)
         return {"worker": worker, "ok": True, "status": "ok",
                 "answer": f"答案[{worker}]", "error": ""}
@@ -227,7 +227,7 @@ def test_ballot_ignores_error_text(monkeypatch):
     pool = _pool("m1,m2,m3", cap=3)
     a, b, c = pool.names()
 
-    def fake(worker, prompt, system=None):
+    def fake(worker, prompt, system=None, memo=None):
         if worker == a:
             return {"worker": a, "ok": True, "status": "ok", "answer": "1", "error": ""}
         return {"worker": worker, "ok": False, "status": "error",

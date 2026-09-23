@@ -284,10 +284,13 @@ class Config:
 
     @property
     def retire_days(self) -> int:
-        """连续几个"运行日"调用失败后自动下线（在 model_registry.txt 加 #）。
+        """连续几个"运行日"出现**终态不可重试失败**后自动下线（在 model_registry.txt 加 #）。
 
         "运行日"= 程序实际启动并工作过的自然日（见 health.py active_dates）：
         没运行项目的那天不计入、也不打断连击。默认 7（collaboration.retire_days）。
+        注意：下线只由"重试也没用"的终态失败（认证失败、非重试类 4xx）累积驱动；
+        超时/429/5xx 等可重试瞬时失败只进短时冷却，永不计入此处、也就不会触发自动下线
+        （见 health.py「由此对自动下线的影响」）。
         """
         return self.as_int(
             self.collab_cfg.get("retire_days", 7), "collaboration.retire_days", 7, minimum=1
@@ -318,7 +321,7 @@ class Config:
 
     @property
     def model_health_path(self) -> Path:
-        """模型健康档案（当日失败隔离/连续失败下线记录）落盘位置。
+        """模型健康档案（当日终态失败隔离/连续运行日下线记录）落盘位置。
 
         优先级：环境变量 MAO_HEALTH_FILE > collaboration.health_file > 默认
         data/model_health.json。环境变量主要是给测试用：每个用例指到

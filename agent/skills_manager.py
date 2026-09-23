@@ -4,8 +4,9 @@
   skills/<技能名>/SKILL.md    # 开头 YAML frontmatter: name + description；正文为操作指引
   skills/<技能名>/scripts/    # 可选，Python 脚本（从 argv[1] 接收 JSON 参数，stdout 输出结果）
 
-省上下文的关键：启动时只把每个技能的 name+description 注入系统提示词，
-Agent 判断相关后再用 load_skill 工具读取全文。
+本项目自带的主循环已移除（改由外部主 AI 驱动），故这里不再"启动即把技能概览注入系统
+提示词"——外部主按需调用：先经 list_tools/自身机制了解有技能可用，判断相关后再用
+load_skill 工具读取全文。本模块只负责扫描、按需加载全文、执行脚本三件事。
 """
 from __future__ import annotations
 
@@ -76,12 +77,6 @@ class SkillManager:
             return data if isinstance(data, dict) else {}
         except yaml.YAMLError:
             return {}
-
-    def overview(self) -> str:
-        """技能清单文本（注入系统提示词用）。"""
-        if not self.skills:
-            return "（暂无技能。可在 skills/ 目录按规范添加：每个技能一个文件夹，内含 SKILL.md）"
-        return "\n".join(f"- {name}: {info['description']}" for name, info in self.skills.items())
 
     def load_full(self, name: str) -> str:
         info = self.skills.get(name)

@@ -138,7 +138,7 @@ def test_bridge_ask_fallback_uses_llm_config(monkeypatch):
                      temperature=0.7, timeout=120.0, max_retries=2):
             captured.update(temperature=temperature, timeout=timeout, max_retries=max_retries)
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             return {"content": "ok"}
 
     monkeypatch.setattr(br, "LLMClient", FakeClient)
@@ -166,7 +166,7 @@ def test_bridge_fallback_participates_in_health(tmp_path, monkeypatch):
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages, tools=None):
+        def chat(self, messages):
             raise LLMError("auth", "bad key", retryable=False)  # 终态不可重试
 
         def close(self):

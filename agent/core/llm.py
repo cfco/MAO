@@ -1,4 +1,4 @@
-"""LLM 适配层：统一走 OpenAI 兼容协议（chat.completions + function calling）。
+"""LLM 适配层：统一走 OpenAI 兼容协议（chat.completions）。
 
 DeepSeek / Kimi / 豆包(方舟) / OpenAI / 本地 Ollama 均兼容，换模型只改配置。
 
@@ -102,17 +102,17 @@ class LLMClient:
 
     # ---------- 对外接口 ----------
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict]) -> dict:
         """发起一轮对话补全，返回标准化的 assistant 消息 dict。
 
-        - 无工具调用：{"role": "assistant", "content": "..."}
-        - 有工具调用：额外带 "tool_calls": [{id, type, function: {name, arguments}}]
-        - 失败：抛 LLMError（可重试错误已在此自动退避重试）
+        返回 {"role": "assistant", "content": "..."}。工人池是纯文本执行器，本适配层
+        不启用 function calling（无工具入参、不解析 tool_calls）。
+        失败：抛 LLMError（可重试错误已在此自动退避重试）。
         """
         last: LLMError | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                return self._once(messages, tools)
+                return self._once(messages)
             except LLMError as e:
                 last = e
                 if not e.retryable or attempt >= self.max_retries:
@@ -134,15 +134,13 @@ class LLMClient:
 
     # ---------- 内部 ----------
 
-    def _once(self, messages: list[dict], tools: list[dict] | None) -> dict:
+    def _once(self, messages: list[dict]) -> dict:
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "timeout": self.timeout,
         }
-        if tools:
-            kwargs["tools"] = tools
         try:
             resp = self.client.chat.completions.create(**kwargs)
         except APITimeoutError as e:
@@ -164,20 +162,7 @@ class LLMClient:
         except Exception as e:  # noqa: BLE001 - 兜底：未知错误保守判定为不可重试
             raise LLMError(ERR_OTHER, f"{type(e).__name__}: {e}", retryable=False) from e
         msg = _first_choice(resp)
-        out: dict = {"role": "assistant", "content": msg.content or ""}
-        if getattr(msg, "tool_calls", None):
-            out["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "{}",
-                    },
-                }
-                for tc in msg.tool_calls
-            ]
-        return out
+        return {"role": "assistant", "content": msg.content or ""}
 
     @staticmethod
     def _backoff(attempt: int, error_type: str) -> float:

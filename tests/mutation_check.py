@@ -28,7 +28,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     with _shared_lock:
         inst = _shared_instances.get(key)
         if inst is None:
-            inst = ModelHealth(key)
+            inst = ModelHealth(key, registry_path, retire_days)
             _shared_instances[key] = inst
         return inst""",
         """    return ModelHealth(Path(store_path))""",
@@ -41,7 +41,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     with _shared_lock:
         inst = _shared_instances.get(key)
         if inst is None:
-            inst = ModelHealth(key)
+            inst = ModelHealth(key, registry_path, retire_days)
             _shared_instances[key] = inst
         return inst""",
         """    return ModelHealth(Path(store_path))""",
@@ -148,6 +148,13 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "        self._fallback_models = self.cfg.fallback_models",
         "        self._fallback_models = 0  # mutated: 关闭回退",
         "tests/test_core.py::test_fallback_to_peer_on_retryable_failure",
+    ),
+    (
+        "M21 批次死站记忆不再抑制同站回退",
+        "agent/core/orchestrator.py",
+        "                if e.retryable and fallbacks_left > 0 and not _station_dead_now():",
+        "                if e.retryable and fallbacks_left > 0:  # mutated: 忽略批次死站记忆",
+        "tests/test_core.py::test_station_memo_suppresses_cross_worker_fallback",
     ),
 ]
 

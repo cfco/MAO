@@ -35,7 +35,7 @@ from .constants import (
 )
 from .health import ModelHealth, get_health
 from .llm import LLMClient, LLMError
-from .parallelism import ParallelMixin
+from .parallelism import ParallelMixin, StationMemo
 from .voting import VotingMixin
 
 
@@ -248,7 +248,8 @@ class WorkerPool(ParallelMixin, VotingMixin):
         if notice:
             print(notice, file=sys.stderr)  # stderr：bridge/--stream 的 stdout 必须纯净
 
-    def ask_result(self, worker: str, prompt: str, system: str | None = None) -> dict:
+    def ask_result(self, worker: str, prompt: str, system: str | None = None,
+                   memo: StationMemo | None = None) -> dict:
         """派工核心：返回结构化结果 {worker, ok, status, answer, error}（永不抛异常）。
 
         全部派工路径（ask / ask_many / collect / vote / run_review）的唯一事实源：
@@ -267,7 +268,7 @@ class WorkerPool(ParallelMixin, VotingMixin):
             return {"worker": worker, "ok": False, "status": ST_QUARANTINED, "answer": "",
                     "error": (f"子智能体 '{worker}' 今日调用已失败，当天隔离不再派工，"
                               "请换其它工人或明天再试")}
-        return self._call_result(p, system, prompt)
+        return self._call_result(p, system, prompt, memo=memo)
 
     def ask(self, worker: str, prompt: str, system: str | None = None) -> str:
         """派一个子任务给单个工人，返回其回答文本（含失败说明，不抛异常）。
@@ -300,6 +301,7 @@ class WorkerPool(ParallelMixin, VotingMixin):
     def _call_result(
         self, p: AgentProfile, system: str | None, prompt: str,
         tried: set[str] | None = None, fallbacks_left: int | None = None,
+        memo: StationMemo | None = None,
     ) -> dict:
         """真正打一次网络：取（或复用）LLMClient → chat → 按控制流记结构化成败。
 
@@ -313,12 +315,26 @@ class WorkerPool(ParallelMixin, VotingMixin):
         无论成败都返回 dict、不抛异常；ask_many/collect/vote 依赖该契约。
         tried          本轮已尝试过的模型名集合（防回退环 / 重复打同一模型）
         fallbacks_left 剩余可回退次数（= collaboration.fallback_models，0=关闭回退）
+        memo           本并行批次共享的「死站」记忆（见 parallelism.StationMemo）：
+                       某工人的回退链因可重试失败耗尽后记下该站，同站后续工人只做那一次
+                       主调用、不再各自回退撞死站，抑制 N×(1+fallback) 的跨工人额度放大。
+                       顺序单发不传（None）⇒ 回退行为逐字不变。
         """
         if tried is None:
             tried = set()
         if fallbacks_left is None:
             fallbacks_left = self._fallback_models
         tried.add(p.name)
+        station = (p.base_url, p.api_key)
+
+        def _station_dead_now() -> bool:
+            # 回退决策时**实时**查（非入口快照）：主调用期间同站可能已被别的工人探明死。
+            return memo is not None and memo.is_dead(station)
+
+        def _mark_station_dead() -> None:
+            if memo is not None:
+                memo.mark_dead(station)
+
         try:
             client = self._client_for(p)
             messages = [
@@ -328,23 +344,26 @@ class WorkerPool(ParallelMixin, VotingMixin):
             try:
                 resp = client.chat(messages)
             except LLMError as e:
-                # 可重试的瞬时错误 + 同站另有可用模型 ⇒ 回退重试（避免一次抖动废一额度）
-                if e.retryable and fallbacks_left > 0:
+                # 可重试的瞬时错误 + 同站另有可用模型 + 本轮该站未探明死 ⇒ 回退重试
+                if e.retryable and fallbacks_left > 0 and not _station_dead_now():
                     fb = self._fallback_target(p, tried)
                     if fb is not None:
                         # 当前模型记为瞬时失败（只冷却，当天仍可回来），换同站其它模型
                         self._record_result(p.name, ok=False, fatal=False)
-                        return self._call_result(fb, system, prompt, tried, fallbacks_left - 1)
+                        return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
                 # 不再回退：按终态与否记账（可重试耗尽只冷却；终态当日隔离）
+                if e.retryable:
+                    _mark_station_dead()  # 可重试失败耗尽 ⇒ 抑制同站后续工人的回退放大
                 self._record_result(p.name, ok=False, fatal=not e.retryable)
                 return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
                         "error": f"调用子智能体 '{p.name}' 失败 [{e.error_type}]：{e}"}
             except Exception as e:  # noqa: BLE001 - 意外异常按可重试处理，别全天拉黑
-                if fallbacks_left > 0:
+                if fallbacks_left > 0 and not _station_dead_now():
                     fb = self._fallback_target(p, tried)
                     if fb is not None:
                         self._record_result(p.name, ok=False, fatal=False)
-                        return self._call_result(fb, system, prompt, tried, fallbacks_left - 1)
+                        return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
+                _mark_station_dead()
                 self._record_result(p.name, ok=False, fatal=False)
                 return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
                         "error": f"调用子智能体 '{p.name}' 失败：{type(e).__name__}: {e}"}
@@ -352,11 +371,12 @@ class WorkerPool(ParallelMixin, VotingMixin):
             return {"worker": p.name, "ok": True, "status": ST_OK,
                     "answer": resp.get("content", "") or "(空回复)", "error": ""}
         except Exception as e:  # noqa: BLE001 - 连取 client 都失败，也不让派工崩（只冷却）
-            if fallbacks_left > 0:
+            if fallbacks_left > 0 and not _station_dead_now():
                 fb = self._fallback_target(p, tried)
                 if fb is not None:
                     self._record_result(p.name, ok=False, fatal=False)
-                    return self._call_result(fb, system, prompt, tried, fallbacks_left - 1)
+                    return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
+            _mark_station_dead()
             self._record_result(p.name, ok=False, fatal=False)
             return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
                     "error": f"调用子智能体 '{p.name}' 异常：{type(e).__name__}: {e}"}
