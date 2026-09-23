@@ -28,11 +28,6 @@ from .shell_safety import (  # shell 命令安全扫描，独立模块见 shell_
     _try_split_args,
 )
 
-# 兼容层：旧测试/代码有 `from agent.tools.builtin import _check_command_safety`，
-# 这些函数现已迁入 shell_safety.py，这里显式转发保持 import 路径不变。
-# noqa: F401 - 这些名字在本文件不直接用，是转发给外部调用方的
-from .shell_safety import _strip_wrapping_quotes as _strip_wrapping_quotes  # noqa: F401
-
 ROOT_RESOLVED = ROOT.resolve()  # 规范化后的根，用于越界比对
 
 # 允许工具访问的根目录集合。默认只有 MAO 项目根；build_builtin_tools 会按

@@ -4,7 +4,8 @@
 仍有 543 行，超「单文件 ≤500 行」约定。并行派工相关四个方法（_wait_gather /
 _effective_timeout / _spawn / _run_parallel）约 100 行，与「派工 + 健康 + pick」
 职责不同，独立成 Mixin 后——
-  - orchestrator.py 回到 ~443 行，专注池 / 派工 / 健康 / pick 轮转；
+  - orchestrator.py 专注池 / 派工 / 健康 / pick 轮转（后续新增回退 / 主参与
+    支持后又回到 ~526 行，见 TODO：超 500 行约定，后续仍需进一步拆分）；
   - parallelism.py 专注「怎么把一批 ask_result 并发打出去并限时收回」。
 
 方法通过 self 访问 WorkerPool 的 cfg / ask_result / max_workers 等，与 VotingMixin
