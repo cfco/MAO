@@ -24,7 +24,7 @@ from agent.mcp_server import build_server
 ROOT = Path(__file__).resolve().parent.parent
 
 EXPECTED_TOOLS = {
-    "ping", "list_agents", "health", "list_tools", "call_tool", "load_skill",
+    "ping", "list_agents", "health", "set_economy", "list_tools", "call_tool", "load_skill",
     "run_skill_script", "ask", "ask_many", "ask_vote", "run_review",
 }
 

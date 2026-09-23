@@ -41,6 +41,10 @@ llm:
   max_retries: ${LLM_MAX_RETRIES:-2}
 
 collaboration:
+  # 省 token 开关（二元）：true=主智能体在派工协作时优先省自己的 token。
+  # MAO 层只把这个开关随协议带出/可改，**不会**自行判断"分工还是重复验证"，
+  # 模式判断全部留给外部主（见 docs/外部主接入指南.md §3.1 set_economy）。
+  economy: ${COLLAB_ECONOMY:-false}
   max_workers: ${COLLAB_MAX_WORKERS:-3}
   max_participants: ${COLLAB_MAX_PARTICIPANTS:-5}
   vote_threshold: ${COLLAB_VOTE_THRESHOLD:-0.5}

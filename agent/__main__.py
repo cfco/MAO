@@ -32,7 +32,7 @@ def main() -> None:
     sub.add_parser("mcp", help="以标准 MCP server（stdio）接入宿主：Claude Desktop / Cursor / Qoder 等")
 
     p_call = sub.add_parser("call", help="单发一条指令即退出（脚本接入用）")
-    p_call.add_argument("cmd", help="指令名：ping/list_agents/health/list_tools/call_tool/"
+    p_call.add_argument("cmd", help="指令名：ping/list_agents/health/set_economy/list_tools/call_tool/"
                                      "load_skill/run_skill_script/ask/ask_many/ask_vote/run_review")
     p_call.add_argument("payload", nargs="?", default="",
                         help='JSON 参数（省略则从 stdin 读一行），如 \'{"prompt":"...","agent":"x"}\'')

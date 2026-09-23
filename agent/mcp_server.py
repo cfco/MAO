@@ -55,6 +55,10 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
     def health() -> dict:
         return _h({"cmd": "health"})
 
+    @app.tool(name="set_economy", description="省 token 开关（二元）：value 为 true/false，返回切换后的真实状态；非法值 ok:false 并保持原值")
+    def set_economy(value: bool) -> dict:
+        return _h({"cmd": "set_economy", "value": value})
+
     @app.tool(name="list_tools", description="可用本地工具清单（内置 + MCP + Skill）")
     def list_tools() -> dict:
         return _h({"cmd": "list_tools"})

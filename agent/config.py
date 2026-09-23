@@ -45,6 +45,17 @@ def _warn_bad_value(key: str, value: Any, default: Any) -> None:
     _bad_value_logged.add(key)
 
 
+def _warn_bad_bool(key: str, value: Any, default: Any) -> None:
+    """布尔配置值异常时告警一次（与 _warn_bad_value 同源，提示语区分类型）。"""
+    if key in _bad_value_logged:
+        return
+    print(
+        f"[配置警告] {key} 的值 {value!r} 不是合法布尔（true/false/1/0），已按默认值 {default} 处理",
+        file=sys.stderr,
+    )
+    _bad_value_logged.add(key)
+
+
 def _interpolate(value: Any) -> Any:
     """递归把字符串里的 ${VAR} / ${VAR:-默认值} 替换为环境变量值。
 
@@ -261,6 +272,27 @@ class Config:
         _warn_bad_value(key, value, default)
         return list(default)
 
+    @staticmethod
+    def as_bool(value: Any, key: str, default: bool) -> bool:
+        """把配置值安全转成 bool：非法值警告一次并回退默认值，不让程序崩。
+
+        接受 Python 布尔、0/1 数字，以及字符串 "true"/"false"/"yes"/"no"/"1"/"0"
+        （不区分大小写）。其余值（如配置写成了 "省 token" 这类描述文本）视为
+        类型错误：警告一次 + 回退默认，与 as_int / as_float 的态度一致。
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("1", "true", "yes", "on"):
+                return True
+            if text in ("0", "false", "no", "off"):
+                return False
+        _warn_bad_bool(key, value, default)
+        return bool(default)
+
     @property
     def max_workers(self) -> int:
         return self.as_int(self.collab_cfg.get("max_workers", 3), "collaboration.max_workers", 3,
@@ -278,6 +310,19 @@ class Config:
         """
         return self.as_int(
             self.collab_cfg.get("max_participants", 5), "collaboration.max_participants", 5
+        )
+
+    @property
+    def economy(self) -> bool:
+        """省 token 开关（二元）：true=主智能体在派工协作时优先省自己的 token。
+
+        语义边界：MAO 层只负责「启动时读配置作为初始值 + 允许外部主经
+        bridge `set_economy` 指令运行期切换」，**绝不**在这里判断"当前任务
+        该用分工还是重复验证"——模式判断全部留给外部主。此属性只在
+        Bridge 构造时读取一次，作为运行态开关的初始值（见 bridge.py）。
+        """
+        return self.as_bool(
+            self.collab_cfg.get("economy", False), "collaboration.economy", False
         )
 
     # ---------- 模型健康档案（collaboration.*） ----------

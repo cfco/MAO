@@ -25,6 +25,7 @@
 | `ask_many` | 同一子任务并行派多人，多方案对比、交叉验证；**输出按入参工人顺序排列（确定性）**；同时返回 `workers`（逐工人结构化 `ok`/`status`/`answer`/`elapsed_ms`）与 `results`（文本）；`timeout` 对收集阶段整体限时 |
 | `ask_vote` | 两步投票取共识：先并行收集各工人方案，再让全体对**确定性编号**的方案投票，超阈值（默认 `collaboration.vote_threshold`=0.5 过半）即宣布共识并给出胜出方案全文。**共识比例的分母只算有效票**——废票（投了不存在编号）不进分母、不参与计票，只在结果里提示张数。**主参与（方案 A）**：可传 `master_contribution`（主在外部算好的方案文本）——它作为"只入候选、不出力"的候选追加到末尾（编号=工人候选数+1，工人编号不变），MAO 不调用主、不耗额度；空值/非字符串忽略；工人全失败但有主方案时主方案兜底直接胜出 |
 | `run_review` | 外部主给初稿（+可选背景/验收标准），多个工人只当评审团挑错、给编号改进建议，返回结构化 `reviews` |
+| `set_economy` | **省 token 开关**（二元，方案 B）：`{"cmd":"set_economy","value":true}` 运行期切换，响应回显新状态 `economy`；非法值 `ok:false` 且开关保持原值。MAO 只透传开关、**不判断**"分工还是重复验证"——模式判断全部留给外部主 |
 
 派工基础设施（WorkerPool）：
 - **参与人数上限**：`ask_many`/`collect`/`vote` 的**缺省名单**由 `pick()` 产生——按池内确定性顺序取前 `collaboration.max_participants`（默认 5）个当前可派工人（跳过冷却与当日隔离）；显式传入的名单不受该上限约束。池子一站多模型轻易几十个，全池派发会一次打出几十个请求，而并发上限只有个位数 → 尾部批次必被整体限时丢弃、额度白烧；
@@ -38,7 +39,7 @@
 
 同一 `Bridge` 内核另有两种外壳，行为与逐字契约和裸协议一致（外壳只做参数拼装/透传，不复制业务逻辑）：
 
-- **`python -m agent mcp`（MCP server，stdio）**：把 11 条指令逐一映射为 MCP 工具（`mcp>=2` 官方 SDK 的 `MCPServer`），支持 MCP client 的宿主（Claude Desktop / Cursor / Qoder 等）只需在其配置里加一段 `{"command": "uv", "args": ["run", "mao", "mcp"], "cwd": "<项目根>"}` 即接入，免写子进程驱动代码。
+- **`python -m agent mcp`（MCP server，stdio）**：把 12 条指令逐一映射为 MCP 工具（`mcp>=2` 官方 SDK 的 `MCPServer`），支持 MCP client 的宿主（Claude Desktop / Cursor / Qoder 等）只需在其配置里加一段 `{"command": "uv", "args": ["run", "mao", "mcp"], "cwd": "<项目根>"}` 即接入，免写子进程驱动代码。
 - **`python -m agent call <指令> [JSON]`（one-shot）**：单发一条指令、stdout 打印一行 JSON 响应即退出，供脚本/技能包在"每次调用都是新进程"的宿主里使用；JSON 参数可作位置参数或从 stdin 读一行（位置参数里的 `cmd` 优先）。退出码：0=ok:true，1=指令失败（ok:false），2=参数 JSON 坏。注意每次调用都付进程冷启动成本（配置加载；配了 `mcp_servers` 时还含 MCP 首连），高频场景仍应用长驻的 bridge/mcp 外壳。
 
 ## 3. 运行模型（MAO 侧无状态）
@@ -91,13 +92,13 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 |---|---|
 | `agents` | 智能体池，按"站"组织（一 Endpoint+Key 挂多 model）；`models` 逗号分隔，`#` 前缀临时屏蔽，`@128k` 标注上下文窗口，可选 `tags`（能力标签，供外部主选路）、`note` |
 | `llm` | 兜底单模型 + temperature / timeout / max_retries |
-| `collaboration` | max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails / cooldown_base / health_file / retire_days（连续几个运行日出现终态失败即自动下线，默认 7；瞬时失败只冷却不下线）/ fallback_models（同站回退重试上限，默认 2，0=关闭） |
+| `collaboration` | economy（省 token 开关，二元，默认 false，初始值随 ready 带出、可被 set_economy 运行期切换）/ max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails / cooldown_base / health_file / retire_days（连续几个运行日出现终态失败即自动下线，默认 7；瞬时失败只冷却不下线）/ fallback_models（同站回退重试上限，默认 2，0=关闭） |
 | `tools` | shell_timeout / workspace（额外允许工具访问的项目目录，默认为空=仅本项目根） |
 | `mcp_servers` | MCP 接入列表 |
 
 **配置分层**（`load_config`）：`${VAR}` 的取值优先级为 **shell 环境变量 > `.env` > `model_registry.txt`**。`config.yaml` 只留结构骨架（`${VAR}` / `${VAR:-默认}` 引用）；`.env` 承载**全部配置值**（端点/KEY/LLM 参数/协作参数，保密不进 git，AI 负责维护内容）；`model_registry.txt` 承载**全部模型名**（`NODE_A_MODELS` / `LLM_MODEL` 等，随仓库维护，git pull 即更新，它的 mtime 参与配置缓存失效判断，也是自动下线改写目标）。
 
-**数值配置容错**：所有数值项（`max_workers`/`max_participants`/`retire_days`/`shell_timeout`/`vote_threshold`/`llm.timeout` 等）统一走 `Config.as_int()` / `as_float()`。类型写错（如 `max_participants: five`）不再抛 `ValueError` 崩启动，改为**警告一次 + 回退默认值**（提示走 stderr），与"缺 key 不阻启动、只警告"的既有态度保持一致。分层边界由双向守卫闭环：`model_registry.txt` 绝不出现 `*_KEY` 行（`test_real_registry_never_carries_key_values` 守着，真实 key 不会随 git 泄漏）；`.env` 出现 `*_MODEL(S)` 模型清单变量时重载配置即打 `[配置分层提醒]`（只报变量名绝不回显值——这些变量会盖住 registry 的 git 更新与自动下线）。`.env` 值支持 ` #` 行内注释（剥离后才是真值）。
+**数值配置容错**：所有数值项（`max_workers`/`max_participants`/`retire_days`/`shell_timeout`/`vote_threshold`/`llm.timeout` 等）统一走 `Config.as_int()` / `as_float()`；布尔项（`collaboration.economy`）走 `Config.as_bool()`。类型写错（如 `max_participants: five` 或 `economy: 省token`）不再抛 `ValueError` 崩启动，改为**警告一次 + 回退默认值**（提示走 stderr），与"缺 key 不阻启动、只警告"的既有态度保持一致。分层边界由双向守卫闭环：`model_registry.txt` 绝不出现 `*_KEY` 行（`test_real_registry_never_carries_key_values` 守着，真实 key 不会随 git 泄漏）；`.env` 出现 `*_MODEL(S)` 模型清单变量时重载配置即打 `[配置分层提醒]`（只报变量名绝不回显值——这些变量会盖住 registry 的 git 更新与自动下线）。`.env` 值支持 ` #` 行内注释（剥离后才是真值）。
 
 ## 9. 质量门禁
 

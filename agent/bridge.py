@@ -14,6 +14,7 @@
   {"cmd":"ping"}
   {"cmd":"list_agents"}                                   （池清单，含能力标签，不含 key）
   {"cmd":"health"}                                        （各子 AI 可用性快照：冷却/当日隔离/标签）
+  {"cmd":"set_economy","value":true}                      （运行期切"省 token"开关，返回新状态）
   {"cmd":"list_tools"}
   {"cmd":"call_tool","name":"run_shell","args":{"command":"dir"}}
   {"cmd":"load_skill","name":"example_hello"}
@@ -59,6 +60,21 @@ def _norm_workers(raw) -> list[str] | None:
     return [str(w) for w in raw if str(w).strip()] or None
 
 
+def _parse_economy(raw) -> bool | None:
+    """把 set_economy 的 value 容错解析成 bool；非法值返回 None（调用方保持原值）。"""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+    return None
+
+
 class Bridge:
     """一个 bridge 连接：共享的注册表 + 技能 + MCP 连接组 + 工人池 + 兜底单模型。"""
 
@@ -78,6 +94,9 @@ class Bridge:
             self.mcp_status = list(self.mcp_group.status)
             register_group_tools(self.registry, self.mcp_group)
         self.workers = WorkerPool(cfg)
+        # 省 token 开关（运行态）：初始值来自 collaboration.economy（.env COLLAB_ECONOMY）。
+        # 外部主可经 set_economy 指令运行期切换；MAO 只透传开关、不做模式判断。
+        self._economy: bool = cfg.economy
         # 兜底单模型客户端（ask 未指定 agent 时用）：首次访问创建后复用，
         # 避免每次 ask 都新建一个 OpenAI 客户端（各自一套 httpx 连接池，用完即弃）。
         self._fallback_llm: LLMClient | None = None
@@ -122,8 +141,23 @@ class Bridge:
         if cmd == "list_tools":
             return {"ok": True, "tools": self.registry.info_list()}
         if cmd == "health":
-            # 每个子 AI 的当前可用性快照（冷却/当日隔离/能力标签），供外部主派工前预检
-            return {"ok": True, "workers": self.workers.health_status()}
+            # 每个子 AI 的当前可用性快照（冷却/当日隔离/能力标签），供外部主派工前预检。
+            # 顺带回显 economy 开关：外部主每次派工前都无需记忆上次 set 的状态。
+            out = {"ok": True, "workers": self.workers.health_status(), "economy": self._economy}
+            return out
+        if cmd == "set_economy":
+            # 运行期切"省 token"开关（二元）。非法值警告并保持原值：
+            # 返回 ok:false + error + 当前真实状态，调用方据此知道没切动。
+            val = _parse_economy(req.get("value"))
+            if val is None:
+                print(
+                    f"[bridge] set_economy 收到非法值 {req.get('value')!r}，保持当前 {self._economy}",
+                    file=sys.stderr,
+                )
+                return {"ok": False, "economy": self._economy,
+                        "error": "value 必须是布尔值或 true/false/1/0 等字面量"}
+            self._economy = val
+            return {"ok": True, "economy": self._economy}
         if cmd == "call_tool":
             name = str(req.get("name", ""))
             res = self.registry.run(name, req.get("args") or {})
@@ -284,6 +318,7 @@ def serve(cfg: Config) -> None:
         "version": __version__,
         "agents": [p.name for p in bridge.cfg.agent_profiles],
         "mcp": bridge.mcp_status,
+        "economy": bridge._economy,  # 省 token 开关初始值，外部主握手即可知当前模式
     }
     sys.stdout.write(json.dumps(ready, ensure_ascii=False) + "\n")
     sys.stdout.flush()

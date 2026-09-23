@@ -152,13 +152,14 @@ echo '{"cmd":"list_agents"}' | uv run mao bridge
 - `ask`：把子任务派给某个工人（纯文本执行，无本地工具）；
 - `ask_many`：同一任务并行派多个工人，结果按入参顺序返回，含每个工人的 `ok`/耗时/状态（结构化 `workers` + 文本 `results`），适合多方案对比、交叉验证；
 - `ask_vote`：两步投票取共识（先各出方案，再对编号投票；可传 `master_contribution` 让主外部算好的方案作为候选参与对比/兜底）；
-- `run_review`：外部主给初稿，多个工人只当评审团挑错。
+- `run_review`：外部主给初稿，多个工人只当评审团挑错；
+- `set_economy`：**省 token 开关**（二元）——`{"cmd":"set_economy","value":true}` 表达"这轮协作优先省主智能体 token"；MAO 只透传/切换开关（初始值 `COLLAB_ECONOMY`，随 `ready` 与 `health` 带出），**分工 or 重复验证的模式判断完全由外部主来做**。
 
 工人是纯文本执行器（不挂本地工具）：免费模型 function calling 参差不齐，这样最稳也最安全，本地工具权始终在主智能体（外部 AI）手里。
 
 ### 外部智能体驱动（谁启动谁当主）：一条内核，三种外壳
 
-任何能起子进程、能读写文本行的智能体都能当主。`bridge` 是唯一内核（11 条无状态指令，
+任何能起子进程、能读写文本行的智能体都能当主。`bridge` 是唯一内核（12 条无状态指令，
 下表），外面有两种更省事的壳：
 
 | 接入方式 | 适合谁 | 上手成本 |
@@ -167,7 +168,7 @@ echo '{"cmd":"list_agents"}' | uv run mao bridge
 | **`uv run mao call <指令> '<JSON>'`** | 只有 shell/技能机制、每次调用起新进程的宿主（脚本、SKILL.md） | 一行命令拿一行 JSON，退出码表成败 |
 | **`uv run mao bridge`（裸协议）** | 要长驻、批量、自己管进出的深度集成驱动方 | 自写子进程驱动（逐行 JSON） |
 
-**MCP 接入**（宿主配置里加一段即可，11 条指令逐一映射为 MCP 工具）：
+**MCP 接入**（宿主配置里加一段即可，12 条指令逐一映射为 MCP 工具）：
 
 ```json
 {
@@ -203,6 +204,7 @@ stderr 也已在 bridge 启动时归一为 UTF-8：Windows 重定向流默认本
 | `{"cmd":"ping"}` | 握手，返回版本与池内智能体名 |
 | `{"cmd":"list_agents"}` | 智能体池清单（不含 key，含能力标签 tags） |
 | `{"cmd":"health"}` | 各子 AI 当前可用性快照（冷却剩余/当日隔离/标签），派工前预检 |
+| `{"cmd":"set_economy","value":true}` | 省 token 开关（二元）：运行期切换，响应回显 `economy`；非法值 `ok:false` 并保持原值 |
 | `{"cmd":"list_tools"}` | 本地工具清单（内置+MCP+Skill） |
 | `{"cmd":"call_tool","name":"run_shell","args":{...}}` | 执行本地工具 |
 | `{"cmd":"load_skill","name":"example_hello"}` | 读技能全文 |
