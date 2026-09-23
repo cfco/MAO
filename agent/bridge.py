@@ -203,7 +203,12 @@ class Bridge:
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
-            v = self.workers.vote(prompt, _norm_workers(req.get("workers")), req.get("threshold"))
+            v = self.workers.vote(
+                prompt,
+                _norm_workers(req.get("workers")),
+                req.get("threshold"),
+                master_contribution=req.get("master_contribution"),
+            )
             # #2：vote 返回结构化 {ok, consensus, report}——ok=投票是否真正产出结果，
             # consensus=是否过半；无法投票时 ok:false 且带 error。
             out = {"ok": v["ok"], "result": v["report"], "consensus": v["consensus"]}

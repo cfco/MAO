@@ -102,13 +102,21 @@ class VotingMixin:
         voters: list[str] | None = None,
         threshold: float | None = None,
         timeout: float | None = None,
+        master_contribution: str | None = None,
     ) -> tuple[str, str, str] | None:
         """对已有候选方案投票择优（复用两步投票的第二步，不重复收集阶段）。
 
         返回 (胜出工人名, 胜出全文, 票况摘要)；无解析选票返回 None。
         供调用方「候选已就绪、只想复用投票择一」的场景（程序化公共 API，见 WorkerPool 类文档）。
         voters 缺省取 pick() 的可用工人子集（受 collaboration.max_participants 约束）。
+        主参与（方案 A）：`master_contribution` 作为追加候选（"@master"）参与择优，
+        空值/空白视为未提供。这里是纯择优接口，无"全败兜底"特殊处理——候选集合由
+        调用方显式给出，是否给主方案由调用方决定。
         """
+        if isinstance(master_contribution, str):
+            master_text = master_contribution.strip()
+            if master_text:
+                candidates = [*candidates, ("@master", master_text)]
         # 审计 P1：显式传入的 threshold 也过 as_float——外部主经 bridge 传 JSON 时
         # "threshold":"0.5"（字符串）会原样流到 `ratio >= th` 抛 TypeError。
         # 与数值配置同一态度：类型错警告一次、回退默认值，不阻投票。
@@ -136,6 +144,7 @@ class VotingMixin:
         workers: list[str] | None = None,
         threshold: float | None = None,
         timeout: float | None = None,
+        master_contribution: str | None = None,
     ) -> dict:
         """两步投票：先让每个工人给出方案，再让全体工人对方案编号投票。
 
@@ -145,6 +154,12 @@ class VotingMixin:
         2) 把候选方案编号（附 80 字符预览）重新发给全体工人，每人选一个编号。
         3) 统计得票：最高票数 / 总票数 >= 阈值（默认 collaboration.vote_threshold，
            通常取 0.5，即过半共识）则宣布达成共识，否则列出票况请主智能体裁决。
+
+        主参与（方案 A）：`master_contribution` 是主智能体在外部算好的方案文本，
+        MAO 侧不调用主（主在 bridge/外部），只把它作为"只入候选、不出力"的候选
+        **追加到末尾**（编号 = 工人候选数 + 1，不改变工人候选的确定性编号）。
+        空值/空白/N 串按未提供处理（行为与不传逐字一致）。工人全部失败但主方案
+        存在时，主方案作为唯一候选直接胜出（ok:true），不再报"无可用方案"。
 
         workers 缺省取 pick()（按 collaboration.max_participants 限制参与人数、
         跳过冷却与当日隔离的工人）—— 全池投票在「一站多模型」的池子里意味着
@@ -182,8 +197,27 @@ class VotingMixin:
 
         # 第一步：收集各工人方案（失败者淘汰，不进候选池；顺序确定性）
         candidates = self.collect(pool, prompt, timeout=stage_timeout)
+        # 主参与（方案 A）：主在外部算好的方案追加为候选，编号 = 工人候选数 + 1。
+        # 只入候选、不出力（MAO 不调用主），所以不占工人名额、不消耗额度，也不进
+        # 冷却/隔离/"投票人"名单；仅接受字符串（None/非字符串按未提供，行为与不传一致）。
+        master_text = (
+            str(master_contribution).strip()
+            if isinstance(master_contribution, str)
+            else ""
+        )
+        if master_text:
+            candidates = [*candidates, ("@master", master_text)]
         if not candidates:
             return {"ok": False, "consensus": False, "report": "错误：所有工人均未给出可用方案，无法投票。"}
+        # 全败兜底：工人一个方案都没有、只有主方案时，主方案即唯一答案，直接宣布
+        # 胜出（不再发起投票——无工人候选时投票没意义，只会报"结果无法解析"）。
+        if len(candidates) == 1 and candidates[0][0] == "@master":
+            return {
+                "ok": True, "consensus": True,
+                "report": "## 候选方案\n[1] @master：主智能体方案\n"
+                          "## 共识达成（1/1 票 ≥ 100%）\n"
+                          f"胜出方案（@master）：\n{master_text}",
+            }
 
         # 第二步：编号后发给全体投票
         result = self._run_ballot(candidates, pool, stage_timeout)
