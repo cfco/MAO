@@ -51,7 +51,10 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
     def list_agents() -> dict:
         return _h({"cmd": "list_agents"})
 
-    @app.tool(name="health", description="派工前预检：各子 AI 可用性快照（冷却/当日隔离/标签/延迟ms）")
+    @app.tool(name="health",
+              description="派工前预检：各子 AI 可用性快照（冷却/当日隔离/标签/延迟ms）"
+                          "+ concurrency（真实并行度 = min(max_workers, max_per_station × 站数)，"
+                          "默认每站只跑 1 个模型 ⇒ 一批要点速度就跨站点名）")
     def health() -> dict:
         return _h({"cmd": "health"})
 

@@ -46,6 +46,12 @@ collaboration:
   # 模式判断全部留给外部主（见 docs/外部主接入指南.md §3.1 set_economy）。
   economy: ${COLLAB_ECONOMY:-false}
   max_workers: ${COLLAB_MAX_WORKERS:-3}
+  # 同一中转站（base_url+api_key）同时允许在飞的请求数，默认 **1**（一站同时只跑一个模型）。
+  # 一站多模型共用同一份配额/同一条网关，并发打过去只在站端互相排队拖慢，还会把
+  # 「延迟档案」里的真实往返污染成"这个模型慢"（选路正是按这份档案裁剪）。
+  # 串行后并行度 = min(max_workers, 本值 × 本批涉及站数)：跨站才真并行。
+  # 想要旧的"只看总并发"行为就把它调大（例如 ≥ 站内模型数）。
+  max_per_station: ${COLLAB_MAX_PER_STATION:-1}
   max_participants: ${COLLAB_MAX_PARTICIPANTS:-5}
   vote_threshold: ${COLLAB_VOTE_THRESHOLD:-0.5}
   cooldown_fails: ${COLLAB_COOLDOWN_FAILS:-2}

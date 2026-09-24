@@ -27,6 +27,10 @@ _VIEW_KEEP = 500      # 档案最多保留的工人条数（防异常膨胀）
 # 探测用的极短提示：只要一次最小往返，测的是"节点响应快不快"、不关心回答内容。
 # 空回复视为无效往返（节点不可信，不计入延迟样本，见 LatencyMixin._probe_one）。
 _PROBE_PROMPT = "ping"
+# 探测等同站串行门的最长等待（秒）：门被真实派工占着（可达 llm.timeout 量级）时，
+# 探测**不陪等**——拿不到门就本轮跳过该工人。理由：探测器是后台顺带动作，为一两个
+# 样本把整轮 join 挂几分钟，既拖内存里在跑的派工，也没必要。
+_PROBE_GATE_WAIT = 2.0
 
 
 def _median(samples: list) -> float | None:
@@ -320,22 +324,33 @@ class LatencyMixin:
     # ---------- 探测与记账 ----------
 
     def _probe_one(self, name: str) -> float | None:
-        """对单个工人做一次极短往返，返回毫秒（失败/空回复返回 None）。
+        """对单个工人做一次极短往返，返回毫秒（失败/空回复/让路返回 None）。
 
         只测速、不记账：探测失败**不**进冷却、不当日隔离——那是真实派工的职责。
         否则"定时探测器"会变成自己给自己制造隔离与冷却的噪声源：节点慢一点被探成失败、
         进冷却被跳过，反而更快被摘掉。
         用探测**专用**短超时、不重试的客户端（_probe_client_for，cfg.latency_probe_timeout），
         不沿用真实派工的 llm.timeout(120s)+重试——坏节点最多拖本值秒、且只发一次请求。
+
+        同站串行（collaboration.max_per_station）对探测同样生效，而且**更要生效**：档案是
+        按延迟裁剪选路的依据，若探测请求和真实派工挤在同一条站上并发，测出来的"慢模型"
+        其实是站端排队，排名会被系统性带偏。故进门前先拿站门，拿不到（>2s 还被占着）就
+        本轮跳过这个工人，绝不陪真实请求等几分钟。
         """
         p = self.profiles.get(name)
         if p is None:
             return None
-        t0 = time.monotonic()
-        resp = self._probe_client_for(p).chat([{"role": "user", "content": _PROBE_PROMPT}])
-        if not str(resp.get("content") or "").strip():
-            return None  # 空回复不算有效往返，避免污染样本
-        return (time.monotonic() - t0) * 1000.0
+        gate = self._station_gate((p.base_url, p.api_key))
+        if not gate.acquire(timeout=_PROBE_GATE_WAIT):
+            return None  # 该站正在跑真实请求 ⇒ 本轮让路，不污染样本也不挂住探测轮
+        try:
+            t0 = time.monotonic()
+            resp = self._probe_client_for(p).chat([{"role": "user", "content": _PROBE_PROMPT}])
+            if not str(resp.get("content") or "").strip():
+                return None  # 空回复不算有效往返，避免污染样本
+            return (time.monotonic() - t0) * 1000.0
+        finally:
+            gate.release()
 
     def _record_latency(self, name: str, ms: float) -> None:
         """把一次真实成功派工的往返耗时写进延迟档案（失败只丢持久化，绝不影响派工）。"""

@@ -146,7 +146,10 @@ class Bridge:
         if cmd == "health":
             # 每个子 AI 的当前可用性快照（冷却/当日隔离/能力标签/延迟ms），供外部主派工前预检。
             # 顺带回显 economy 开关：外部主每次派工前都无需记忆上次 set 的状态。
-            out = {"ok": True, "workers": self.workers.health_status(), "economy": self._economy}
+            # 再带回 concurrency（同站串行后的**真实**并行度）：点名一批工人能并行几路不再
+            # 等于 max_workers，主据此决定"一批几个、分几轮、要不要跨站点名"。
+            out = {"ok": True, "workers": self.workers.health_status(), "economy": self._economy,
+                   "concurrency": self.workers.concurrency_status()}
             return out
         if cmd == "latency":
             # 延迟维度快照（问题5）：各工人当前延迟（往返耗时中位数，毫秒）+ 探测调度状态。

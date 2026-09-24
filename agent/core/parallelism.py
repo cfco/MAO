@@ -102,21 +102,51 @@ class ParallelMixin:
             out[fut_to_worker[fut]] = None
         return out
 
-    def _effective_timeout(self, n: int, timeout: float | None) -> float:
+    def _batch_concurrency(self, n: int, workers: list[str] | None = None) -> int:
+        """一批派工**实际**能并行几路 = min(全局上限, 每站配额 × 本批涉及站数)。
+
+        同站串行（collaboration.max_per_station，默认 1）把并行度的天花板从 max_workers
+        换成了"有几个站能同时开工"：2 站 × 1 = 2 路，即使 max_workers=3 也只有 2 路在飞，
+        第三路在同站的门上排队。批次数量必须按这个口径算，否则排队时间会被整体限时误判成
+        "尾部批次未完成"——额度已经花掉、结果却被丢弃（与 2026-09-22 那条
+        「池大 + 并发低 + 固定限时」的 P0 同源，只是这次串行是**策略**而非 bug）。
+
+        拿不到站信息（不传 workers / 名字不在池里）时退回旧口径 min(max_workers, n)，
+        行为逐字不变。
+        """
+        cap = max(1, self.cfg.max_workers)
+        if workers is None:
+            return max(1, min(cap, n))
+        profiles = getattr(self, "profiles", None) or {}
+        stations = {
+            (p.base_url, p.api_key) for w in workers
+            if (p := profiles.get(w)) is not None
+        }
+        if not stations:
+            return max(1, min(cap, n))
+        per_station = max(1, getattr(self, "_max_per_station", self.cfg.max_per_station))
+        return max(1, min(cap, per_station * len(stations)))
+
+    def _effective_timeout(self, n: int, timeout: float | None,
+                           workers: list[str] | None = None) -> float:
         """批量派工的整体限时：显式传入优先，缺省按「批次 × 单请求超时」推导。
 
-        为什么不用固定 300s：批次 = ceil(n / max_workers)，每批最长 llm.timeout 秒。
+        为什么不用固定 300s：批次 = ceil(n / 实际并行度)，每批最长 llm.timeout 秒。
         池大 + 并发低时（实测 25 个工人 / 3 并发 = 9 批），固定限时在单工人耗时超过
         「限时 ÷ 批次」秒时（>33s 就触发）会把后面所有批次判为"未完成"丢弃 ——
         票和草稿都拿不全，额度却已经花掉。自适应后限时随规模伸缩，并加 30s 余量
         给排队与序列化开销；配合 pick() 的参与人数上限，规模本身也回到可控区间。
+
+        传入 workers 时并行度按站数折算（见 _batch_concurrency）：同站串行后批次数会
+        变大，限时随之放宽。
         """
         if timeout is not None:
             return float(timeout)
         per_call = self.cfg.as_float(
             self.cfg.llm_cfg.get("timeout", 120) or 120, "llm.timeout", 120.0, minimum=1.0
         )
-        batches = max(1, -(-max(1, n) // self.cfg.max_workers))
+        concurrency = self._batch_concurrency(max(1, n), workers)
+        batches = max(1, -(-max(1, n) // concurrency))
         return batches * per_call + 30.0
 
     def _spawn(self, fn, sem: threading.Semaphore) -> Future:

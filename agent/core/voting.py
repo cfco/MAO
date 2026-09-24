@@ -67,7 +67,7 @@ class VotingMixin:
         ]
         ballot = "候选方案：\n" + "\n".join(numbered) + "\n\n请只输出你认可方案的编号数字。"
         got = self._run_parallel(
-            voters, ballot, VOTER_SYSTEM, self._effective_timeout(len(voters), timeout)
+            voters, ballot, VOTER_SYSTEM, self._effective_timeout(len(voters), timeout, voters)
         )
         votes: list[int] = []
         for res in got.values():

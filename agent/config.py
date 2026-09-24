@@ -299,6 +299,25 @@ class Config:
                            minimum=1)
 
     @property
+    def max_per_station(self) -> int:
+        """同一中转站（base_url + api_key）同时允许**在飞**的 LLM 请求数，默认 1。
+
+        为什么默认 1（"一站同时只跑一个模型"）：一站多模型只是同一份配额、同一条网关上
+        的多个入口，并发打过去并不会更快——请求在站端排队互相拖慢（实测同站 3 路并发时
+        单模型耗时数倍膨胀），更糟的是**延迟档案**（`_record_latency` 记的就是负载下的真实
+        往返）会被污染成"这个模型慢"，而实际是站被自己人堵了；选路裁剪正是按这份档案做的，
+        等于自己给自己制造错误的排名依据。串行后并行度由**站数**决定：跨站才真并行。
+
+        口径：本值是**每站**配额，与全局 `max_workers` 取交集（见
+        `ParallelMixin._batch_concurrency`）——2 站 × 1 仍只有 2 路在飞，哪怕
+        max_workers=3。设成较大值即退回旧的"只看总并发、不看站"行为。
+        """
+        return self.as_int(
+            self.collab_cfg.get("max_per_station", 1), "collaboration.max_per_station", 1,
+            minimum=1
+        )
+
+    @property
     def max_participants(self) -> int:
         """单次批量派工最多参与的工人数。<=0 表示不限（池内全部可用工人）。
 

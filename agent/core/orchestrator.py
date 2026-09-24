@@ -12,6 +12,7 @@
 
 文件结构（2026-09-22 拆分、2026-09-23 二次拆分并行段后）：
   orchestrator.py —— WorkerPool 类：派工 + 健康 + pick 轮转
+  station_gate.py —— StationGateMixin：同站串行门（一站同时只跑一个模型）+ 并发口径
   parallelism.py  —— ParallelMixin：并行派工（_wait_gather / _effective_timeout / _spawn / _run_parallel）
   voting.py       —— VotingMixin：投票两步（收集 + 编号投票）、择优
   constants.py    —— 派工结果状态码（ST_OK/ST_ERROR 等）
@@ -39,10 +40,11 @@ from .health import ModelHealth, get_health
 from .latency import LatencyMixin, LatencyStore
 from .llm import LLMClient, LLMError
 from .parallelism import ParallelMixin, StationMemo
+from .station_gate import StationGateMixin
 from .voting import VotingMixin
 
 
-class WorkerPool(LatencyMixin, ParallelMixin, VotingMixin):
+class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
     """子智能体池：纯文本执行器（不挂本地工具，兼容性最好、最安全）。
 
     免费节点友好：单节点抖动/限流/不可用不拖垮整体——连续失败进入**短时冷却**，
@@ -126,6 +128,11 @@ class WorkerPool(LatencyMixin, ParallelMixin, VotingMixin):
         self._station_models: dict[tuple[str, str], list[str]] = {}
         for nm, p in self.profiles.items():
             self._station_models.setdefault((p.base_url, p.api_key), []).append(nm)
+
+        # 同站串行门（collaboration.max_per_station，默认 1）：门表与闸门方法在
+        # StationGateMixin（见 station_gate.py），卡在被真正发请求的那一层，
+        # 批量派工 / 顺序 ask / 失败回退 / 延迟探测共用同一口径。
+        self._init_station_gates(cfg)
 
         # 回退上限：单模型可重试失败后，最多尝试的额外模型数（0=关闭回退）。
         # 既利用"一站多模型"冗余，又限制额度蔓延（整站挂时不会把同站几十个模型挨个试）。
@@ -396,25 +403,25 @@ class WorkerPool(LatencyMixin, ParallelMixin, VotingMixin):
                 {"role": "system", "content": system or WORKER_SYSTEM},
                 {"role": "user", "content": prompt},
             ]
-            t0 = time.monotonic()  # 只量真实请求往返（不含建连），与探测同口径
-            try:
-                resp = client.chat(messages)
-            except LLMError as e:
-                # 可重试的瞬时错误 + 仍有回退额度 ⇒ 换模型重试（同站优先，可跨站恢复）。
-                # 死站抑制改由 _fallback_target 内的 memo 过滤承担，不再入口一刀切。
-                if e.retryable and fallbacks_left > 0:
-                    fb = self._fallback_target(p, tried, memo)
-                    if fb is not None:
-                        # 当前模型记为瞬时失败（只冷却，当天仍可回来），换其它模型续跑
-                        self._record_result(p.name, ok=False, fatal=False)
-                        return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
-                # 不再回退：按终态与否记账（可重试耗尽只冷却；终态当日隔离）
-                if e.retryable:
-                    _mark_station_dead()  # 可重试失败耗尽 ⇒ 抑制后续工人重复撞该站
-                self._record_result(p.name, ok=False, fatal=not e.retryable)
-                return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
-                        "error": f"调用子智能体 '{p.name}' 失败 [{e.error_type}]：{e}"}
-            except Exception as e:  # noqa: BLE001 - 意外异常按可重试处理，别全天拉黑
+            resp, err, elapsed_ms = self._chat_gated(client, station, messages)
+            if err is not None:
+                # 分类与记账逐字沿用旧实现：LLMError 按 retryable 分级，其它意外异常按可重试
+                # 处理（别全天拉黑）。回退递归发生在**站点门之外**（见 _chat_gated 文档）。
+                if isinstance(err, LLMError):
+                    # 可重试的瞬时错误 + 仍有回退额度 ⇒ 换模型重试（同站优先，可跨站恢复）。
+                    # 死站抑制改由 _fallback_target 内的 memo 过滤承担，不再入口一刀切。
+                    if err.retryable and fallbacks_left > 0:
+                        fb = self._fallback_target(p, tried, memo)
+                        if fb is not None:
+                            # 当前模型记为瞬时失败（只冷却，当天仍可回来），换其它模型续跑
+                            self._record_result(p.name, ok=False, fatal=False)
+                            return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
+                    # 不再回退：按终态与否记账（可重试耗尽只冷却；终态当日隔离）
+                    if err.retryable:
+                        _mark_station_dead()  # 可重试失败耗尽 ⇒ 抑制后续工人重复撞该站
+                    self._record_result(p.name, ok=False, fatal=not err.retryable)
+                    return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
+                            "error": f"调用子智能体 '{p.name}' 失败 [{err.error_type}]：{err}"}
                 if fallbacks_left > 0:
                     fb = self._fallback_target(p, tried, memo)
                     if fb is not None:
@@ -423,11 +430,13 @@ class WorkerPool(LatencyMixin, ParallelMixin, VotingMixin):
                 _mark_station_dead()
                 self._record_result(p.name, ok=False, fatal=False)
                 return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
-                        "error": f"调用子智能体 '{p.name}' 失败：{type(e).__name__}: {e}"}
+                        "error": f"调用子智能体 '{p.name}' 失败：{type(err).__name__}: {err}"}
             self._record_result(p.name, ok=True)
             # 真实成功派工也回填延迟档案（"一套"）：探测给小请求基线，真实调用把负载下的
             # 实际表现也计入同一份中位数——两路事实共写一个账本，选路看的是同一套数字。
-            self._record_latency(p.name, (time.monotonic() - t0) * 1000.0)
+            # elapsed_ms 由 _chat_gated 在**门内**计时：排队等同站前一个请求的秒数绝不能
+            # 写进延迟档案，否则同站串行会被误记成"这个模型慢"，选路随之裁错。
+            self._record_latency(p.name, elapsed_ms)
             return {"worker": p.name, "ok": True, "status": ST_OK,
                     "answer": resp.get("content", "") or "(空回复)", "error": ""}
         except Exception as e:  # noqa: BLE001 - 连取 client 都失败，也不让派工崩（只冷却）
@@ -515,7 +524,7 @@ class WorkerPool(LatencyMixin, ParallelMixin, VotingMixin):
         if not valid:
             return []
         got = self._run_parallel(
-            valid, prompt, system, self._effective_timeout(len(valid), timeout)
+            valid, prompt, system, self._effective_timeout(len(valid), timeout, valid)
         )
         return [
             (w, got[w]["answer"])
@@ -538,7 +547,7 @@ class WorkerPool(LatencyMixin, ParallelMixin, VotingMixin):
         valid = list(dict.fromkeys(workers))
         if not valid:
             return {"valid": [], "got": {}, "elapsed": {}, "limit": 0.0}
-        limit = self._effective_timeout(len(valid), timeout)
+        limit = self._effective_timeout(len(valid), timeout, valid)
         t0 = time.monotonic()
         elapsed: dict[str, int] = {}
 
