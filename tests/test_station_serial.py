@@ -120,15 +120,13 @@ def test_cross_station_still_runs_in_parallel(monkeypatch):
     monkeypatch.setattr(orch, "LLMClient", _fake_client(tracker))
     pool = _pool([("A", "http://a", "m1,m2"), ("B", "http://b", "m1,m2")])
     try:
-        t0 = time.monotonic()
         out = pool.collect(["A:m1", "A:m2", "B:m1", "B:m2"], "p")
-        spent = time.monotonic() - t0
         assert len(out) == 4
         assert tracker.peak_station[("http://a", "key-A")] == 1
         assert tracker.peak_station[("http://b", "key-B")] == 1
+        # 断言用"同时在飞峰值"而不是墙钟：峰值 2 本身就证明两站的请求重叠过
+        # （串行必为 1），且是锁内记录的确定量，不像计时断言在慢速 CI runner 上抖动。
         assert tracker.peak_total == 2, "跨站必须并行，否则本策略把池退化成单路"
-        # 4 发 × 0.15s：纯串行≈0.6s，两站并行≈0.3s
-        assert spent < 0.55, f"耗时 {spent:.2f}s 说明并未跨站并行"
     finally:
         pool.close()
 
