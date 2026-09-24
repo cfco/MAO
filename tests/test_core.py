@@ -759,7 +759,7 @@ def test_fallback_respects_cooldown_skip(monkeypatch):
 
 
 def test_fallback_not_cross_station(monkeypatch):
-    """回退只在同站：同站无可用模型时，绝不跨到站 other(x1)。"""
+    """fallback_cross_station=false 时回退只在同站：同站无可用也不跨到 other(x1)。"""
     calls = {"models": []}
 
     class Recorder:
@@ -771,12 +771,40 @@ def test_fallback_not_cross_station(monkeypatch):
             raise LLMError("rate_limit", "429", retryable=True)  # 全站可重试失败
 
     monkeypatch.setattr(orch, "LLMClient", Recorder)
-    pool = _fallback_pool()
+    cfg = Config(_interpolate({
+        "agents": [
+            {"name": "st", "base_url": "u1", "api_key": "k", "models": ["m1", "m2", "m3"]},
+            {"name": "other", "base_url": "u2", "api_key": "k2", "model": "x1"},
+        ],
+        "collaboration": {"fallback_cross_station": False},
+    }))
+    pool = WorkerPool(cfg, exclude=None)
     pool._cooldowns["st:m2"] = time.time() + 999   # 同站无可用回退
     pool._cooldowns["st:m3"] = time.time() + 999
     r = pool.ask_result("st:m1", "任务")
     assert r["ok"] is False and r["status"] == "error"
-    assert calls["models"] == ["m1"], f"回退不得跨站，实际试过：{calls['models']}"
+    assert calls["models"] == ["m1"], f"关闭跨站后不得跨站，实际试过：{calls['models']}"
+
+
+def test_fallback_cross_station_recovers(monkeypatch):
+    """默认允许跨站：同站候选全冷却时跨站到 other 站(x1) 恢复成功（异常停止自动换模型）。"""
+    class OnlyM1Boom:
+        def __init__(self, base_url, api_key, model, **kw):
+            self.model = model
+
+        def chat(self, messages):
+            if self.model == "m1":
+                raise LLMError("rate_limit", "429", retryable=True)  # 仅 m1 瞬时失败
+            return {"role": "assistant", "content": f"ok-from-{self.model}"}
+
+    monkeypatch.setattr(orch, "LLMClient", OnlyM1Boom)
+    pool = _fallback_pool()
+    pool._cooldowns["st:m2"] = time.time() + 999   # 同站候选均不可用
+    pool._cooldowns["st:m3"] = time.time() + 999
+    r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is True and r["status"] == "ok"
+    assert r["worker"] == "other", f"应跨站恢复到 other 站，实际 worker={r['worker']}"
+    assert r["answer"] == "ok-from-x1"
 
 
 def test_fallback_terminal_error_no_fallback(monkeypatch):
@@ -823,10 +851,11 @@ def test_fallback_disabled_when_zero(monkeypatch):
 
 
 def test_station_memo_suppresses_cross_worker_fallback(monkeypatch):
-    """批次内整站故障：首个工人把同站回退链打死后，同站后续工人只发被点名的主调用、
-    不再各自回退撞死站——抑制 N×(1+fallback_models) 的跨工人额度放大。
+    """批次内整站故障：首个工人把同站回退链打死后记该站死，同站后续工人**不再撞同站候选**，
+    只发被点名的主调用 + 一次跨站兜底——既抑制 N×(1+fallback_models) 的跨工人额度放大，
+    又保留"异常停止自动换模型恢复"的跨站兜底。
 
-    确定性起见按序调用同一共享 memo（并发批次里三个工人几乎同时起跑，计数会抖动）；
+    确定性起见按序调用同一共享 memo（并发批次里工人几乎同时起跑，计数会抖动）；
     memo 语义与并发无关，串行即可验证抑制逻辑。
     """
     calls = {"models": []}
@@ -840,19 +869,22 @@ def test_station_memo_suppresses_cross_worker_fallback(monkeypatch):
             raise LLMError("rate_limit", "429", retryable=True)  # 整站持续可重试失败
 
     monkeypatch.setattr(orch, "LLMClient", AllBoom)
-    pool = _fallback_pool()  # st: m1/m2/m3 同站；fallback_models 默认 2
+    pool = _fallback_pool()  # st: m1/m2/m3 同站 + other: x1；fallback_models 默认 2
     memo = StationMemo()
 
-    # 工人1：主调用 m1 失败 → 回退链 m2、m3（均失败）→ 链耗尽记该站死。共 3 次网络。
+    # 工人1：主调用 m1 失败 → 同站回退链 m2、m3（均失败）→ 链耗尽记该站死。共 3 次网络。
     pool.ask_result("st:m1", "任务", memo=memo)
     assert calls["models"] == ["m1", "m2", "m3"], "首个工人应走完同站回退链再判死"
 
-    # 工人2：主调用 m2（点名要求，不能省），但该站本轮已死 → 不再回退，只 1 次网络。
+    # 工人2：主调用 m2（点名不能省）失败后，同站候选已被 memo 抑制（不再撞 m1/m3），
+    #        改为跨站兜底到 other:x1；x1 也失败且无更多候选 → 返回 error。
     before = len(calls["models"])
     r2 = pool.ask_result("st:m2", "任务", memo=memo)
     assert r2["ok"] is False and r2["status"] == "error"
-    assert len(calls["models"]) - before == 1, "同站后续工人应只发主调用、不再回退撞死站"
-    assert calls["models"][-1] == "m2", f"最后一次调用应是 m2 主调用，实际={calls['models'][-1]}"
+    new_calls = calls["models"][before:]
+    assert "m1" not in new_calls and "m3" not in new_calls, \
+        f"同站已被记忆为死站，不得再撞同站候选，实际={new_calls}"
+    assert new_calls == ["m2", "x1"], f"应为「主调用 + 一次跨站兜底」，实际={new_calls}"
 
 
 def test_memo_absent_preserves_full_fallback_chain(monkeypatch):

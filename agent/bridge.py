@@ -5,7 +5,8 @@
 1. 本地工具执行（shell / 文件 / MCP 工具 / Skill）——给被沙箱限制的主一双"手"。
 2. 按需调用池内免费模型当"纯文本子 AI"：ask（单个）/ ask_many（并行+结构化）/
    ask_vote（两步投票取共识）/ run_review（主给初稿、子 AI 只当评审团挑错）。
-3. 派工前预检：health（各子 AI 冷却/当日隔离/能力标签）、list_agents（池清单）。
+3. 派工前预检：health（各子 AI 冷却/当日隔离/能力标签/延迟）、list_agents（池清单）、
+   latency（延迟档案 + 探测状态，可强制刷一轮）。
 
 协议：stdin 每行一个 JSON 请求，stdout 每行一个 JSON 响应，UTF-8；启动即发一行 ready。
 诊断/警告一律走 stderr，stdout 只放 JSON 行，供外部主按行 json.loads 解析。
@@ -13,7 +14,9 @@
 请求指令：
   {"cmd":"ping"}
   {"cmd":"list_agents"}                                   （池清单，含能力标签，不含 key）
-  {"cmd":"health"}                                        （各子 AI 可用性快照：冷却/当日隔离/标签）
+  {"cmd":"health"}                                        （各子 AI 可用性快照：冷却/当日隔离/标签/延迟ms）
+  {"cmd":"latency"}                                       （延迟档案 + 探测调度状态）
+  {"cmd":"latency","probe":true}                          （先同步探测一轮全部节点再回包）
   {"cmd":"set_economy","value":true}                      （运行期切"省 token"开关，返回新状态）
   {"cmd":"list_tools"}
   {"cmd":"call_tool","name":"run_shell","args":{"command":"dir"}}
@@ -141,10 +144,17 @@ class Bridge:
         if cmd == "list_tools":
             return {"ok": True, "tools": self.registry.info_list()}
         if cmd == "health":
-            # 每个子 AI 的当前可用性快照（冷却/当日隔离/能力标签），供外部主派工前预检。
+            # 每个子 AI 的当前可用性快照（冷却/当日隔离/能力标签/延迟ms），供外部主派工前预检。
             # 顺带回显 economy 开关：外部主每次派工前都无需记忆上次 set 的状态。
             out = {"ok": True, "workers": self.workers.health_status(), "economy": self._economy}
             return out
+        if cmd == "latency":
+            # 延迟维度快照（问题5）：各工人当前延迟（往返耗时中位数，毫秒）+ 探测调度状态。
+            # probe=true ⇒ 先**同步**跑一轮全节点探测再回包：外部主刚加了节点、或怀疑
+            # 某模型变慢时可立即刷新，不必等 10 分钟自动周期。探测失败不打 health/冷却。
+            if req.get("probe"):
+                self.workers.probe_latency_now()
+            return {"ok": True, **self.workers.latency_status()}
         if cmd == "set_economy":
             # 运行期切"省 token"开关（二元）。非法值警告并保持原值：
             # 返回 ok:false + error + 当前真实状态，调用方据此知道没切动。

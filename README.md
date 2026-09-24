@@ -159,7 +159,7 @@ echo '{"cmd":"list_agents"}' | uv run mao bridge
 
 ### 外部智能体驱动（谁启动谁当主）：一条内核，三种外壳
 
-任何能起子进程、能读写文本行的智能体都能当主。`bridge` 是唯一内核（12 条无状态指令，
+任何能起子进程、能读写文本行的智能体都能当主。`bridge` 是唯一内核（13 条无状态指令，
 下表），外面有两种更省事的壳：
 
 | 接入方式 | 适合谁 | 上手成本 |
@@ -168,7 +168,7 @@ echo '{"cmd":"list_agents"}' | uv run mao bridge
 | **`uv run mao call <指令> '<JSON>'`** | 只有 shell/技能机制、每次调用起新进程的宿主（脚本、SKILL.md） | 一行命令拿一行 JSON，退出码表成败 |
 | **`uv run mao bridge`（裸协议）** | 要长驻、批量、自己管进出的深度集成驱动方 | 自写子进程驱动（逐行 JSON） |
 
-**MCP 接入**（宿主配置里加一段即可，12 条指令逐一映射为 MCP 工具）：
+**MCP 接入**（宿主配置里加一段即可，13 条指令逐一映射为 MCP 工具）：
 
 ```json
 {
@@ -203,7 +203,9 @@ stderr 也已在 bridge 启动时归一为 UTF-8：Windows 重定向流默认本
 |------|------|
 | `{"cmd":"ping"}` | 握手，返回版本与池内智能体名 |
 | `{"cmd":"list_agents"}` | 智能体池清单（不含 key，含能力标签 tags） |
-| `{"cmd":"health"}` | 各子 AI 当前可用性快照（冷却剩余/当日隔离/标签），派工前预检 |
+| `{"cmd":"health"}` | 各子 AI 当前可用性快照（冷却剩余/当日隔离/标签/延迟 ms），派工前预检 |
+| `{"cmd":"latency"}` | 延迟档案（各工人往返耗时中位数）+ 探测调度状态 |
+| `{"cmd":"latency","probe":true}` | 先同步探测一轮**全部节点**（含不可用节点）再返回 |
 | `{"cmd":"set_economy","value":true}` | 省 token 开关（二元）：运行期切换，响应回显 `economy`；非法值 `ok:false` 并保持原值 |
 | `{"cmd":"list_tools"}` | 本地工具清单（内置+MCP+Skill） |
 | `{"cmd":"call_tool","name":"run_shell","args":{...}}` | 执行本地工具 |

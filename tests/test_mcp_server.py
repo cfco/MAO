@@ -24,8 +24,8 @@ from agent.mcp_server import build_server
 ROOT = Path(__file__).resolve().parent.parent
 
 EXPECTED_TOOLS = {
-    "ping", "list_agents", "health", "set_economy", "list_tools", "call_tool", "load_skill",
-    "run_skill_script", "ask", "ask_many", "ask_vote", "run_review",
+    "ping", "list_agents", "health", "latency", "set_economy", "list_tools", "call_tool",
+    "load_skill", "run_skill_script", "ask", "ask_many", "ask_vote", "run_review",
 }
 
 
@@ -102,6 +102,19 @@ def test_health_on_empty_pool():
 
     _with_session(go)
     assert got["ok"] is True and got["workers"] == []
+
+
+def test_latency_through_mcp_on_empty_pool():
+    """`latency` 指令经 MCP 外壳透传：延迟档案 + 探测状态；空池 = 空档案，不报错。"""
+    got: dict = {}
+
+    async def go(s):
+        got.update(_payload(await s.call_tool("latency", {})))
+
+    _with_session(go)
+    assert got["ok"] is True
+    assert got["model_latency"] == {}
+    assert got["prober"]["rounds"] == 0 and got["prober"]["interval_s"] > 0
 
 
 def _run_call(*argv: str) -> subprocess.CompletedProcess:

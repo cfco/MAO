@@ -3,7 +3,7 @@
 为什么要有这一层：bridge 的裸 JSON 行协议要求每个接入方自己写子进程驱动
 （握手、逐行读写、UTF-8 归一），接一次麻烦一次。而主流宿主（Claude Desktop /
 Cursor / Qoder / 千问办公等）几乎都内置了 MCP client——本模块把 Bridge 的
-12 条指令逐一映射为 MCP 工具，接入退化为在宿主配置里加一段
+13 条指令逐一映射为 MCP 工具，接入退化为在宿主配置里加一段
 `{"command": "uv", "args": ["run", "mao", "mcp"]}`，协议细节全部由 MCP 消化。
 
 实现取向：不复制任何业务逻辑，每个工具都只是把入参拼成 bridge 请求、原样调
@@ -51,9 +51,15 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
     def list_agents() -> dict:
         return _h({"cmd": "list_agents"})
 
-    @app.tool(name="health", description="派工前预检：各子 AI 可用性快照（冷却/当日隔离/标签）")
+    @app.tool(name="health", description="派工前预检：各子 AI 可用性快照（冷却/当日隔离/标签/延迟ms）")
     def health() -> dict:
         return _h({"cmd": "health"})
+
+    @app.tool(name="latency",
+              description="延迟档案与探测状态（问题5）：各工人往返耗时中位数（毫秒）+ 探测调度；"
+                          "probe=true 时先同步探测一轮**全部节点**（含不可用节点）再返回")
+    def latency(probe: bool = False) -> dict:
+        return _h({"cmd": "latency", "probe": probe})
 
     @app.tool(name="set_economy", description="省 token 开关（二元）：value 为 true/false，返回切换后的真实状态；非法值 ok:false 并保持原值")
     def set_economy(value: bool) -> dict:

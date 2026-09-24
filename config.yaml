@@ -50,10 +50,28 @@ collaboration:
   vote_threshold: ${COLLAB_VOTE_THRESHOLD:-0.5}
   cooldown_fails: ${COLLAB_COOLDOWN_FAILS:-2}
   cooldown_base: ${COLLAB_COOLDOWN_BASE:-10}
+  # 冷却指数退避封顶（秒）：连续失败越多、冷却越久（base × 2^n），到顶后恒定不再增长。
+  cooldown_max: ${COLLAB_COOLDOWN_MAX:-3600}
   # ---- 模型健康：当日失败隔离 + 连续运行日失败自动下线（见 agent/core/health.py）----
   health_file: ${COLLAB_HEALTH_FILE:-data/model_health.json}  # 健康档案落盘（当日失败标记，无密钥）
   retire_days: ${COLLAB_RETIRE_DAYS:-7}  # 连续 N 个"运行日"调用失败 → 在 model_registry.txt 给该模型加 # 下线
-  fallback_models: ${COLLAB_FALLBACK_MODELS:-2}  # 单模型可重试失败后，同中转站最多回退的额外模型数（0=关闭）
+  fallback_models: ${COLLAB_FALLBACK_MODELS:-2}  # 单模型可重试失败后，最多回退的额外模型数（0=关闭）
+  # 回退候选是否允许跨中转站（默认 true）：同站无可用候选时从整池恢复（异常停止自动换模型）。
+  fallback_cross_station: ${COLLAB_FALLBACK_CROSS_STATION:-true}
+  # ---- 模型延迟档案：可用的模型里再比"快不快"（见 agent/core/latency.py）----
+  latency_file: ${COLLAB_LATENCY_FILE:-data/model_latency.json}  # 往返耗时样本落盘（只记毫秒数，无密钥）
+  # 延迟自动探测：每 latency_probe_interval 秒对**全部节点（含当前不可用节点）**打一次
+  # 极短往返刷新档案；pick() 据此排序、优先派给延迟低的可用模型。MAO_LATENCY_PROBE=0 可关。
+  latency_probe: ${COLLAB_LATENCY_PROBE:-true}
+  latency_probe_interval: ${COLLAB_LATENCY_PROBE_INTERVAL:-600}  # 秒：默认 10 分钟一轮
+  # 探测专用短超时（秒）：**不**沿用派工的 llm.timeout。坏节点也只拖本值秒、且探测客户端不重试，
+  # 免得一次测速被拖成分钟级、或同步 probe（latency probe:true）挂住整轮。
+  latency_probe_timeout: ${COLLAB_LATENCY_PROBE_TIMEOUT:-8}
+  # 只用延迟最低的这部分（默认 0.6 = 弃掉最高延迟的 40%）；小池同样适用
+  # （n=5→3、4→3、3→2、2→2），即"可用低于 5 个就用最低的 2~3 个"。
+  latency_keep_ratio: ${COLLAB_LATENCY_KEEP_RATIO:-0.6}
+  # 已知延迟的候选少于该数则不裁剪（冷启动保护：没数据就不动刀）
+  latency_min_samples: ${COLLAB_LATENCY_MIN_SAMPLES:-2}
 
 tools:
   shell_timeout: ${TOOLS_SHELL_TIMEOUT:-120}  # 单条命令最长执行秒数

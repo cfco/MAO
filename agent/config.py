@@ -343,7 +343,7 @@ class Config:
 
     @property
     def fallback_models(self) -> int:
-        """单模型可重试失败后，同中转站最多尝试的额外模型数（0=关闭回退）。
+        """单模型可重试失败后，最多尝试的额外模型数（0=关闭回退）。
 
         配合「一站多模型」：某模型节点抖动/限流时换同站其它模型往往能成，避免一次
         抖动废掉一整个免费额度。上限防止整站挂时把同站几十个模型挨个试（额度蔓延）。
@@ -351,6 +351,19 @@ class Config:
         return self.as_int(
             self.collab_cfg.get("fallback_models", 2), "collaboration.fallback_models", 2,
             minimum=0,
+        )
+
+    @property
+    def fallback_cross_station(self) -> bool:
+        """回退候选是否允许跨中转站（默认 True）：子智能体异常停止时从整池恢复。
+
+        True：某工人可重试失败先用同站其它模型，同站无可用候选（或该站已被本批次
+        探明故障）则再跨站、从整池挑「未试过且当前可用」的模型重试——即"异常停止了
+        自动换模型恢复"。False：退回旧行为，只在同站内回退、绝不跨站（额度最省）。
+        """
+        return self.as_bool(
+            self.collab_cfg.get("fallback_cross_station", True),
+            "collaboration.fallback_cross_station", True,
         )
 
     @property
@@ -377,6 +390,86 @@ class Config:
         )
         p = Path(rel)
         return p if p.is_absolute() else ROOT / p
+
+    # ---------- 模型延迟档案（collaboration.*，问题5） ----------
+
+    @property
+    def model_latency_path(self) -> Path:
+        """模型延迟档案（各工人最近往返耗时样本）落盘位置。
+
+        优先级：环境变量 MAO_LATENCY_FILE（测试隔离）> collaboration.latency_file >
+        默认 data/model_latency.json。只记延迟数值与更新时间，不含任何密钥。
+        """
+        rel = os.environ.get("MAO_LATENCY_FILE") or str(
+            self.collab_cfg.get("latency_file", "data/model_latency.json")
+        )
+        p = Path(rel)
+        return p if p.is_absolute() else ROOT / p
+
+    @property
+    def latency_probe(self) -> bool:
+        """是否启用延迟自动探测（默认 true）。
+
+        为什么默认开：延迟档案全靠"每 latency_probe_interval 秒对全部节点（含当前
+        不可用节点）探测一轮"刷新。不探测就永远没有延迟数据，pick() 的延迟选路等于
+        空转（退回旧的"只按可用性选"）。
+        环境变量 MAO_LATENCY_PROBE=0 可单独关闭（测试用：离线用例不允许后台线程打网络）。
+        """
+        env = os.environ.get("MAO_LATENCY_PROBE")
+        if env is not None:
+            return self.as_bool(env, "MAO_LATENCY_PROBE", True)
+        return self.as_bool(
+            self.collab_cfg.get("latency_probe", True), "collaboration.latency_probe", True
+        )
+
+    @property
+    def latency_probe_interval(self) -> float:
+        """延迟探测周期（秒，默认 600 = 10 分钟；下限 10s 防误配成高频探测烧额度）。"""
+        return self.as_float(
+            self.collab_cfg.get("latency_probe_interval", 600),
+            "collaboration.latency_probe_interval", 600.0, minimum=10.0,
+        )
+
+    @property
+    def latency_probe_timeout(self) -> float:
+        """探测专用超时（秒，默认 8；下限 1s）——**不**沿用真实派工的 llm.timeout。
+
+        为什么单列：探测只测"节点响应快不快"，一次极短往返就够。若沿用派工的
+        llm.timeout（默认 120s）+ max_retries（默认 2），一个卡住/慢的坏节点会把一次
+        "测速"拖成分钟级、并白打多次请求；更糟的是同步 probe（bridge/MCP `latency
+        probe:true`）会被挂住整轮。故探测客户端用这个短超时且 max_retries=0（只发一次），
+        失败只丢样本、不占派工额度。一轮最坏耗时 ≈ ceil(节点数/并发) × 本值。
+        """
+        return self.as_float(
+            self.collab_cfg.get("latency_probe_timeout", 8),
+            "collaboration.latency_probe_timeout", 8.0, minimum=1.0,
+        )
+
+    @property
+    def latency_keep_ratio(self) -> float:
+        """延迟裁剪后保留的比例（默认 0.6，夹在 0.1~1.0）。
+
+        用户口径：可用模型 >5 个时"不使用高延迟的 40%，只用延迟较低的 60%"。
+        同一条公式在小池上也自洽（n=5→3、4→3、3→2、2→2），恰好落在"可用低于 5 个
+        就用延迟最低的 2~3 个"——故不另设小池分支，两档口径共用一套实现。
+        """
+        raw = self.as_float(
+            self.collab_cfg.get("latency_keep_ratio", 0.6),
+            "collaboration.latency_keep_ratio", 0.6, minimum=0.1,
+        )
+        return min(1.0, raw)
+
+    @property
+    def latency_min_samples(self) -> int:
+        """至少有多少个候选工人的延迟已知，才启用延迟裁剪（默认 2）。
+
+        冷启动保护：档案为空 / 刚部署时样本不足，绝不能凭空把工人踢出派工——证据不足
+        就原样返回，等探测把样本补上再裁。
+        """
+        return self.as_int(
+            self.collab_cfg.get("latency_min_samples", 2),
+            "collaboration.latency_min_samples", 2, minimum=1,
+        )
 
     # ---------- 兼容旧配置的兜底单模型 ----------
 

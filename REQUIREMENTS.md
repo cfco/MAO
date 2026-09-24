@@ -29,17 +29,18 @@
 
 派工基础设施（WorkerPool）：
 - **参与人数上限**：`ask_many`/`collect`/`vote` 的**缺省名单**由 `pick()` 产生——按池内确定性顺序取前 `collaboration.max_participants`（默认 5）个当前可派工人（跳过冷却与当日隔离）；显式传入的名单不受该上限约束。池子一站多模型轻易几十个，全池派发会一次打出几十个请求，而并发上限只有个位数 → 尾部批次必被整体限时丢弃、额度白烧；
-- **节点冷却**：连续失败达 `collaboration.cooldown_fails` 进入指数冷却（基数 `cooldown_base`×连败次数），冷却期快速跳过；成功清零。
+- **延迟选路**：**缺省名单**在进入轮转前先按延迟裁剪——可用工人按当前延迟（往返耗时**中位数**）升序排列，只保留延迟最低的 `collaboration.latency_keep_ratio`（默认 0.6，即弃掉最高延迟的 40%；`drop = floor(n × (1−ratio))`）。同一公式在小池上自洽（n=5→3、4→3、3→2、2→2），即"可用模型低于 5 个时用延迟最低的 2~3 个"，不另设分支。未测过的工人取**已知样本中位数**作中性先验（既不因未测被优先放行、也不被当成最慢一刀切）；已知样本少于 `collaboration.latency_min_samples`（默认 2）时**不裁剪**（冷启动/证据不足不动刀）。显式传 `limit`（含 0=不限）表示调用方自己定规模，不做延迟裁剪。同站/跨站**回退候选**也按同一套延迟升序挑，故回退同样优先落到快节点；
+- **节点冷却**：连续失败达 `collaboration.cooldown_fails`（默认 2）进入**指数退避**冷却：`min(cooldown_base × 2^(连败次数−阈值), cooldown_max)`，即连败越多屏蔽越久（默认基数 10s、封顶 `collaboration.cooldown_max`=3600s）；冷却期快速跳过，成功即清零。
 
 （历史上的 LRU 答案缓存、并发在飞去重、`run_pipeline` 固定流水线、内部 Agent 自主派工 loop 均已随「单一 bridge 路线」简化移除：外部主按需发话、命中率极低，且弱模型驱动多步工具循环不可靠。）
 
 ### 2.3 bridge：外部智能体当主（一条内核，三种外壳）
 
-`python -m agent bridge`，stdin 每行一个 JSON 请求、stdout 每行一个 JSON 响应（UTF-8），启动即发 ready 事件。诊断/警告一律走 stderr，stdout 只放 JSON 行。为驱动者（外部主）提供：本地工具执行（`call_tool`）、Skill 加载与脚本（`load_skill`/`run_skill_script`）、池内模型当纯文本子 AI（`ask`/`ask_many` 结构化/`ask_vote`）、评审团（`run_review`）、可用性预检（`health`、`list_agents` 含能力标签）。响应 `ok` 反映真实成败：`call_tool`/`ask` 失败即 `ok:false`，派工类失败带稳定 `status` 码（`ok|error|cooldown|quarantined|missing|timeout`，全内核统一、不翻译成中文），成败判断靠字段而非解析文本前缀。
+`python -m agent bridge`，stdin 每行一个 JSON 请求、stdout 每行一个 JSON 响应（UTF-8），启动即发 ready 事件。诊断/警告一律走 stderr，stdout 只放 JSON 行。为驱动者（外部主）提供：本地工具执行（`call_tool`）、Skill 加载与脚本（`load_skill`/`run_skill_script`）、池内模型当纯文本子 AI（`ask`/`ask_many` 结构化/`ask_vote`）、评审团（`run_review`）、可用性预检（`health` 含延迟字段、`list_agents` 含能力标签）、延迟档案（`latency`，`probe:true` 时可先同步探测一轮全部节点）。响应 `ok` 反映真实成败：`call_tool`/`ask` 失败即 `ok:false`，派工类失败带稳定 `status` 码（`ok|error|cooldown|quarantined|missing|timeout`，全内核统一、不翻译成中文），成败判断靠字段而非解析文本前缀。
 
 同一 `Bridge` 内核另有两种外壳，行为与逐字契约和裸协议一致（外壳只做参数拼装/透传，不复制业务逻辑）：
 
-- **`python -m agent mcp`（MCP server，stdio）**：把 12 条指令逐一映射为 MCP 工具（`mcp>=2` 官方 SDK 的 `MCPServer`），支持 MCP client 的宿主（Claude Desktop / Cursor / Qoder 等）只需在其配置里加一段 `{"command": "uv", "args": ["run", "mao", "mcp"], "cwd": "<项目根>"}` 即接入，免写子进程驱动代码。
+- **`python -m agent mcp`（MCP server，stdio）**：把 13 条指令逐一映射为 MCP 工具（`mcp>=2` 官方 SDK 的 `MCPServer`），支持 MCP client 的宿主（Claude Desktop / Cursor / Qoder 等）只需在其配置里加一段 `{"command": "uv", "args": ["run", "mao", "mcp"], "cwd": "<项目根>"}` 即接入，免写子进程驱动代码。
 - **`python -m agent call <指令> [JSON]`（one-shot）**：单发一条指令、stdout 打印一行 JSON 响应即退出，供脚本/技能包在"每次调用都是新进程"的宿主里使用；JSON 参数可作位置参数或从 stdin 读一行（位置参数里的 `cmd` 优先）。退出码：0=ok:true，1=指令失败（ok:false），2=参数 JSON 坏。注意每次调用都付进程冷启动成本（配置加载；配了 `mcp_servers` 时还含 MCP 首连），高频场景仍应用长驻的 bridge/mcp 外壳。
 
 ## 3. 运行模型（MAO 侧无状态）
@@ -57,7 +58,8 @@ MAO 不再有内部 Agent 循环，也不再持久化会话——它是被外部
 | 超时+分类重试 | 每请求带 `llm.timeout`（默认 120s）；限流(429)/超时/5xx/连接失败指数退避重试（限流退避更长），**408 请求超时与 425 Too Early 同样归入可重试**（免费中转网关超时很常见），认证与其余 4xx 不重试；SDK 内置重试关闭，自定义退避是唯一重试源 |
 | 节点冷却 | 见 2.1 |
 | 畸形响应归一 | 中转站内容过滤会返回 `choices: []`：显式归类为可重试的服务端错误（原本是裸 `IndexError`，会绕过错误分类与重试编排一路冒到调用方）；模型给出空 content 且无工具调用时返回明确说明，不再静默输出空白答复 |
-| 同站模型回退 | 支持多模型的中转站上：某模型发生**可重试瞬时失败**（429/5xx/超时/连接）时，`WorkerPool` 自动切换**同一中转站**（`base_url`+`api_key` 相同）的其它"当前可用"模型重试；每个模型仍保持独立（独立连接池/冷却/健康档案），回退只在同站内、**不跨站**、不重复打已试过的模型。终态错误（认证等）不回退——那类错误在整站级统一出现，回退既无用又浪费其它模型的额度。重试上限由 `collaboration.fallback_models`（默认 2，0=关闭）约束：整站挂时不会把同站几十个模型挨个试穿 |
+| 模型回退（同站优先，可跨站） | 支持多模型的中转站上：某模型发生**可重试瞬时失败**（429/5xx/超时/连接）时，`WorkerPool` 自动切换其它"当前可用"模型重试——**先同站**（`base_url`+`api_key` 相同），同站无可用候选且 `collaboration.fallback_cross_station`=true（默认开）时**再跨站**从整池恢复；候选内部按延迟升序挑（优先快节点）。每个模型仍保持独立（独立连接池/冷却/健康档案），不重复打已试过的模型。批次内共享「死站」记忆（`StationMemo`）：某工人的回退链因可重试失败耗尽即记该站本轮已死，同站后续工人只做被点名的主调用、不再各自撞死站，抑制 N×(1+fallback) 的跨工人额度放大。终态错误（认证等）不回退——那类错误在整站级统一出现，回退既无用又浪费其它模型的额度，直接当日隔离。重试上限由 `collaboration.fallback_models`（默认 2，0=关闭）约束：整站挂时不会把同站几十个模型挨个试穿 |
+| 模型延迟档案 + 定时探测 | `LatencyStore` + `LatencyProber`（`agent/core/latency.py`，档案落 `collaboration.latency_file`=`data/model_latency.json`）：每个工人记最近 5 次往返耗时样本、取中位数（抗单次长尾）。两路事实共写**同一份档案**（"一套"）：①**定时探测**——每 `collaboration.latency_probe_interval`（默认 600s=10 分钟）对**全部节点（含当前不可用节点）**打一次极短往返（`ping`），刷新基线（探测走**专用客户端**：短超时 `collaboration.latency_probe_timeout`（默认 8s）且**不重试**——坏节点一次最多拖本值秒，也挂不住同步 probe 整轮）；②真实成功派工顺带回填实际负载下的耗时。探测**懒式调度**（挂在 `pick`/`ask_result` 入口：到期且无在飞才起一轮守护线程），空载不烧额度、不阻塞派工、一轮不叠一轮。探测失败**只丢样本**，绝不计冷却/当日隔离（否则定时器会自己制造隔离）。`latency_probe=false`（或环境变量 `MAO_LATENCY_PROBE=0`）可整体关闭自动探测；手动 `bridge latency probe:true` 仍可强制刷一轮。档案按路径**进程内共享单实例**（`latency.get_latency()`），写盘原子化且锁外进行（同 health）。选路消费方式见 §2.2「延迟选路」 |
 | 并发隔离 | 线程池并行派工，单工人失败/超时以文本如实带回，不拖垮整体 |
 | 整体限时 | `ask_many`/`vote`/`collect` 用 `concurrent.futures.wait` 对收集阶段整体限时；限时**按规模自适应** = `ceil(参与人数 ÷ max_workers) × llm.timeout + 30s`（调用方显式传入 `timeout` 时以传入值为准）。原先固定 300s 在「池大 + 并发低」时必然截断尾部批次（25 名 / 3 并发 = 9 批，单工人耗时 >33s 即超标）。超时工人标记"未完成"放弃等待，后台线程按 LLM 超时自行收尾 |
 | 当日失败隔离 + 连续运行日下线 | `ModelHealth`（`agent/core/health.py`，档案落 `collaboration.health_file`=`data/model_health.json`）：模型出现一次**不可重试的终态失败**（认证失败、非重试类 4xx）即记当天日期，当天不再向它派工（`ask`/`ask_many`/`collect`/`vote` 全部跳过并如实提示，`status=quarantined`）；429/5xx/超时等**可重试瞬时失败**耗尽重试只进短时冷却（`status=cooldown`），不再拉黑全天——免费节点限流是常态，按旧规则一次 429 就报废整天的可用池。档案按路径**进程内共享单实例**（`health.get_health()`）：多工人池/多调用方各持独立内存账本 + 全量覆写会互相抹记录（lost update）、且彼此看不到隔离结果，共享后当日隔离全进程一致。**文件 IO 全部在锁外**（锁内更新内存取快照、锁外原子写盘），避免记账持锁把 health 锁串到 pool 锁卡住派工。某模型连续 `COLLAB_RETIRE_DAYS`（默认 7）个**运行日**（程序实际启动工作的天，未运行日子不计入不打断）都出现终态（不可重试）失败，纯瞬时 429/5xx/超时不计入、不触发下线，自动在 `model_registry.txt` 对应 `*_MODELS` 行给该模型加 `#` 下线（删 `#` 手动恢复；`LLM_MODEL` 兜底行不自动动；已下线幂等不重复改写、不刷频）。 |
@@ -82,7 +84,7 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 
 | 入口 | 命令 | 说明 |
 |---|---|---|
-| bridge | `uv run mao bridge` | 外部智能体驱动模式（谁启动驱动，谁当主）。提供本地工具执行（`call_tool`）、Skill（`load_skill`/`run_skill_script`）、池内模型派工（`ask` / `ask_many` 并行+结构化 / `ask_vote` 投票验证 / `run_review` 评审团）、可用性预检（`health`、`list_agents`）。一问一答，无流式事件、无会话。 |
+| bridge | `uv run mao bridge` | 外部智能体驱动模式（谁启动驱动，谁当主）。提供本地工具执行（`call_tool`）、Skill（`load_skill`/`run_skill_script`）、池内模型派工（`ask` / `ask_many` 并行+结构化 / `ask_vote` 投票验证 / `run_review` 评审团）、可用性预检（`health` 含 `latency_ms`、`list_agents`）、延迟档案（`latency` / `latency probe:true` 强制刷一轮）。一问一答，无流式事件、无会话。 |
 
 **stdout 纯净约定**：bridge 的 stdout 只放 JSON 行（每请求一行响应），所有诊断/警告（配置缺失变量、MCP 状态）统一走 stderr——混入 stdout 会让按行 `json.loads` 的调用方直接解析失败。bridge 的 stdio 在 `load_config` 前即归一为 UTF-8（Windows 重定向流默认 GBK，中文诊断不转码会炸外部 UTF-8 解码）。
 
@@ -92,7 +94,7 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 |---|---|
 | `agents` | 智能体池，按"站"组织（一 Endpoint+Key 挂多 model）；`models` 逗号分隔，`#` 前缀临时屏蔽，`@128k` 标注上下文窗口，可选 `tags`（能力标签，供外部主选路）、`note` |
 | `llm` | 兜底单模型 + temperature / timeout / max_retries |
-| `collaboration` | economy（省 token 开关，二元，默认 false，初始值随 ready 带出、可被 set_economy 运行期切换）/ max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails / cooldown_base / health_file / retire_days（连续几个运行日出现终态失败即自动下线，默认 7；瞬时失败只冷却不下线）/ fallback_models（同站回退重试上限，默认 2，0=关闭） |
+| `collaboration` | economy（省 token 开关，二元，默认 false，初始值随 ready 带出、可被 set_economy 运行期切换）/ max_workers（并发上限）/ max_participants（单次批量派工参与人数上限，默认 5，0=不限）/ vote_threshold / cooldown_fails（连败进冷却的阈值，默认 2）/ cooldown_base（冷却基数秒，默认 10）/ cooldown_max（冷却指数退避封顶秒，默认 3600）/ health_file / retire_days（连续几个运行日出现终态失败即自动下线，默认 7；瞬时失败只冷却不下线）/ fallback_models（回退重试上限，默认 2，0=关闭）/ fallback_cross_station（回退是否允许跨站，默认 true）/ latency_file（延迟档案路径，默认 data/model_latency.json）/ latency_probe（是否自动探测延迟，默认 true）/ latency_probe_interval（探测周期秒，默认 600）/ latency_probe_timeout（探测专用超时秒，默认 8；不沿用 llm.timeout、探测客户端不重试）/ latency_keep_ratio（延迟裁剪保留比例，默认 0.6）/ latency_min_samples（延迟裁剪所需最少已知样本数，默认 2） |
 | `tools` | shell_timeout / workspace（额外允许工具访问的项目目录，默认为空=仅本项目根） |
 | `mcp_servers` | MCP 接入列表 |
 
@@ -105,9 +107,10 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 - `uv run ruff check .`：E/F/W/I/B/UP，line-length 100；用 `extend-exclude = ["data"]` 追加排除运行时产物与隔离区（**不要用 `exclude`**——那是替换语义，会顶掉 ruff 默认排除表把 `.venv`/`.git` 重新纳入扫描）。
 - 解释器版本以仓库根 `.python-version` 为唯一来源（CI 用不带参数的 `uv python install` 跟随它，不写死版本号）。
 - 质量门禁的守卫测试：`tests/test_config_contract.py`（`model_registry.txt` + `.env` ↔ `config.yaml` 变量名契约）、`tests/test_repo_hygiene.py`（`.gitignore` 规则真生效、ruff 用 extend-exclude）。
-- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避/畸形响应归一、WorkerPool 冷却/当日隔离、ask_many 整体限时与确定性顺序、结构化派工结果（`ask_many_structured`）、`health` 可用性探针、能力标签 `tags`、`run_review` 评审团、路径防穿越（工具/技能脚本）、MCP 断线重连持续重试与连接回滚、bridge stderr UTF-8、配置分层（model_registry.txt 模型名基础层 / .env 全配置覆盖层 / shell 最高 / registry 与 .env 变更失效缓存 / 行内注释剥离 / 边界双向守卫：registry 绝不带 `*_KEY`、`.env` 混入 `*_MODEL(S)` 按名告警不回显值）、模型健康（当日隔离、进程内共享、幂等、跨进程持久化、连续运行日自动下线含"未运行的日子不计入也不打断"；`tests/conftest.py` 用 `MAO_HEALTH_FILE` / `MAO_MODEL_REGISTRY_FILE` 给每用例独立档案与独立 registry 防跨用例污染）等。（内部 Agent 主循环、会话持久化、LRU 缓存、并发去抖、`run_pipeline` 的用例已随功能移除。）
+- `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避/畸形响应归一、WorkerPool 冷却/当日隔离、ask_many 整体限时与确定性顺序、结构化派工结果（`ask_many_structured`）、`health` 可用性探针、能力标签 `tags`、`run_review` 评审团、路径防穿越（工具/技能脚本）、MCP 断线重连持续重试与连接回滚、bridge stderr UTF-8、配置分层（model_registry.txt 模型名基础层 / .env 全配置覆盖层 / shell 最高 / registry 与 .env 变更失效缓存 / 行内注释剥离 / 边界双向守卫：registry 绝不带 `*_KEY`、`.env` 混入 `*_MODEL(S)` 按名告警不回显值）、模型健康（当日隔离、进程内共享、幂等、跨进程持久化、连续运行日自动下线含"未运行的日子不计入也不打断"；`tests/conftest.py` 用 `MAO_HEALTH_FILE` / `MAO_MODEL_REGISTRY_FILE` / `MAO_LATENCY_FILE` / `MAO_LATENCY_PROBE=0` 给每用例独立档案、独立 registry 且关闭延迟自动探测，防跨用例污染与意外的后台网络）等。（内部 Agent 主循环、会话持久化、LRU 缓存、并发去抖、`run_pipeline` 的用例已随功能移除。）
 - 2026-09-22 审计修复的专项回归集中在 `tests/test_audit_fixes.py`：健康档案进程内共享（含"两个实例各自先读盘、再交错记账不得互相覆盖"的 lost update 场景）且直连构造仍独立、缺省派工规模上限（pick）与自适应限时、显式名单不被上限约束、批量路径跳过项如实带回、MCP 连接共享与引用计数、计票不采信错误文本。**配套变异测试**（撤销修复 → 对应用例必须失败）确认用例非恒真。
 - 2026-09-22 第二轮全链路审计的回归集中在 `tests/test_audit2_fixes.py`（27 例）：投票分母只算有效票、健康档案写盘不阻塞隔离查询与并发落盘不留垃圾、6 项数值配置的类型容错、流水线阶段间裁剪（含窗口伸缩与按份均分）、`write_file` 覆盖留档、注入检查不误拦引号内字面量且真实拼接照拦、408/425/429/5xx 与 4xx 的重试分类。变异校验扩到多项（`tests/mutation_check.py`）；本轮变异又抓出 2 个恒真用例并修正（假 `_last_active` 被清理线程连带清理、测试 monkeypatch 掉了被测方法本身）。
+- 2026-09-23 协作层专项（问题1 冷却指数退避 / 问题2 异常停止自动恢复 / 问题5 延迟维度）的回归：`tests/test_latency.py`（15 例）与 `tests/test_core.py` 的回退段、`tests/mutation_check.py` 的 M20–M29 锚点。覆盖——冷却指数退避且封顶；跨站回退恢复（`fallback_cross_station`）与"同站候选被批次死站记忆抑制、但仍保留一次跨站兜底"；延迟档案（样本中位数、只留最近 5 条、进程内按路径共享、落盘跨实例可读回）；探测覆盖**全部节点（含冷却与当日隔离的）**且失败只丢样本、不计冷却不当日隔离；懒式到期调度与"一轮不叠一轮"；`latency_probe=0` 时绝不自动探测（离线用例零网络）；pick 延迟裁剪（>5 用最低 60%、小池落在 2~3 个、证据不足不动刀、显式 limit 不裁剪）；真实成功派工回填延迟；回退候选优先低延迟；`health` 带 `latency_ms` 与 bridge `latency` 指令。**变异锚点扩到 24 项（M1–M29，本轮新增 M23–M29）**，全部通过（无恒真用例）。
 - GitHub Actions CI：ruff + pytest。
 
 ## 10. 安全边界

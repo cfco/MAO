@@ -5,7 +5,8 @@
   汇总、把关——本项目不再自带内部 Agent Loop（已随"单一 bridge 内核"收敛移除）。
 - 工人池：智能体池里的全部成员，纯文本执行器（不挂本地工具，兼容性最好、最安全）。
 - 派工能力：ask_result（单个，结构化）/ ask_many（并行 + 结构化）/ vote（两步投票取共识）；
-  pick() 跨调用 round-robin 分摊负载、可跳过冷却/隔离、支持按 tags 选路。
+  pick() 跨调用 round-robin 分摊负载、可跳过冷却/隔离、支持按 tags 选路，并按**延迟**
+  排序裁剪（优先派给延迟低的可用模型，见 _latency_window）。
 - 历史演进：ask 结果 LRU 缓存、并发同 key 去重、swarm 的 ask_worker 工具等均已移除
   （外部主按需发话、命中率极低）；每次如实打网络。
 
@@ -15,6 +16,7 @@
   voting.py       —— VotingMixin：投票两步（收集 + 编号投票）、择优
   constants.py    —— 派工结果状态码（ST_OK/ST_ERROR 等）
   health.py       —— 模型健康档案（当日失败隔离）
+  latency.py      —— 模型延迟档案 + 定时探测器（选路用"快不快"）
   llm.py          —— LLM 适配层
 """
 from __future__ import annotations
@@ -34,12 +36,13 @@ from .constants import (
     WORKER_SYSTEM,
 )
 from .health import ModelHealth, get_health
+from .latency import LatencyMixin, LatencyStore
 from .llm import LLMClient, LLMError
 from .parallelism import ParallelMixin, StationMemo
 from .voting import VotingMixin
 
 
-class WorkerPool(ParallelMixin, VotingMixin):
+class WorkerPool(LatencyMixin, ParallelMixin, VotingMixin):
     """子智能体池：纯文本执行器（不挂本地工具，兼容性最好、最安全）。
 
     免费节点友好：单节点抖动/限流/不可用不拖垮整体——连续失败进入**短时冷却**，
@@ -59,7 +62,7 @@ class WorkerPool(ParallelMixin, VotingMixin):
     """
 
     def __init__(self, cfg: Config, exclude: str | None = None,
-                 health: ModelHealth | None = None):
+                 health: ModelHealth | None = None, latency: LatencyStore | None = None):
         self.cfg = cfg
         self.profiles: dict[str, AgentProfile] = {
             p.name: p for p in cfg.agent_profiles if p.name != exclude
@@ -73,6 +76,11 @@ class WorkerPool(ParallelMixin, VotingMixin):
         self.health = health if health is not None else get_health(
             cfg.model_health_path, cfg.model_registry_path, cfg.retire_days
         )
+        # 模型延迟档案（问题5）：与 health 并列的一层——health 管"能不能用"，
+        # 本档案管"快不快用"。同一批可用工人里优先派延迟低的（见 pick/_latency_window），
+        # 并由 LatencyProber 每 latency_probe_interval 秒探测全部节点刷新它。
+        # 具体构造在 LatencyMixin._init_latency（本文件已超 500 行约定，延迟选路整段外置）。
+        self._init_latency(cfg, latency)
         # 下线改写需要模型名与清单变量名（如 NODE_A_MODELS），一次性建好映射
         self._model_of = {n: p.model for n, p in self.profiles.items()}
         self._env_of = {n: p.models_env for n, p in self.profiles.items()}
@@ -88,12 +96,22 @@ class WorkerPool(ParallelMixin, VotingMixin):
             self.cfg.collab_cfg.get("cooldown_base", 10),
             "collaboration.cooldown_base", 10.0, minimum=0.0,
         )
+        # 指数退避封顶（秒）：连续失败时长按 2 的幂翻倍，到顶后恒定，
+        # 防止一个长期坏节点被算出天量冷却（否则 2^n 会很快溢出到数小时）。
+        self._cooldown_max = self.cfg.as_int(
+            self.cfg.collab_cfg.get("cooldown_max", 3600),
+            "collaboration.cooldown_max", 3600, minimum=1,
+        )
         # 并发安全：ask_many/vote 用线程池并发调用 ask，健康状态与客户端缓存
         # （_clients）都需加锁保护。（历史上此处还有 LRU 答案缓存与并发在飞去重，
         # 已随「单一 bridge 路线」简化移除——外部主按需发话，命中率极低。）
         self._lock = threading.Lock()
         # 按 profile.name 缓存 LLMClient，避免每次派工都重建连接池
         self._clients: dict[str, LLMClient] = {}
+        # 探测专用客户端缓存：短超时 + 不重试，与真实派工的 _clients 分开（见 _probe_client_for）。
+        # 绝不合用同一实例——派工要容忍节点慢/抖动（llm.timeout 120s + 重试），探测只求"最快摸
+        # 一下在不在、快不快"，坏节点绝不能把测速拖成分钟级或打出多次请求，更会挂住同步 probe 整轮。
+        self._probe_clients: dict[str, LLMClient] = {}
         # pick() 轮转游标（#6）：随默认批量派工的调用推进，把负载摊到整个池，
         # 而非每次死取头部 N 个。单进程一池共享 → 全局 round-robin。
         # _pick_lock 单独一把：MCP 外壳下宿主可并发发工具调用（同步工具跑在线程池），
@@ -109,9 +127,11 @@ class WorkerPool(ParallelMixin, VotingMixin):
         for nm, p in self.profiles.items():
             self._station_models.setdefault((p.base_url, p.api_key), []).append(nm)
 
-        # 同站回退上限：单模型可重试失败后，最多在同站尝试的额外模型数（0=关闭回退）。
+        # 回退上限：单模型可重试失败后，最多尝试的额外模型数（0=关闭回退）。
         # 既利用"一站多模型"冗余，又限制额度蔓延（整站挂时不会把同站几十个模型挨个试）。
         self._fallback_models = self.cfg.fallback_models
+        # 回退是否允许跨站（默认 true）：同站无可用候选时从整池恢复——"异常停止自动换模型"。
+        self._fallback_cross_station = self.cfg.fallback_cross_station
 
     # ---------- 基础派工 ----------
 
@@ -131,9 +151,15 @@ class WorkerPool(ParallelMixin, VotingMixin):
         - 连续多次默认调用（不显式点名 workers）则轮流覆盖整个池，把负载摊到所有可用模型。
         首次调用从头部开始（游标 0），因此"池内前 N 个"仍是第一次的结果，向后依次轮转。
 
+        延迟选路（问题5）：**缺省路径**（limit=None）先按延迟裁剪候选，再在裁剪后的
+        子集里轮转——只用延迟最低的 60%（弃掉最高延迟的 40%；小池上同一公式落在
+        "最低的 2~3 个"，见 _latency_window），并把候选按延迟升序排列，让窗口优先落
+        在快节点上。显式传 limit（含 0=不限）表示调用方自己定规模，不做延迟裁剪。
+
         可选 `tags`（逗号分隔）：只保留能力标签**全部命中**的工人，供外部主按任务类型选路
         （标签见 list_agents / health 快照）。缺省 None 不过滤。
         """
+        self._touch_latency()  # 到期就起一轮后台探测刷新延迟档案，不阻塞本次调用
         cap = self.cfg.max_participants if limit is None else limit
         live = [w for w in self.profiles if self._skip_reason(w) is None]
         if tags:
@@ -147,6 +173,8 @@ class WorkerPool(ParallelMixin, VotingMixin):
                     }
                     return need <= have
                 live = [w for w in live if _has_tags(w)]
+        if limit is None:
+            live = self._latency_window(live)
         if cap is None or cap <= 0 or not live:
             return live
         n = len(live)
@@ -161,8 +189,12 @@ class WorkerPool(ParallelMixin, VotingMixin):
 
         available=False 表示当前不可派：冷却中（cooldown_s 剩余秒）或当日失败隔离。
         这里只是给主的"该不该派"参考。
+        latency_ms 为该工人的当前延迟（最近往返耗时中位数，毫秒）；None=尚无样本。
+        字段语义上，available 是"能不能用"，latency_ms 是"快不快用"——两者独立：
+        一个可用但很慢的节点仍然 available=True，只是默认派工会把它排在后面/裁掉。
         """
         now = time.time()
+        lat = self.latency.snapshot()
         out: list[dict] = []
         for name, p in self.profiles.items():
             with self._lock:
@@ -174,6 +206,7 @@ class WorkerPool(ParallelMixin, VotingMixin):
                 "available": until <= now and not quarantined,
                 "cooldown_s": round(max(0.0, until - now), 1),
                 "quarantined_today": quarantined,
+                "latency_ms": lat.get(name),
             })
         return out
 
@@ -216,7 +249,8 @@ class WorkerPool(ParallelMixin, VotingMixin):
         """更新节点健康状态：失败累计，达阈值进冷却（时长指数上升）；成功清零。
 
         冷却 vs 当日隔离分两层，按失败性质区分（#1/#2）：
-        - 任何失败都累计连击、必要时进**短时冷却**（base×连击，成功即清零、会自动恢复）；
+        - 任何失败都累计连击、必要时进**短时冷却**（base×2^n 指数退避、封顶 cooldown_max，
+          成功即清零、会自动恢复）；
         - 只有 **fatal=True（不可重试的终态错误：认证失败、非重试类 4xx 等）** 才记入
           持久健康档案（ModelHealth）→ **当天不再向该模型派工**。
 
@@ -235,8 +269,12 @@ class WorkerPool(ParallelMixin, VotingMixin):
             streak = self._fail_streak.get(name, 0) + 1
             self._fail_streak[name] = streak
             if streak >= self._cooldown_threshold:
-                # 连续失败越多，冷却越久：base×streak
-                self._cooldowns[name] = now + self._cooldown_base * streak
+                # 连续失败越多，冷却越久：指数退避 base × 2^(超出阈值的次数)，封顶 cooldown_max。
+                # 例（base=10, threshold=2）：第2次失败 10s、第3次 20s、第4次 40s……到顶后恒定。
+                # exponent 先封到 20：极端连击下避免计算 2^n 大整数（2^20×base 已远超合理封顶）。
+                exponent = min(streak - self._cooldown_threshold, 20)
+                duration = min(self._cooldown_base * (2 ** exponent), self._cooldown_max)
+                self._cooldowns[name] = now + duration
         if not fatal:
             return  # 可重试的瞬时失败：只进冷却，不做当日隔离
         try:
@@ -260,6 +298,7 @@ class WorkerPool(ParallelMixin, VotingMixin):
         if not p:
             return {"worker": worker, "ok": False, "status": ST_MISSING, "answer": "",
                     "error": f"子智能体 '{worker}' 不存在。可用：{', '.join(self.profiles) or '无'}"}
+        self._touch_latency()  # 顺带检查探测是否到期（点名派工也走这里，别漏刷新延迟档案）
         reason = self._skip_reason(worker)
         if reason == "冷却中":
             return {"worker": worker, "ok": False, "status": ST_COOLDOWN, "answer": "",
@@ -279,23 +318,43 @@ class WorkerPool(ParallelMixin, VotingMixin):
         """
         return self.render_answer(self.ask_result(worker, prompt, system))
 
-    def _fallback_target(self, p: AgentProfile, tried: set[str]) -> AgentProfile | None:
-        """同中转站（base_url + api_key 相同）下挑一个「当前可用且本轮未试过」的模型回退。
+    def _fallback_target(
+        self, p: AgentProfile, tried: set[str], memo: StationMemo | None = None,
+    ) -> AgentProfile | None:
+        """挑一个「当前可用且本轮未试过」的模型回退，供异常停止时自动恢复。
 
-        候选 = 同站模型列表里排除：本轮已尝试（tried）、当前冷却中、当日隔离的模型；
-        按 profiles 定义顺序取第一个（确定性）。无候选返回 None（调用方不再回退）。
-        不跨站（只在同 base_url 组），不回避「本批外部主也点名的同站模型」
-        （最多多打一次网络，无害）。
+        两级候选（确定性顺序）：
+        1) **同站优先**：同 (base_url, api_key) 组内、未试过、非冷却/隔离、且该站未被
+           本批次探明故障（memo）的模型；
+        2) **跨站兜底**（collaboration.fallback_cross_station=true 时）：同站无候选则从
+           整池挑「未试过、当前可用、且其所在站未死」的模型——这就是"子智能体异常
+           停止后自动换模型恢复"的落点。
+
+        memo 为本批次共享的「死站」记忆：已探明故障的站不再重复撞（抑制额度放大）。
+        候选内部再按延迟升序（问题5「优先选择延迟低的可用模型」）：同站/跨站各自排序后
+        取首个；无延迟样本时排序是恒等变换，回退行为与旧版逐字一致。
+        无候选返回 None（调用方不再回退）。
         """
-        peers = self._station_models.get((p.base_url, p.api_key)) or ()
-        for name in peers:
-            if name in tried:
-                continue
-            if self._skip_reason(name) is not None:  # 冷却/当日隔离的模型不再打
-                continue
-            prof = self.profiles.get(name)
-            if prof is not None:
-                return prof
+        # 1) 同站优先
+        same = [
+            n for n in (self._station_models.get((p.base_url, p.api_key)) or ())
+            if n not in tried and n in self.profiles and self._skip_reason(n) is None
+        ]
+        for name in self._latency_sorted(same):
+            prof = self.profiles[name]
+            if memo is not None and memo.is_dead((prof.base_url, prof.api_key)):
+                continue  # 该站本批次已判死，不再重复撞（抑制额度放大）
+            return prof
+        # 2) 跨站兜底（可关）
+        if not self._fallback_cross_station:
+            return None
+        cross = [
+            n for n, prof in self.profiles.items()
+            if n not in tried and self._skip_reason(n) is None
+            and not (memo is not None and memo.is_dead((prof.base_url, prof.api_key)))
+        ]
+        if cross:
+            return self.profiles[self._latency_sorted(cross)[0]]
         return None
 
     def _call_result(
@@ -305,12 +364,12 @@ class WorkerPool(ParallelMixin, VotingMixin):
     ) -> dict:
         """真正打一次网络：取（或复用）LLMClient → chat → 按控制流记结构化成败。
 
-        失败时按性质分级记账（#1/#2），并在「可重试错误 + 同站多模型」场景下自动
-        回退到同一中转站（base_url）的其它「当前可用」模型重试（见 _fallback_target）：
-        免费中转站常挂多个模型，某个模型节点抖动/限流时换同站其它模型往往能成，
-        避免一次抖动就浪费一整个免费额度。回退只在同站、不跨站、不重复试已试过的
-        模型、且受 fallback_models 上限约束；终态不可重试错误（认证等整站级问题）
-        不回退，直接判当日隔离。
+        失败时按性质分级记账（#1/#2），并在「可重试错误」场景下自动回退换模型重试
+        （见 _fallback_target）：先同站其它「当前可用」模型，同站无候选且
+        collaboration.fallback_cross_station=true 时再跨站、从整池挑未试过的可用模型——
+        即"子智能体异常停止就自动换模型恢复"，尽量不让一次抖动丢掉一个派工位。
+        回退不重复试已试过的模型、且受 fallback_models 上限约束（抑制额度蔓延）；
+        终态不可重试错误（认证等整站级问题）不回退，直接判当日隔离。
 
         无论成败都返回 dict、不抛异常；ask_many/collect/vote 依赖该契约。
         tried          本轮已尝试过的模型名集合（防回退环 / 重复打同一模型）
@@ -327,10 +386,6 @@ class WorkerPool(ParallelMixin, VotingMixin):
         tried.add(p.name)
         station = (p.base_url, p.api_key)
 
-        def _station_dead_now() -> bool:
-            # 回退决策时**实时**查（非入口快照）：主调用期间同站可能已被别的工人探明死。
-            return memo is not None and memo.is_dead(station)
-
         def _mark_station_dead() -> None:
             if memo is not None:
                 memo.mark_dead(station)
@@ -341,25 +396,27 @@ class WorkerPool(ParallelMixin, VotingMixin):
                 {"role": "system", "content": system or WORKER_SYSTEM},
                 {"role": "user", "content": prompt},
             ]
+            t0 = time.monotonic()  # 只量真实请求往返（不含建连），与探测同口径
             try:
                 resp = client.chat(messages)
             except LLMError as e:
-                # 可重试的瞬时错误 + 同站另有可用模型 + 本轮该站未探明死 ⇒ 回退重试
-                if e.retryable and fallbacks_left > 0 and not _station_dead_now():
-                    fb = self._fallback_target(p, tried)
+                # 可重试的瞬时错误 + 仍有回退额度 ⇒ 换模型重试（同站优先，可跨站恢复）。
+                # 死站抑制改由 _fallback_target 内的 memo 过滤承担，不再入口一刀切。
+                if e.retryable and fallbacks_left > 0:
+                    fb = self._fallback_target(p, tried, memo)
                     if fb is not None:
-                        # 当前模型记为瞬时失败（只冷却，当天仍可回来），换同站其它模型
+                        # 当前模型记为瞬时失败（只冷却，当天仍可回来），换其它模型续跑
                         self._record_result(p.name, ok=False, fatal=False)
                         return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
                 # 不再回退：按终态与否记账（可重试耗尽只冷却；终态当日隔离）
                 if e.retryable:
-                    _mark_station_dead()  # 可重试失败耗尽 ⇒ 抑制同站后续工人的回退放大
+                    _mark_station_dead()  # 可重试失败耗尽 ⇒ 抑制后续工人重复撞该站
                 self._record_result(p.name, ok=False, fatal=not e.retryable)
                 return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
                         "error": f"调用子智能体 '{p.name}' 失败 [{e.error_type}]：{e}"}
             except Exception as e:  # noqa: BLE001 - 意外异常按可重试处理，别全天拉黑
-                if fallbacks_left > 0 and not _station_dead_now():
-                    fb = self._fallback_target(p, tried)
+                if fallbacks_left > 0:
+                    fb = self._fallback_target(p, tried, memo)
                     if fb is not None:
                         self._record_result(p.name, ok=False, fatal=False)
                         return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
@@ -368,11 +425,14 @@ class WorkerPool(ParallelMixin, VotingMixin):
                 return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
                         "error": f"调用子智能体 '{p.name}' 失败：{type(e).__name__}: {e}"}
             self._record_result(p.name, ok=True)
+            # 真实成功派工也回填延迟档案（"一套"）：探测给小请求基线，真实调用把负载下的
+            # 实际表现也计入同一份中位数——两路事实共写一个账本，选路看的是同一套数字。
+            self._record_latency(p.name, (time.monotonic() - t0) * 1000.0)
             return {"worker": p.name, "ok": True, "status": ST_OK,
                     "answer": resp.get("content", "") or "(空回复)", "error": ""}
         except Exception as e:  # noqa: BLE001 - 连取 client 都失败，也不让派工崩（只冷却）
-            if fallbacks_left > 0 and not _station_dead_now():
-                fb = self._fallback_target(p, tried)
+            if fallbacks_left > 0:
+                fb = self._fallback_target(p, tried, memo)
                 if fb is not None:
                     self._record_result(p.name, ok=False, fatal=False)
                     return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
@@ -406,11 +466,31 @@ class WorkerPool(ParallelMixin, VotingMixin):
             self._clients[p.name] = client
             return client
 
-    def close(self) -> None:
-        """释放全部工人客户端连接池（幂等）。池被弃用时由持有方调用。"""
+    def _probe_client_for(self, p: AgentProfile) -> LLMClient:
+        """延迟探测专用客户端：短超时（cfg.latency_probe_timeout）且**不重试**（max_retries=0）。
+
+        与 _client_for 分开缓存、绝不复用同一实例：真实派工要容忍节点慢/抖动（120s + 重试），
+        探测只求"最快摸一下在不在、快不快"。若让探测继承派工超时策略，一个卡住的节点会把一次
+        测速拖成分钟级、白打多次请求，更会挂住同步 probe（bridge/MCP `latency probe:true`）整轮。
+        仍走 self._lock 保护（建/取缓存的临界区极短，chat 在锁外发起），不会与派工自锁。
+        """
         with self._lock:
-            clients = list(self._clients.values())
+            client = self._probe_clients.get(p.name)
+            if client is not None:
+                return client
+            client = LLMClient(
+                p.base_url, p.api_key, p.model,
+                timeout=self._latency_probe_timeout, max_retries=0,
+            )
+            self._probe_clients[p.name] = client
+            return client
+
+    def close(self) -> None:
+        """释放全部工人客户端连接池（含探测专用池，幂等）。池被弃用时由持有方调用。"""
+        with self._lock:
+            clients = list(self._clients.values()) + list(self._probe_clients.values())
             self._clients.clear()
+            self._probe_clients.clear()
         for c in clients:
             try:
                 c.close()

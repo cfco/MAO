@@ -152,9 +152,78 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M21 批次死站记忆不再抑制同站回退",
         "agent/core/orchestrator.py",
-        "                if e.retryable and fallbacks_left > 0 and not _station_dead_now():",
-        "                if e.retryable and fallbacks_left > 0:  # mutated: 忽略批次死站记忆",
+        "                    fb = self._fallback_target(p, tried, memo)",
+        "                    fb = self._fallback_target(p, tried, None)  # mutated: 忽略批次死站记忆",
         "tests/test_core.py::test_station_memo_suppresses_cross_worker_fallback",
+    ),
+    (
+        "M22 跨站回退被关闭（默认应开）",
+        "agent/core/orchestrator.py",
+        "        self._fallback_cross_station = self.cfg.fallback_cross_station",
+        "        self._fallback_cross_station = False  # mutated: 关闭跨站恢复",
+        "tests/test_core.py::test_fallback_cross_station_recovers",
+    ),
+    (
+        "M23 延迟档案不再共享",
+        "agent/core/latency.py",
+        """    key = Path(store_path)
+    with _shared_lock:
+        inst = _shared_instances.get(key)
+        if inst is None:
+            inst = LatencyStore(key)
+            _shared_instances[key] = inst
+        return inst""",
+        """    return LatencyStore(Path(store_path))""",
+        "tests/test_latency.py::test_get_latency_shares_instance_per_path",
+    ),
+    (
+        "M24 派工入口不做延迟裁剪",
+        "agent/core/orchestrator.py",
+        """        if limit is None:
+            live = self._latency_window(live)""",
+        """        if False:  # mutated: 关闭延迟裁剪
+            live = self._latency_window(live)""",
+        "tests/test_latency.py::test_pick_drops_slowest_share_and_sorts_by_latency",
+    ),
+    (
+        "M25 延迟窗口不再裁剪（只排序）",
+        "agent/core/latency.py",
+        "        drop = int(len(ordered) * (1.0 - self._latency_keep_ratio))",
+        "        drop = 0  # mutated: 不裁掉高延迟的",
+        "tests/test_latency.py::test_pick_small_pool_keeps_two_or_three",
+    ),
+    (
+        "M26 冷启动保护被去掉（无样本也裁剪）",
+        "agent/core/latency.py",
+        """        if len(known) < min(self._latency_min_samples, len(live)):
+            return live""",
+        """        if False:  # mutated: 证据不足也动刀
+            return live""",
+        "tests/test_latency.py::test_pick_without_enough_latency_data_does_not_prune",
+    ),
+    (
+        "M27 探测只覆盖可用节点",
+        "agent/core/latency.py",
+        "            self._prober.maybe_start(list(self.profiles))",
+        "            self._prober.maybe_start([w for w in self.profiles"
+        " if self._skip_reason(w) is None])  # mutated: 漏掉不可用节点",
+        "tests/test_latency.py::test_touch_latency_probe_covers_unavailable_nodes",
+    ),
+    (
+        "M28 无视自动探测开关（关不掉）",
+        "agent/core/latency.py",
+        """        if not self._latency_auto_probe:
+            return""",
+        """        if False:  # mutated: 关不掉自动探测
+            return""",
+        "tests/test_latency.py::test_probe_disabled_by_config_does_not_probe",
+    ),
+    (
+        "M29 health 快照不再带延迟",
+        "agent/core/orchestrator.py",
+        '                "latency_ms": lat.get(name),',
+        '                "latency_ms": None,  # mutated: 外部主看不到延迟',
+        "tests/test_latency.py::test_bridge_latency_command_reports_and_refreshes",
     ),
 ]
 

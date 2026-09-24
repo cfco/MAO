@@ -15,3 +15,9 @@ def isolate_model_health_store(tmp_path, monkeypatch):
     # 自动下线改写目标（model_registry.txt）同样隔离：worker 集成测试连跑 7 个
     # 运行日失败也可能触发 retire，绝不能落到真实仓库的模型清单上。
     monkeypatch.setenv("MAO_MODEL_REGISTRY_FILE", str(tmp_path / "model_registry.txt"))
+    # 延迟档案同理隔离：延迟样本会影响 pick() 的候选裁剪（问题5），跨用例串样本会让
+    # "轮转顺序/全员参与"这类断言随机失败。
+    monkeypatch.setenv("MAO_LATENCY_FILE", str(tmp_path / "model_latency.json"))
+    # 并整轮关掉延迟自动探测：默认开启时首个派工就会起后台守护线程真打网络，
+    # 离线用例必须完全无网络。测延迟探测本身的用例直接构造 LatencyProber（不经配置）。
+    monkeypatch.setenv("MAO_LATENCY_PROBE", "0")
