@@ -2,7 +2,7 @@
 
 覆盖：
 - LatencyStore：取样本中位数（抗单次长尾）、非法值忽略、落盘后换实例可读回、
-  按档案路径进程内共享（防多池互相覆写丢更新）
+  按档案路径进程内共享（防多池互相覆写丢更新）、并发落盘不丢样本
 - LatencyProber：从未探测过则首次即到期、一轮未结束不叠新一轮（单飞）、
   探测覆盖**全部节点（含冷却/隔离中的不可用节点）**、
   探测失败不写样本也**不**改可用性判定（不进冷却、不当日隔离）
@@ -64,6 +64,33 @@ def test_latency_store_keeps_only_recent_samples(tmp_path):
     for ms in (10.0, 20.0, 30.0, 40.0, 50.0, 900.0):
         s.record("w1", ms)
     assert s.get_ms("w1") == 40.0, "window 内是 [20,30,40,50,900] → 中位数 40"
+
+
+def test_latency_store_concurrent_records_all_persisted(tmp_path):
+    """并发 record 不得互相覆写：落盘的档案要含全部工人样本、不留临时文件。
+
+    与 health 同一口径：快照必须与写盘同在 _write_lock 内取，分开取则写盘顺序可能与
+    快照顺序相反，旧快照（少样本）覆盖新快照。这条在 Windows 本地很难复现，
+    CI ubuntu 上 health 的同款写法实测丢 2/100 条。
+    """
+    import json
+
+    path = tmp_path / "lat.json"
+    s = LatencyStore(path)
+
+    def writer(idx: int) -> None:
+        for j in range(20):
+            s.record(f"lt:{idx}-{j}", 10.0 + j)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert len(data["models"]) == 100
+    assert not list(tmp_path.glob("*.tmp")), "失败路径要清掉临时文件"
 
 
 def test_get_latency_shares_instance_per_path(tmp_path):

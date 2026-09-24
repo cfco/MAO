@@ -60,8 +60,9 @@ class LatencyStore:
     def __init__(self, store_path: Path):
         self.store_path = Path(store_path)
         self._lock = threading.Lock()
-        # 写盘专用锁：写盘在 _lock 之外（见 _write_payload），多线程并发 os.replace
-        # 到同一目标在 Windows 上会互相踩；串行化落盘。
+        # 写盘专用锁：**取快照 + 写盘**整段串行（见 _write_payload）。写盘在 _lock 之外
+        # （get_ms/snapshot 是热路径）；若快照取在 _write_lock 之外，写盘顺序可能与快照
+        # 顺序相反，旧快照会覆盖新快照丢样本。嵌套方向恒为 write_lock→lock。
         self._write_lock = threading.Lock()
         self._data: dict[str, dict] | None = None  # 懒加载：首次使用时才读盘
 
@@ -107,8 +108,7 @@ class LatencyStore:
             entry["samples"] = samples[-_MAX_SAMPLES:]
             entry["updated_at"] = time.time()
             self._data = _trim(self._data)
-            payload = self._snapshot_locked()
-        self._write_payload(payload)
+        self._write_payload()  # 快照+落盘都在 _write_lock 内串行，见 _write_payload
 
     # ---------- 落盘 ----------
 
@@ -130,10 +130,17 @@ class LatencyStore:
         payload = {"version": 1, "models": self._data}
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def _write_payload(self, text: str) -> None:
-        """原子写入档案（**锁外调用**）：临时文件 + os.replace，失败只丢持久化。"""
+    def _write_payload(self) -> None:
+        """取账本快照并原子写入档案（**_lock 之外调用**）：临时文件 + os.replace，失败只丢持久化。
+
+        快照在 _write_lock **之内**取（与 health._write_payload 同一口径）：分开取的话两个
+        线程的写盘顺序可能与快照顺序相反，旧快照覆盖新快照丢样本。落盘 IO 仍留在 _lock 之外，
+        get_ms/snapshot 不被慢盘拖住。
+        """
         tmp: Path | None = None
         with self._write_lock:
+            with self._lock:
+                text = self._snapshot_locked()
             try:
                 self.store_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self.store_path.with_name(
