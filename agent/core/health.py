@@ -30,7 +30,7 @@ fail_dates 只保留最近 _MAX_DATES_KEPT 条、active_dates 只保留最近 _M
 条，防止文件无界增长。旧版 version 1（无 active_dates）可读：视为运行日未知。
 
 并发：自带独立锁（与 WorkerPool 的锁相互独立，嵌套方向恒为 pool→health，
-不会反向，无死锁环）；写盘原子化（临时文件 + os.replace）。
+不会反向，无死锁环）；落盘另有 _write_lock，嵌套方向恒为 write_lock→health。写盘原子化（临时文件 + os.replace）。
 离线可测：record_failure 支持显式指定日期 day，不必等真实时间流逝。
 """
 from __future__ import annotations
@@ -64,8 +64,9 @@ class ModelHealth:
         self.registry_path = Path(registry_path) if registry_path else None
         self.retire_days = max(1, int(retire_days))
         self._lock = threading.Lock()
-        # 落盘专用锁：写盘已移到 _lock 之外（见 _write_payload），多个线程可能同时
-        # 落盘 —— 需要串行化，否则并发 os.replace 到同一目标在 Windows 上会互相踩。
+        # 落盘专用锁：**取快照 + 写盘**整段串行（见 _write_payload）。写盘在 _lock 之外，
+        # 多线程可能同时落盘；若快照在 _write_lock 之外取，写盘顺序可能与快照顺序相反，
+        # 旧快照会覆盖新快照丢记账。嵌套方向恒为 write_lock→lock，与 pool→health 同向无环。
         self._write_lock = threading.Lock()
         self._data: dict[str, dict] | None = None  # 懒加载：首次使用时才读盘
         self._active: list[str] = []  # 运行日清单（加载后随记账增长）
@@ -106,10 +107,10 @@ class ModelHealth:
             if not entry.get("disabled") and self._streak_full_locked(entry["fail_dates"]):
                 entry["disabled"] = day
                 disabled_now = True  # registry 改写是 IO，放锁外做（理由同写盘）
-            payload = self._snapshot_locked()
         # 文件 IO 放锁外：quarantined() 是派工热路径，持锁写会把 health 锁串到
-        # pool 锁、卡住全进程派工。锁内只更新内存并取快照，写盘用快照文本。
-        self._write_payload(payload)
+        # pool 锁、卡住全进程派工。快照与落盘都在 _write_lock 内串行（见 _write_payload），
+        # 这里只负责记账完就通知落盘。
+        self._write_payload()
         if disabled_now:
             notice = self._notice_and_retire(name, model, models_env)
         return notice
@@ -119,8 +120,7 @@ class ModelHealth:
         with self._lock:
             self._ensure_loaded()
             self._mark_active_locked(day or _today())
-            payload = self._snapshot_locked()
-        self._write_payload(payload)  # 文件 IO 放锁外，理由同 record_failure
+        self._write_payload()  # 落盘放锁外，理由同 record_failure
 
     # ---------- 运行日记录 ----------
 
@@ -220,15 +220,23 @@ class ModelHealth:
         payload = {"version": 2, "active_dates": list(self._active), "models": self._data}
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def _write_payload(self, text: str) -> None:
-        """把快照原子写入档案。**锁外调用**，不阻塞 quarantined() 等热路径。
+    def _write_payload(self) -> None:
+        """取账本快照并原子写入档案。**_lock 之外调用**，不阻塞 quarantined() 等热路径。
 
-        自己带一把写盘锁（_write_lock）串行化落盘：写盘移出 _lock 后多个线程可能
-        同时写，并发 os.replace 到同一目标在 Windows 上会互相踩（实测残留 .tmp
-        垃圾文件）。临时文件名仍带 pid+线程号，失败时清理，不留残留。
+        快照必须在 _write_lock **之内**取：若调用方在 _lock 里先取好文本、再来排队写盘，
+        两个线程的"写盘顺序"与"快照顺序"可能相反 —— 后写盘的反而拿着更早（少记账）的快照，
+        把先写盘的全量快照整段覆盖掉（lost update；并发 record_failure 实测会丢档案条目，
+        慢盘/多核 Linux 上尤其容易撞见）。取快照与写盘同域串行后，写盘顺序即快照顺序，
+        每次落盘都是上一次的超集。落盘 IO 仍留在 _lock 之外：quarantined() 只拿 _lock，
+        不会被慢盘阻塞（见 tests/test_audit2_fixes.py 的 M17 变异用例）。
+
+        另带一把写盘锁串行化本身：并发 os.replace 到同一目标在 Windows 上会互相踩
+        （实测残留 .tmp 垃圾文件）。临时文件名带 pid+线程号，失败时清理，不留残留。
         """
         tmp: Path | None = None
         with self._write_lock:
+            with self._lock:
+                text = self._snapshot_locked()
             try:
                 self.store_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self.store_path.with_name(

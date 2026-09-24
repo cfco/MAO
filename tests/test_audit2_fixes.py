@@ -111,7 +111,12 @@ def test_persist_does_not_block_quarantine_queries(tmp_path, monkeypatch):
 
 
 def test_concurrent_record_failure_keeps_store_parsable(tmp_path):
-    """写盘移到锁外后并发落盘不得互相踩：档案要能解析、不留临时文件。"""
+    """写盘移到锁外后并发落盘不得互相踩：档案要能解析、不留临时文件。
+
+    快照必须与落盘同在 _write_lock 内取（health._write_payload）：分开取则"写盘顺序"可能与
+    "快照顺序"相反，旧快照覆盖新快照丢记账。这条在 Windows 本地很难复现（调度太整齐），
+    但 CI ubuntu 上实测会丢 2/100 条 —— 别因为它常绿就动回原写法。
+    """
     import json
 
     store = tmp_path / "h.json"
