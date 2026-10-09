@@ -8,6 +8,7 @@
 提示词"——外部主按需调用：先经 list_tools/自身机制了解有技能可用，判断相关后再用
 load_skill 工具读取全文。本模块只负责扫描、按需加载全文、执行脚本三件事。
 """
+
 from __future__ import annotations
 
 import json
@@ -50,14 +51,20 @@ class SkillManager:
         self.skills: dict[str, dict] = {}
 
     def scan(self) -> None:
-        """扫描所有 */SKILL.md，解析 frontmatter。"""
+        """扫描所有 */SKILL.md，解析 frontmatter。单个技能文件坏掉只跳过该技能。
+
+        except 必须覆盖 UnicodeDecodeError：它是 ValueError 子类而非 OSError，
+        一个非 UTF-8 编码的 SKILL.md 若逃出这里，就会一路炸穿 Bridge.__init__，
+        让 bridge 与 mcp 两个入口全都起不来——一个技能文件不该有这种破坏力。
+        """
         self.skills.clear()
         if not self.skills_dir.exists():
             return
         for skill_md in sorted(self.skills_dir.glob("*/SKILL.md")):
             try:
                 meta = self._parse_frontmatter(skill_md.read_text(encoding="utf-8"))
-            except OSError:
+            except (OSError, ValueError) as e:
+                print(f"[技能警告] 跳过无法读取的 {skill_md}：{type(e).__name__}", file=sys.stderr)
                 continue
             name = str(meta.get("name") or skill_md.parent.name)
             self.skills[name] = {
@@ -82,18 +89,28 @@ class SkillManager:
         info = self.skills.get(name)
         if not info:
             return ToolResult(
-                f"错误：技能 '{name}' 不存在。可用技能：{', '.join(self.skills) or '无'}", ok=False)
-        return (info["dir"] / "SKILL.md").read_text(encoding="utf-8")
+                f"错误：技能 '{name}' 不存在。可用技能：{', '.join(self.skills) or '无'}", ok=False
+            )
+        try:
+            return (info["dir"] / "SKILL.md").read_text(encoding="utf-8")
+        except (OSError, ValueError) as e:
+            # 扫描之后文件仍可能被改坏或删除；这里要回到工具错误文案，
+            # 而不是把裸异常抛给上层的通用兜底（外部主会收到看不懂的技术栈）。
+            return ToolResult(
+                f"错误：技能 '{name}' 的 SKILL.md 读取失败：{type(e).__name__}", ok=False
+            )
 
     def run_script(self, skill: str, script: str, args: dict | None = None) -> str:
         info = self.skills.get(skill)
         if not info:
             return ToolResult(
-                f"错误：技能 '{skill}' 不存在。可用技能：{', '.join(self.skills) or '无'}", ok=False)
+                f"错误：技能 '{skill}' 不存在。可用技能：{', '.join(self.skills) or '无'}", ok=False
+            )
         name = _safe_script_name(script)
         if name is None:
             return ToolResult(
-                f"错误：脚本名非法（只能是 scripts/ 下的文件名）：{script!r}", ok=False)
+                f"错误：脚本名非法（只能是 scripts/ 下的文件名）：{script!r}", ok=False
+            )
         scripts_dir = info["dir"] / "scripts"
         path = scripts_dir / name
         # 双保险：即便上面的白名单被绕过，落点也必须仍在技能自己的 scripts/ 内，
@@ -101,8 +118,7 @@ class SkillManager:
         try:
             path.resolve().relative_to(scripts_dir.resolve())
         except (ValueError, OSError):
-            return ToolResult(
-                f"错误：脚本路径超出技能目录，已拒绝：{script!r}", ok=False)
+            return ToolResult(f"错误：脚本路径超出技能目录，已拒绝：{script!r}", ok=False)
         if not path.exists():
             return ToolResult(f"错误：脚本不存在：{path}", ok=False)
         payload = json.dumps(args or {}, ensure_ascii=False)
@@ -114,9 +130,9 @@ class SkillManager:
                 timeout=SCRIPT_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            return ToolResult(
-                f"错误：脚本超过 {SCRIPT_TIMEOUT} 秒未完成，已终止", ok=False)
+            return ToolResult(f"错误：脚本超过 {SCRIPT_TIMEOUT} 秒未完成，已终止", ok=False)
         from .tools.builtin import _decode
+
         parts = []
         if proc.stdout:
             parts.append(_decode(proc.stdout)[-8000:])
@@ -127,33 +143,40 @@ class SkillManager:
 
 
 def register_skill_tools(registry: ToolRegistry, manager: SkillManager) -> None:
-    registry.register(FunctionTool(
-        name="load_skill",
-        description="读取指定技能的完整说明（SKILL.md）。系统提示词中的技能列表若与当前任务相关，先调用本工具再行动。",
-        input_schema={
-            "type": "object",
-            "properties": {"name": {"type": "string", "description": "技能名"}},
-            "required": ["name"],
-        },
-        func=lambda a: manager.load_full(str(a.get("name", ""))),
-    ))
-    registry.register(FunctionTool(
-        name="run_skill_script",
-        description=(
-            "执行技能自带的 Python 脚本（与 bridge/mcp 的 run_skill_script 指令同名，"
-            "避免 list_tools 与协议文档出现两套名字）。脚本通过命令行参数接收一个 JSON "
-            "字符串，结果用 stdout 输出。"
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "skill": {"type": "string", "description": "技能名"},
-                "script": {"type": "string", "description": "scripts/ 目录下的脚本文件名，如 hello.py"},
-                "args": {"type": "object", "description": "传给脚本的参数对象", "default": {}},
+    registry.register(
+        FunctionTool(
+            name="load_skill",
+            description="读取指定技能的完整说明（SKILL.md）。系统提示词中的技能列表若与当前任务相关，先调用本工具再行动。",
+            input_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "技能名"}},
+                "required": ["name"],
             },
-            "required": ["skill", "script"],
-        },
-        func=lambda a: manager.run_script(
-            str(a.get("skill", "")), str(a.get("script", "")), a.get("args") or {}
-        ),
-    ))
+            func=lambda a: manager.load_full(str(a.get("name", ""))),
+        )
+    )
+    registry.register(
+        FunctionTool(
+            name="run_skill_script",
+            description=(
+                "执行技能自带的 Python 脚本（与 bridge/mcp 的 run_skill_script 指令同名，"
+                "避免 list_tools 与协议文档出现两套名字）。脚本通过命令行参数接收一个 JSON "
+                "字符串，结果用 stdout 输出。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "skill": {"type": "string", "description": "技能名"},
+                    "script": {
+                        "type": "string",
+                        "description": "scripts/ 目录下的脚本文件名，如 hello.py",
+                    },
+                    "args": {"type": "object", "description": "传给脚本的参数对象", "default": {}},
+                },
+                "required": ["skill", "script"],
+            },
+            func=lambda a: manager.run_script(
+                str(a.get("skill", "")), str(a.get("script", "")), a.get("args") or {}
+            ),
+        )
+    )

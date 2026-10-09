@@ -11,6 +11,7 @@ _effective_timeout / _spawn / _run_parallel）约 100 行，与「派工 + 健�
 方法通过 self 访问 WorkerPool 的 cfg / ask_result / max_workers 等，与 VotingMixin
 同模式：本类不单独实例化，由 WorkerPool(ParallelMixin, VotingMixin) 提供 self 上下文。
 """
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -19,6 +20,7 @@ import time
 from concurrent.futures import Future, wait
 
 from .constants import ST_ERROR
+from .redact import safe_error_text
 
 
 class StationMemo:
@@ -63,7 +65,10 @@ class ParallelMixin:
     # ---------- 并行派工 ----------
 
     def _wait_gather(
-        self, futs: dict[Future, str], timeout: float, on_done=None,
+        self,
+        futs: dict[Future, str],
+        timeout: float,
+        on_done=None,
     ) -> dict[str, dict | None]:
         """等待一批 {Future: 工人名}，整体限时，返回 {工人: 结果 dict 或 None}。
 
@@ -73,15 +78,18 @@ class ParallelMixin:
         ask_result 本身不抛，这里的 except 只是兜底：万一抛了也归一成 error dict。
         """
         fut_to_worker = futs
-        deadline = time.time() + timeout
+        # 整体限时用 monotonic：与 futures.wait 内部同源，墙钟被 NTP 回拨时不会把这一批
+        # 平白多等一小时（正向跳变则提前把还在跑的工人误标 timeout）。
+        deadline = time.monotonic() + timeout
         out: dict[str, dict | None] = {}
         pending = set(fut_to_worker)
         while pending:
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             done, pending = wait(
-                pending, timeout=min(remaining, 0.5),
+                pending,
+                timeout=min(remaining, 0.5),
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
             for fut in done:
@@ -89,8 +97,13 @@ class ParallelMixin:
                 try:
                     res = fut.result()
                 except Exception as e:  # noqa: BLE001 - 兜底归一成结构化 error，绝不下游解析文本
-                    res = {"worker": w, "ok": False, "status": ST_ERROR, "answer": "",
-                           "error": f"派工异常：{type(e).__name__}: {e}"}
+                    res = {
+                        "worker": w,
+                        "ok": False,
+                        "status": ST_ERROR,
+                        "answer": "",
+                        "error": f"派工异常：{type(e).__name__}: {safe_error_text(e)}",
+                    }
                 out[w] = res
                 if on_done is not None:
                     try:
@@ -118,17 +131,14 @@ class ParallelMixin:
         if workers is None:
             return max(1, min(cap, n))
         profiles = getattr(self, "profiles", None) or {}
-        stations = {
-            (p.base_url, p.api_key) for w in workers
-            if (p := profiles.get(w)) is not None
-        }
+        stations = {(p.base_url, p.api_key) for w in workers if (p := profiles.get(w)) is not None}
         if not stations:
             return max(1, min(cap, n))
-        per_station = max(1, getattr(self, "_max_per_station", self.cfg.max_per_station))
-        return max(1, min(cap, per_station * len(stations)))
+        return self._station_parallel_cap(len(stations))
 
-    def _effective_timeout(self, n: int, timeout: float | None,
-                           workers: list[str] | None = None) -> float:
+    def _effective_timeout(
+        self, n: int, timeout: float | None, workers: list[str] | None = None
+    ) -> float:
         """批量派工的整体限时：显式传入优先，缺省按「批次 × 单请求超时」推导。
 
         为什么不用固定 300s：批次 = ceil(n / 实际并行度)，每批最长 llm.timeout 秒。
@@ -173,7 +183,11 @@ class ParallelMixin:
         return fut
 
     def _run_parallel(
-        self, workers: list[str], prompt: str, system: str | None, timeout: float,
+        self,
+        workers: list[str],
+        prompt: str,
+        system: str | None,
+        timeout: float,
         on_done=None,
     ) -> dict[str, dict | None]:
         """并行派工给多个工人并限时收集；未完成的放弃等待（daemon 线程，不拖退出）。

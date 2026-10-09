@@ -20,6 +20,7 @@
   latency.py      —— 模型延迟档案 + 定时探测器（选路用"快不快"）
   llm.py          —— LLM 适配层
 """
+
 from __future__ import annotations
 
 import sys
@@ -40,6 +41,7 @@ from .health import ModelHealth, get_health
 from .latency import LatencyMixin, LatencyStore
 from .llm import LLMClient, LLMError
 from .parallelism import ParallelMixin, StationMemo
+from .redact import safe_error_text
 from .station_gate import StationGateMixin
 from .voting import VotingMixin
 
@@ -63,8 +65,13 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
     render_answer 均在 VotingMixin 中定义，这里专注派工与健康逻辑。
     """
 
-    def __init__(self, cfg: Config, exclude: str | None = None,
-                 health: ModelHealth | None = None, latency: LatencyStore | None = None):
+    def __init__(
+        self,
+        cfg: Config,
+        exclude: str | None = None,
+        health: ModelHealth | None = None,
+        latency: LatencyStore | None = None,
+    ):
         self.cfg = cfg
         self.profiles: dict[str, AgentProfile] = {
             p.name: p for p in cfg.agent_profiles if p.name != exclude
@@ -75,8 +82,10 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         # 默认构造走 get_health()：同一档案路径全进程共享一个实例，避免多个工人池各持
         # 独立内存账本互相覆盖写盘、且彼此看不到隔离结果（见 health.get_health）。
         # registry_path（自动下线改写目标）与 retire_days（运行日阈值）一并传入。
-        self.health = health if health is not None else get_health(
-            cfg.model_health_path, cfg.model_registry_path, cfg.retire_days
+        self.health = (
+            health
+            if health is not None
+            else get_health(cfg.model_health_path, cfg.model_registry_path, cfg.retire_days)
         )
         # 模型延迟档案（问题5）：与 health 并列的一层——health 管"能不能用"，
         # 本档案管"快不快用"。同一批可用工人里优先派延迟低的（见 pick/_latency_window），
@@ -88,21 +97,30 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         self._env_of = {n: p.models_env for n, p in self.profiles.items()}
         # 节点健康：连续失败达阈值进入冷却，冷却期内跳过该节点。
         # 冷却时长指数上升，成功即清零。
-        self._cooldowns: dict[str, float] = {}  # name -> 冷却到期时间戳
+        # name -> 冷却到期时刻。计时一律走 time.monotonic：冷却是"进程内还要等多久"的
+        # 时限，用墙钟的话 NTP 校时/时区切换回拨一小时，就把一个 10s 冷却变成 1 小时
+        # 空转（正向跳变则提前放行坏节点）。本表不进持久化，跨进程/重启无需可比性。
+        self._cooldowns: dict[str, float] = {}
         self._fail_streak: dict[str, int] = {}  # name -> 连续失败次数
         self._cooldown_threshold = self.cfg.as_int(
             self.cfg.collab_cfg.get("cooldown_fails", 2),
-            "collaboration.cooldown_fails", 2, minimum=1,
+            "collaboration.cooldown_fails",
+            2,
+            minimum=1,
         )
         self._cooldown_base = self.cfg.as_float(
             self.cfg.collab_cfg.get("cooldown_base", 10),
-            "collaboration.cooldown_base", 10.0, minimum=0.0,
+            "collaboration.cooldown_base",
+            10.0,
+            minimum=0.0,
         )
         # 指数退避封顶（秒）：连续失败时长按 2 的幂翻倍，到顶后恒定，
         # 防止一个长期坏节点被算出天量冷却（否则 2^n 会很快溢出到数小时）。
         self._cooldown_max = self.cfg.as_int(
             self.cfg.collab_cfg.get("cooldown_max", 3600),
-            "collaboration.cooldown_max", 3600, minimum=1,
+            "collaboration.cooldown_max",
+            3600,
+            minimum=1,
         )
         # 并发安全：ask_many/vote 用线程池并发调用 ask，健康状态与客户端缓存
         # （_clients）都需加锁保护。（历史上此处还有 LRU 答案缓存与并发在飞去重，
@@ -114,6 +132,10 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         # 绝不合用同一实例——派工要容忍节点慢/抖动（llm.timeout 120s + 重试），探测只求"最快摸
         # 一下在不在、快不快"，坏节点绝不能把测速拖成分钟级或打出多次请求，更会挂住同步 probe 整轮。
         self._probe_clients: dict[str, LLMClient] = {}
+        # 客户端缓存独立一把锁：建 LLMClient 要建 httpx 客户端与 SSL 上下文（非纯内存操作），
+        # 绝不能压在 self._lock 里——那会让并发首派把 _record_result / health_status 的
+        # 纯内存记账一起串行化。两把锁互不嵌套（本缓存路径不碰记账，记账路径不建客户端）。
+        self._clients_lock = threading.Lock()
         # pick() 轮转游标（#6）：随默认批量派工的调用推进，把负载摊到整个池，
         # 而非每次死取头部 N 个。单进程一池共享 → 全局 round-robin。
         # _pick_lock 单独一把：MCP 外壳下宿主可并发发工具调用（同步工具跑在线程池），
@@ -172,6 +194,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         if tags:
             need = {t.strip() for t in str(tags).split(",") if t.strip()}
             if need:
+
                 def _has_tags(name: str) -> bool:
                     have = {
                         t.strip()
@@ -179,6 +202,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                         if t.strip()
                     }
                     return need <= have
+
                 live = [w for w in live if _has_tags(w)]
         if limit is None:
             live = self._latency_window(live)
@@ -200,46 +224,34 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         字段语义上，available 是"能不能用"，latency_ms 是"快不快用"——两者独立：
         一个可用但很慢的节点仍然 available=True，只是默认派工会把它排在后面/裁掉。
         """
-        now = time.time()
+        now = time.monotonic()
         lat = self.latency.snapshot()
+        # 冷却表一次取全：逐工人取锁拼出来的"快照"，同一轮里各条目的时点会不一致
+        # （先取的条目可能已被并发派工改过），与已修的"快照移入锁内取"同一族问题。
+        with self._lock:
+            untils = dict(self._cooldowns)
         out: list[dict] = []
         for name, p in self.profiles.items():
-            with self._lock:
-                until = self._cooldowns.get(name, 0.0)
+            until = untils.get(name, 0.0)
             quarantined = self.health.quarantined(name)
-            out.append({
-                "worker": name, "model": p.model,
-                "tags": getattr(p, "tags", ""),
-                "available": until <= now and not quarantined,
-                "cooldown_s": round(max(0.0, until - now), 1),
-                "quarantined_today": quarantined,
-                "latency_ms": lat.get(name),
-            })
+            out.append(
+                {
+                    "worker": name,
+                    "model": p.model,
+                    "tags": getattr(p, "tags", ""),
+                    "available": until <= now and not quarantined,
+                    "cooldown_s": round(max(0.0, until - now), 1),
+                    "quarantined_today": quarantined,
+                    "latency_ms": lat.get(name),
+                }
+            )
         return out
-
-    # ---------- 兜底单模型纳入健康体系（#8）----------
-    # ask 不带 agent 时走 cfg.llm 的兜底模型，它不是池里的 profile，历史上完全
-    # 游离在冷却/当日隔离之外，与主路线容错语义割裂。这里给它一个合成键 solo:<model>，
-    # 复用同一套 _skip_reason / _record_result，让兜底路径也"抖了会退避、终态失败当天不再打"。
-
-    def solo_key(self) -> str:
-        """兜底单模型在健康体系里的合成键。"""
-        return f"solo:{self.cfg.llm.get('model', '')}"
-
-    def is_dispatchable(self, name: str) -> tuple[bool, str]:
-        """任意键（含 solo 键）当前能否派工，返回 (可用?, 原因或空串)。"""
-        reason = self._skip_reason(name)
-        return (reason is None, reason or "")
-
-    def note_result(self, name: str, ok: bool, fatal: bool = False) -> None:
-        """记录任意键一次成败：冷却照记；fatal（终态不可重试）才当日隔离。"""
-        self._record_result(name, ok=ok, fatal=fatal)
 
     def _is_in_cooldown(self, name: str) -> bool:
         """该节点是否处于冷却期（冷却期跳过，避免反复打一个坏节点）。"""
         with self._lock:
             until = self._cooldowns.get(name, 0.0)
-        return time.time() < until
+        return time.monotonic() < until
 
     def _skip_reason(self, name: str) -> str | None:
         """该工人当前不可派工的原因（'冷却中' / '当日失败隔离'），None=可派。
@@ -267,7 +279,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
 
         档案落盘在池锁外做，失败路径不在热路径上，多一次小文件写无碍。
         """
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             if ok:
                 self._cooldowns.pop(name, None)
@@ -280,7 +292,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                 # 例（base=10, threshold=2）：第2次失败 10s、第3次 20s、第4次 40s……到顶后恒定。
                 # exponent 先封到 20：极端连击下避免计算 2^n 大整数（2^20×base 已远超合理封顶）。
                 exponent = min(streak - self._cooldown_threshold, 20)
-                duration = min(self._cooldown_base * (2 ** exponent), self._cooldown_max)
+                duration = min(self._cooldown_base * (2**exponent), self._cooldown_max)
                 self._cooldowns[name] = now + duration
         if not fatal:
             return  # 可重试的瞬时失败：只进冷却，不做当日隔离
@@ -293,8 +305,9 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         if notice:
             print(notice, file=sys.stderr)  # stderr：bridge/--stream 的 stdout 必须纯净
 
-    def ask_result(self, worker: str, prompt: str, system: str | None = None,
-                   memo: StationMemo | None = None) -> dict:
+    def ask_result(
+        self, worker: str, prompt: str, system: str | None = None, memo: StationMemo | None = None
+    ) -> dict:
         """派工核心：返回结构化结果 {worker, ok, status, answer, error}（永不抛异常）。
 
         全部派工路径（ask / ask_many / collect / vote / run_review）的唯一事实源：
@@ -303,17 +316,33 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         """
         p = self.profiles.get(worker)
         if not p:
-            return {"worker": worker, "ok": False, "status": ST_MISSING, "answer": "",
-                    "error": f"子智能体 '{worker}' 不存在。可用：{', '.join(self.profiles) or '无'}"}
+            return {
+                "worker": worker,
+                "ok": False,
+                "status": ST_MISSING,
+                "answer": "",
+                "error": f"子智能体 '{worker}' 不存在。可用：{', '.join(self.profiles) or '无'}",
+            }
         self._touch_latency()  # 顺带检查探测是否到期（点名派工也走这里，别漏刷新延迟档案）
         reason = self._skip_reason(worker)
         if reason == "冷却中":
-            return {"worker": worker, "ok": False, "status": ST_COOLDOWN, "answer": "",
-                    "error": f"子智能体 '{worker}' 近期连续失败，正在冷却中，建议稍后再试或换其它工人"}
+            return {
+                "worker": worker,
+                "ok": False,
+                "status": ST_COOLDOWN,
+                "answer": "",
+                "error": f"子智能体 '{worker}' 近期连续失败，正在冷却中，建议稍后再试或换其它工人",
+            }
         if reason == "当日失败隔离":
-            return {"worker": worker, "ok": False, "status": ST_QUARANTINED, "answer": "",
-                    "error": (f"子智能体 '{worker}' 今日调用已失败，当天隔离不再派工，"
-                              "请换其它工人或明天再试")}
+            return {
+                "worker": worker,
+                "ok": False,
+                "status": ST_QUARANTINED,
+                "answer": "",
+                "error": (
+                    f"子智能体 '{worker}' 今日调用已失败，当天隔离不再派工，请换其它工人或明天再试"
+                ),
+            }
         return self._call_result(p, system, prompt, memo=memo)
 
     def ask(self, worker: str, prompt: str, system: str | None = None) -> str:
@@ -326,7 +355,10 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         return self.render_answer(self.ask_result(worker, prompt, system))
 
     def _fallback_target(
-        self, p: AgentProfile, tried: set[str], memo: StationMemo | None = None,
+        self,
+        p: AgentProfile,
+        tried: set[str],
+        memo: StationMemo | None = None,
     ) -> AgentProfile | None:
         """挑一个「当前可用且本轮未试过」的模型回退，供异常停止时自动恢复。
 
@@ -344,7 +376,8 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         """
         # 1) 同站优先
         same = [
-            n for n in (self._station_models.get((p.base_url, p.api_key)) or ())
+            n
+            for n in (self._station_models.get((p.base_url, p.api_key)) or ())
             if n not in tried and n in self.profiles and self._skip_reason(n) is None
         ]
         for name in self._latency_sorted(same):
@@ -356,8 +389,10 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         if not self._fallback_cross_station:
             return None
         cross = [
-            n for n, prof in self.profiles.items()
-            if n not in tried and self._skip_reason(n) is None
+            n
+            for n, prof in self.profiles.items()
+            if n not in tried
+            and self._skip_reason(n) is None
             and not (memo is not None and memo.is_dead((prof.base_url, prof.api_key)))
         ]
         if cross:
@@ -365,8 +400,12 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         return None
 
     def _call_result(
-        self, p: AgentProfile, system: str | None, prompt: str,
-        tried: set[str] | None = None, fallbacks_left: int | None = None,
+        self,
+        p: AgentProfile,
+        system: str | None,
+        prompt: str,
+        tried: set[str] | None = None,
+        fallbacks_left: int | None = None,
         memo: StationMemo | None = None,
     ) -> dict:
         """真正打一次网络：取（或复用）LLMClient → chat → 按控制流记结构化成败。
@@ -415,30 +454,51 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                         if fb is not None:
                             # 当前模型记为瞬时失败（只冷却，当天仍可回来），换其它模型续跑
                             self._record_result(p.name, ok=False, fatal=False)
-                            return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
+                            return self._call_result(
+                                fb, system, prompt, tried, fallbacks_left - 1, memo
+                            )
                     # 不再回退：按终态与否记账（可重试耗尽只冷却；终态当日隔离）
                     if err.retryable:
                         _mark_station_dead()  # 可重试失败耗尽 ⇒ 抑制后续工人重复撞该站
                     self._record_result(p.name, ok=False, fatal=not err.retryable)
-                    return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
-                            "error": f"调用子智能体 '{p.name}' 失败 [{err.error_type}]：{err}"}
+                    return {
+                        "worker": p.name,
+                        "ok": False,
+                        "status": ST_ERROR,
+                        "answer": "",
+                        "error": f"调用子智能体 '{p.name}' 失败 [{err.error_type}]："
+                        f"{safe_error_text(err)}",
+                    }
                 if fallbacks_left > 0:
                     fb = self._fallback_target(p, tried, memo)
                     if fb is not None:
                         self._record_result(p.name, ok=False, fatal=False)
-                        return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
+                        return self._call_result(
+                            fb, system, prompt, tried, fallbacks_left - 1, memo
+                        )
                 _mark_station_dead()
                 self._record_result(p.name, ok=False, fatal=False)
-                return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
-                        "error": f"调用子智能体 '{p.name}' 失败：{type(err).__name__}: {err}"}
+                return {
+                    "worker": p.name,
+                    "ok": False,
+                    "status": ST_ERROR,
+                    "answer": "",
+                    "error": f"调用子智能体 '{p.name}' 失败："
+                    f"{type(err).__name__}: {safe_error_text(err)}",
+                }
             self._record_result(p.name, ok=True)
             # 真实成功派工也回填延迟档案（"一套"）：探测给小请求基线，真实调用把负载下的
             # 实际表现也计入同一份中位数——两路事实共写一个账本，选路看的是同一套数字。
             # elapsed_ms 由 _chat_gated 在**门内**计时：排队等同站前一个请求的秒数绝不能
             # 写进延迟档案，否则同站串行会被误记成"这个模型慢"，选路随之裁错。
             self._record_latency(p.name, elapsed_ms)
-            return {"worker": p.name, "ok": True, "status": ST_OK,
-                    "answer": resp.get("content", "") or "(空回复)", "error": ""}
+            return {
+                "worker": p.name,
+                "ok": True,
+                "status": ST_OK,
+                "answer": resp.get("content", "") or "(空回复)",
+                "error": "",
+            }
         except Exception as e:  # noqa: BLE001 - 连取 client 都失败，也不让派工崩（只冷却）
             if fallbacks_left > 0:
                 fb = self._fallback_target(p, tried, memo)
@@ -447,8 +507,13 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                     return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
             _mark_station_dead()
             self._record_result(p.name, ok=False, fatal=False)
-            return {"worker": p.name, "ok": False, "status": ST_ERROR, "answer": "",
-                    "error": f"调用子智能体 '{p.name}' 异常：{type(e).__name__}: {e}"}
+            return {
+                "worker": p.name,
+                "ok": False,
+                "status": ST_ERROR,
+                "answer": "",
+                "error": f"调用子智能体 '{p.name}' 异常：{type(e).__name__}: {safe_error_text(e)}",
+            }
 
     def _client_for(self, p: AgentProfile) -> LLMClient:
         """按 profile.name 复用 LLMClient；首次访问时按工人配置创建并缓存。
@@ -456,9 +521,12 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
 
         加锁创建：并发派工（ask_many/vote）下同一工人会被多个线程同时首次访问，
         不加锁会各建一个 LLMClient（多套连接池，其中一个被覆盖后无人引用）。
+        缓存单走**独立的 _clients_lock**，不复用池记账锁 self._lock——LLMClient 构造要建
+        httpx 客户端与 SSL 上下文（毫秒~几十毫秒级），压在 self._lock 里会让并发首派把
+        _record_result / health_status 这些纯内存记账一起串行化。
         调用方（_lead）在调本方法时并未持有 self._lock，故不会自锁。
         """
-        with self._lock:
+        with self._clients_lock:
             client = self._clients.get(p.name)
             if client is not None:
                 return client
@@ -469,8 +537,11 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                 self.cfg.llm_cfg.get("max_retries", 2), "llm.max_retries", 2, minimum=0
             )
             client = LLMClient(
-                p.base_url, p.api_key, p.model,
-                timeout=timeout, max_retries=max_retries,
+                p.base_url,
+                p.api_key,
+                p.model,
+                timeout=timeout,
+                max_retries=max_retries,
             )
             self._clients[p.name] = client
             return client
@@ -481,22 +552,24 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         与 _client_for 分开缓存、绝不复用同一实例：真实派工要容忍节点慢/抖动（120s + 重试），
         探测只求"最快摸一下在不在、快不快"。若让探测继承派工超时策略，一个卡住的节点会把一次
         测速拖成分钟级、白打多次请求，更会挂住同步 probe（bridge/MCP `latency probe:true`）整轮。
-        仍走 self._lock 保护（建/取缓存的临界区极短，chat 在锁外发起），不会与派工自锁。
+        同样走 _clients_lock（与建/取真实派工客户端一把锁），chat 在锁外发起，不会与派工自锁。
         """
-        with self._lock:
+        with self._clients_lock:
             client = self._probe_clients.get(p.name)
-            if client is not None:
-                return client
-            client = LLMClient(
-                p.base_url, p.api_key, p.model,
-                timeout=self._latency_probe_timeout, max_retries=0,
-            )
-            self._probe_clients[p.name] = client
+            if client is None:
+                client = LLMClient(
+                    p.base_url,
+                    p.api_key,
+                    p.model,
+                    timeout=self._latency_probe_timeout,
+                    max_retries=0,
+                )
+                self._probe_clients[p.name] = client
             return client
 
     def close(self) -> None:
         """释放全部工人客户端连接池（含探测专用池，幂等）。池被弃用时由持有方调用。"""
-        with self._lock:
+        with self._clients_lock:
             clients = list(self._clients.values()) + list(self._probe_clients.values())
             self._clients.clear()
             self._probe_clients.clear()
@@ -507,7 +580,10 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                 pass
 
     def collect(
-        self, workers: list[str], prompt: str, system: str | None = None,
+        self,
+        workers: list[str],
+        prompt: str,
+        system: str | None = None,
         timeout: float | None = None,
     ) -> list[tuple[str, str]]:
         """并行收集多个工人对同一任务的成功回答，按入参工人顺序返回（确定性）。
@@ -533,7 +609,11 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         ]
 
     def _gather_many(
-        self, workers: list[str], prompt: str, system: str | None, timeout: float | None,
+        self,
+        workers: list[str],
+        prompt: str,
+        system: str | None,
+        timeout: float | None,
     ) -> dict:
         """并行派工的收集核心：ask_many（文本）与 ask_many_structured（结构化）共用。
 
@@ -559,7 +639,10 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         return {"valid": valid, "got": got, "elapsed": elapsed, "limit": limit}
 
     def ask_many(
-        self, workers: list[str], prompt: str, system: str | None = None,
+        self,
+        workers: list[str],
+        prompt: str,
+        system: str | None = None,
         timeout: float | None = None,
     ) -> str:
         """同一子任务并行派给多个工人，收集全部回答（失败也如实带回）。
@@ -587,7 +670,10 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         return "\n\n".join(blocks)
 
     def ask_many_structured(
-        self, workers: list[str], prompt: str, system: str | None = None,
+        self,
+        workers: list[str],
+        prompt: str,
+        system: str | None = None,
         timeout: float | None = None,
     ) -> list[dict]:
         """并行派工的结构化结果（外部主程序化消费，替代 Markdown 大块文本）。
@@ -603,13 +689,23 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         for w in r["valid"]:
             res = got.get(w)
             if res is None:  # 整体限时到点仍未完成
-                out.append({"worker": w, "ok": False, "status": ST_TIMEOUT,
-                            "answer": "", "elapsed_ms": elapsed.get(w)})
+                out.append(
+                    {
+                        "worker": w,
+                        "ok": False,
+                        "status": ST_TIMEOUT,
+                        "answer": "",
+                        "elapsed_ms": elapsed.get(w),
+                    }
+                )
                 continue
-            out.append({
-                "worker": w, "ok": res["status"] == ST_OK,
-                "status": res["status"],
-                "answer": res["answer"] if res["status"] == ST_OK else "",
-                "elapsed_ms": elapsed.get(w),
-            })
+            out.append(
+                {
+                    "worker": w,
+                    "ok": res["status"] == ST_OK,
+                    "status": res["status"],
+                    "answer": res["answer"] if res["status"] == ST_OK else "",
+                    "elapsed_ms": elapsed.get(w),
+                }
+            )
         return out

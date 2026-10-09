@@ -1,23 +1,32 @@
-"""仓库卫生守卫：`.gitignore` 规则必须真的生效、lint 不得扫到隔离区。
+"""仓库卫生守卫：`.gitignore` 规则必须真的生效、lint 不得扫到隔离区、模板不得带值。
 
-两条背景都是本项目实际发生过的：
+三条背景都是本项目实际发生过的：
 1. `.gitignore` 不支持行内注释 —— `data/    # 会话历史` 会被当成一个字面 pattern，
    整条规则失效，于是 `data/` 从未被忽略、会话历史（含对话内容）会被提交。
 2. `[tool.ruff] exclude` 是**替换**语义，会顶掉 ruff 的默认排除表
    （.venv/.git/__pycache__/.pytest_cache… 全部重新进入扫描范围），
    只能靠 `.gitignore` 兜着。两处一起坏时，lint 就会去扫隔离区的旧文件而让 CI 变红。
+3. `.env` 是唯一承载端点/密钥的文件，此前没有 `.env.example`：新环境只能靠读代码
+   猜变量名。模板一旦带了真实值就等于把密钥提交进公开仓库，故这里守"模板必须全注释、
+   且列出的变量名都还有效"。
 """
+
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from agent.config import _load_dotenv
+
 ROOT = Path(__file__).resolve().parent.parent
 GITIGNORE = ROOT / ".gitignore"
 PYPROJECT = ROOT / "pyproject.toml"
+ENV_EXAMPLE = ROOT / ".env.example"
+CONFIG_YAML = ROOT / "config.yaml"
 
 
 def _gitignore_rules() -> list[str]:
@@ -52,8 +61,9 @@ def test_gitignore_actually_ignores_sensitive_paths(path):
     """用 git 自己判定规则真的生效（只看规则文本会漏掉"写了但不匹配"的情况）。"""
     if shutil.which("git") is None:
         pytest.skip("环境无 git，跳过")
-    r = subprocess.run(["git", "check-ignore", "-q", path], cwd=str(ROOT),
-                       capture_output=True, text=True)
+    r = subprocess.run(
+        ["git", "check-ignore", "-q", path], cwd=str(ROOT), capture_output=True, text=True
+    )
     if r.returncode not in (0, 1):
         pytest.skip(f"git 不可用（rc={r.returncode}）")
     assert r.returncode == 0, f"{path} 未被 .gitignore 忽略"
@@ -74,3 +84,66 @@ def test_ruff_extends_default_excludes_instead_of_replacing():
     assert "data" in ruff_cfg.get("extend-exclude", []), (
         "隔离区/运行时产物 data/ 必须显式排除，否则 data/trash 里的文件会被 lint"
     )
+
+
+# ---------------- .env.example：新环境照着填的那张单子 ----------------
+
+
+def _env_example_lines() -> list[str]:
+    assert ENV_EXAMPLE.exists(), ".env.example 缺失：新环境只能靠读代码猜变量名"
+    return ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+
+
+def test_env_example_is_committable_while_env_is_not():
+    """模板要能提交（它是文档），真实 .env 必须被忽略 —— 用 git 自己判定，不看规则文本。"""
+    if shutil.which("git") is None:
+        pytest.skip("环境无 git，跳过")
+    r = subprocess.run(
+        ["git", "check-ignore", "-q", ".env.example"], cwd=str(ROOT), capture_output=True, text=True
+    )
+    if r.returncode not in (0, 1):
+        pytest.skip(f"git 不可用（rc={r.returncode}）")
+    assert r.returncode == 1, ".env.example 被 .gitignore 吃掉了（`.env.*` 规则没被 ! 取反）"
+
+
+def test_env_example_injects_nothing(tmp_path, monkeypatch):
+    """模板必须**整份是注释**：复制成 .env 后不填值也不该往环境里注任何东西。
+
+    留成 `KEY=`（空值）会被 _load_dotenv 当真值注入：config.yaml 的 `${KEY:-默认}`
+    会被空串顶掉，数值项退化成"警告 + 默认"，端点项变成空 base_url —— 用户看到的是
+    "照着模板复制却不能跑"。
+    """
+    for k in ("NODE_A_ENDPOINT", "COLLAB_MAX_WORKERS"):
+        monkeypatch.delenv(k, raising=False)
+    active = [ln for ln in _env_example_lines() if ln.strip() and not ln.strip().startswith("#")]
+    assert not active, f".env.example 里有未注释的行（复制即注入）：{active}"
+    assert _load_dotenv(ENV_EXAMPLE, set()) == [], "模板解析后不应注入任何变量"
+
+
+def test_env_example_names_are_still_real_knobs():
+    """模板列的变量名必须还在用：config.yaml 的 ${VAR} 插值或代码直接读的环境变量。
+
+    名字改名/废弃后模板不会自己报警，新人照着填一个失效的变量，配置静默不生效。
+    """
+    yaml_text = CONFIG_YAML.read_text(encoding="utf-8")
+    code_text = "\n".join(p.read_text(encoding="utf-8") for p in [*(ROOT / "agent").rglob("*.py")])
+    listed = [
+        m.group(1) for ln in _env_example_lines() if (m := re.match(r"\s*#([A-Z][A-Z0-9_]*)=", ln))
+    ]
+    assert listed, "模板里没解析到任何变量名（格式应为 `#KEY=值或说明`）"
+    stale = [
+        n
+        for n in listed
+        if f"${{{n}}}" not in yaml_text
+        and f"${{{n}:-" not in yaml_text
+        and f'"{n}"' not in code_text
+    ]
+    assert not stale, f"这些变量在 config.yaml 与代码里都已不被引用，模板应删掉：{stale}"
+    # 反向也要成立：config.yaml 里"只能来自 .env"的端点/密钥类变量都得在模板出现
+    must = [
+        v
+        for v in re.findall(r"\$\{([A-Z][A-Z0-9_]*)\}", yaml_text)
+        if v.endswith(("_ENDPOINT", "_KEY", "_BASE_URL", "_TOKEN"))
+    ]
+    missing = [v for v in must if v not in listed]
+    assert not missing, f"config.yaml 引用了这些端点/密钥变量但模板没列：{missing}"

@@ -10,6 +10,7 @@ DeepSeek / Kimi / 豆包(方舟) / OpenAI / 本地 Ollama 均兼容，换模型�
 - 抛出的 LLMError 带 error_type / retryable，上层（WorkerPool）据此做
   节点冷却等编排：单节点抖了，换/跳过其它节点，整体不受影响。
 """
+
 from __future__ import annotations
 
 import random
@@ -30,6 +31,8 @@ except ImportError:  # pragma: no cover - 老版本 openai 防御
     APITimeoutError = openai.APITimeoutError
     AuthenticationError = openai.AuthenticationError
     RateLimitError = openai.RateLimitError
+
+from .redact import safe_error_text
 
 DEFAULT_TIMEOUT = 120
 DEFAULT_RETRIES = 2
@@ -62,10 +65,6 @@ class LLMError(Exception):
         super().__init__(message)
         self.error_type = error_type
         self.retryable = retryable
-
-
-def _retryable_from_type(t: str) -> bool:
-    return t in {ERR_TIMEOUT, ERR_RATE_LIMIT, ERR_UNAVAILABLE, ERR_API}
 
 
 def _first_choice(resp):
@@ -158,9 +157,15 @@ class LLMClient:
                 # 5xx 是服务端问题；408/425/429 属于"再试一次可能就好"的临时状态
                 raise LLMError(ERR_API, f"服务端错误 HTTP {code}") from e
             # 其余 4xx 是客户端问题（参数错/鉴权/资源不存在等），重试没用
-            raise LLMError(ERR_API, f"API 错误 HTTP {code}: {e.message}", retryable=False) from e
+            raise LLMError(
+                ERR_API, f"API 错误 HTTP {code}: {safe_error_text(e.message)}", retryable=False
+            ) from e
         except Exception as e:  # noqa: BLE001 - 兜底：未知错误保守判定为不可重试
-            raise LLMError(ERR_OTHER, f"{type(e).__name__}: {e}", retryable=False) from e
+            # 兜底分支只能透传异常原文，而底层异常常回显请求 URL：key 放 query 里的
+            # 端点会从这里泄进 stdout 协议行与工人上下文，故先过一遍脱敏（见 redact.py）
+            raise LLMError(
+                ERR_OTHER, f"{type(e).__name__}: {safe_error_text(e)}", retryable=False
+            ) from e
         msg = _first_choice(resp)
         return {"role": "assistant", "content": msg.content or ""}
 
@@ -168,4 +173,4 @@ class LLMClient:
     def _backoff(attempt: int, error_type: str) -> float:
         """指数退避：2^attempt × 基数 + 随机 jitter，封顶 _MAX_BACKOFF。"""
         base = _BASE_BACKOFF_RATE_LIMIT if error_type == ERR_RATE_LIMIT else _BASE_BACKOFF_OTHER
-        return min(_MAX_BACKOFF, (2 ** attempt) * base) + random.uniform(0, 1.0)
+        return min(_MAX_BACKOFF, (2**attempt) * base) + random.uniform(0, 1.0)

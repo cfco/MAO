@@ -7,8 +7,9 @@
 2) 模型健康：一次终态失败 → 当日隔离不再派工（缓存命中不受影响）；
    连续 retire_days 个"运行日"（程序实际启动过的天，未运行的日子不计入也不打断）
    都失败 → 自动在 model_registry.txt 对应行给模型标 # 下线
-   （LLM_MODEL 兜底行不自动动，人工决定）。
+   （已下线模型幂等不重复改写、不刷频）。
 """
+
 from __future__ import annotations
 
 import os
@@ -63,10 +64,6 @@ agents:
     base_url: ${NODE_A_ENDPOINT}
     api_key: ${NODE_A_KEY}
     models: ${NODE_A_MODELS}
-llm:
-  base_url: ${LLM_ENDPOINT:-http://fallback}
-  api_key: ${LLM_API_KEY}
-  model: ${LLM_MODEL:-fb-model}
 """
 
 
@@ -74,9 +71,7 @@ def _write_layers(home, models_a="m-one@128k,m-two@256k", env_lines=("NODE_A_KEY
     """写三份文件：config.yaml 骨架 + model_registry.txt（模型名）+ .env（配置值）。"""
     (home / "config.yaml").write_text(CONFIG_YAML, encoding="utf-8")
     (home / "model_registry.txt").write_text(
-        "# 分层基础：模型清单\n"
-        f"NODE_A_MODELS={models_a}\n"
-        "LLM_MODEL=m-one\n",
+        f"# 分层基础：模型清单\nNODE_A_MODELS={models_a}\n",
         encoding="utf-8",
     )
     # .env 默认只给 key；需要端点时由调用方自提（ENDPOINT 属配置层）：
@@ -88,16 +83,15 @@ def _write_layers(home, models_a="m-one@128k,m-two@256k", env_lines=("NODE_A_KEY
 
 def test_layers_registry_base_env_override(cfg_home):
     """模型名在 model_registry.txt、配置值（端点/key）在 .env：池应能建起来。"""
-    _write_layers(cfg_home, env_lines=("NODE_A_ENDPOINT=https://a.example/v1",
-                                       "NODE_A_KEY=sk-real"))
+    _write_layers(
+        cfg_home, env_lines=("NODE_A_ENDPOINT=https://a.example/v1", "NODE_A_KEY=sk-real")
+    )
     cfg = load_config()
     assert cfg.agent_profiles, "registry 提供模型名、.env 提供端点/key，池应能建起来"
     p = cfg.profile("node-a:m-one")
     assert p is not None and p.base_url == "https://a.example/v1"
     assert p.api_key == "sk-real", ".env 的 key 必须生效"
     assert p.models_env == "NODE_A_MODELS", "要能反查模型清单所在变量（健康下线改写用）"
-    assert cfg.llm.get("model") == "m-one", "LLM_MODEL 由 registry 提供"
-    assert cfg.llm.get("api_key") == "", "LLM_API_KEY 未在 .env 配置 → 插值为空串"
     assert cfg.retire_days == 7, "collaboration.retire_days 缺省 7 个运行日"
 
 
@@ -106,8 +100,9 @@ def test_shell_env_wins_over_both_layers(cfg_home, monkeypatch):
     monkeypatch.setenv("NODE_A_ENDPOINT", "http://shell.wins/v1")
     monkeypatch.setenv("NODE_A_MODELS", "shell-only@256k")
     monkeypatch.setenv("NODE_A_KEY", "sk-shell")
-    _write_layers(cfg_home, env_lines=("NODE_A_ENDPOINT=http://dotenv.lose/v1",
-                                       "NODE_A_KEY=sk-real"))
+    _write_layers(
+        cfg_home, env_lines=("NODE_A_ENDPOINT=http://dotenv.lose/v1", "NODE_A_KEY=sk-real")
+    )
     cfg = load_config()
     # 只剩 1 个模型 → 名字归一化为站名 node-a（不带 :模型 后缀）；model 只留裸名
     p = cfg.profile("node-a")
@@ -122,7 +117,9 @@ def test_missing_env_file_still_loads_from_registry(cfg_home):
     (cfg_home / ".env").unlink()
     cfg = load_config()
     p = cfg.profile("node-a:m-one")
-    assert p is not None and p.api_key == "", "没有 .env 时池照常构建（registry 管模型名），key 为空占位"
+    assert p is not None and p.api_key == "", (
+        "没有 .env 时池照常构建（registry 管模型名），key 为空占位"
+    )
 
 
 def test_registry_change_invalidates_cache(cfg_home):
@@ -132,8 +129,9 @@ def test_registry_change_invalidates_cache(cfg_home):
     # 只改 model_registry.txt（比如 git pull 下线了 m-two），并显式推后 mtime
     reg = cfg_home / "model_registry.txt"
     reg.write_text(
-        reg.read_text(encoding="utf-8").replace("NODE_A_MODELS=m-one@128k,m-two@256k",
-                                                "NODE_A_MODELS=m-one@128k"),
+        reg.read_text(encoding="utf-8").replace(
+            "NODE_A_MODELS=m-one@128k,m-two@256k", "NODE_A_MODELS=m-one@128k"
+        ),
         encoding="utf-8",
     )
     st = reg.stat()
@@ -153,8 +151,7 @@ def test_hash_blocked_model_untouched_by_layering(cfg_home):
 def test_env_stray_models_vars_warn_by_name_only(cfg_home, capsys):
     """.env 混进模型清单变量（会静默压住 model_registry.txt 的 git 更新/自动下线）⇒
     重载配置时在 stderr 点名提醒；只报变量名，绝不回显任何值。"""
-    _write_layers(cfg_home, env_lines=("NODE_A_MODELS=evil@1",
-                                       "NODE_A_KEY=sk-secret-do-not-print"))
+    _write_layers(cfg_home, env_lines=("NODE_A_MODELS=evil@1", "NODE_A_KEY=sk-secret-do-not-print"))
     load_config()
     err = capsys.readouterr().err
     assert "分层提醒" in err and "NODE_A_MODELS" in err
@@ -171,9 +168,14 @@ def test_env_stray_models_vars_warn_by_name_only(cfg_home, capsys):
 
 def test_inline_comment_stripped_in_dotenv(cfg_home):
     """.env 值里"空格+#"的行内注释要剥掉——否则数字/端点参数会被注释文本污染成非法值。"""
-    _write_layers(cfg_home, env_lines=("NODE_A_ENDPOINT=https://a.example/v1 # 端点",
-                                       "NODE_A_KEY=sk-real",
-                                       "COLLAB_RETIRE_DAYS=7   # 连续 7 个运行日"))
+    _write_layers(
+        cfg_home,
+        env_lines=(
+            "NODE_A_ENDPOINT=https://a.example/v1 # 端点",
+            "NODE_A_KEY=sk-real",
+            "COLLAB_RETIRE_DAYS=7   # 连续 7 个运行日",
+        ),
+    )
     cfg = load_config()
     assert cfg.retire_days == 7, "COLLAB_RETIRE_DAYS 的行内注释应被剥离"
     p = cfg.profile("node-a:m-one")
@@ -185,14 +187,17 @@ def test_real_registry_never_carries_key_values():
     *_KEY 行——真实 key 只允许进 .env（保密、不进 git）。"""
     real_registry = Path(ac.__file__).resolve().parent.parent / "model_registry.txt"
     lines = [ln.strip() for ln in real_registry.read_text(encoding="utf-8").splitlines()]
-    key_lines = [ln for ln in lines if "=" in ln and not ln.startswith("#")
-                 and ln.split("=", 1)[0].strip().endswith("_KEY")]
+    key_lines = [
+        ln
+        for ln in lines
+        if "=" in ln and not ln.startswith("#") and ln.split("=", 1)[0].strip().endswith("_KEY")
+    ]
     assert not key_lines, f"model_registry.txt 出现疑似 key 变量行：{key_lines}"
 
 
 # ---------------- 2) ModelHealth 单元 ----------------
 
-REGISTRY_TXT = "NODE_A_MODELS=m-one@128k,m-two@256k\nLLM_MODEL=m-one\n"
+REGISTRY_TXT = "NODE_A_MODELS=m-one@128k,m-two@256k\n"
 
 
 def _health(tmp_path):
@@ -229,6 +234,7 @@ def test_corrupt_store_file_recovers(tmp_path):
 
 
 # ---------------- 3) 自动下线：连续运行日失败 → registry 加 # ----------------
+
 
 def _registry(tmp_path) -> Path:
     reg = tmp_path / "model_registry.txt"
@@ -280,14 +286,14 @@ def test_success_running_day_breaks_streak(tmp_path):
     assert "#m-one" not in text, "存在『未失败』的运行日 → 不满足全失败，不许下线"
 
 
-def test_retire_is_idempotent_and_informs_llm_model_untouched(tmp_path):
-    """已 # 下线的模型再失败：不重复改写，仍报提示；LLM_MODEL 兜底行绝不被自动动。"""
+def test_retire_is_idempotent(tmp_path):
+    """已 # 下线的模型再失败：不重复改写，仍报提示（幂等，不刷屏）。"""
     reg = _registry(tmp_path)
     h = ModelHealth(tmp_path / "h.json", reg, retire_days=2)
     for i in range(2):
         h.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=_day(i - 2))
     text = reg.read_text(encoding="utf-8")
-    assert "#m-one" in text and "LLM_MODEL=m-one" in text, "LLM_MODEL 行原样保留"
+    assert "#m-one" in text, "达标模型已被标 # 下线"
     # 再模拟一次失败：disabled 标记在案 → 不再重复改写 registry、也不再刷下线提示（幂等）
     h2 = ModelHealth(tmp_path / "h.json", reg, retire_days=2)
     notice = h2.record_failure("st:m-one", "m-one", "NODE_A_MODELS", day=_day(-1))
@@ -297,10 +303,15 @@ def test_retire_is_idempotent_and_informs_llm_model_untouched(tmp_path):
 
 # ---------------- 4) WorkerPool 集成（派工路径真的被隔离） ----------------
 
+
 def _pool(health: ModelHealth, models: str = "m1,m2") -> WorkerPool:
-    cfg = Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": models}],
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": models}],
+            }
+        )
+    )
     return WorkerPool(cfg, exclude="st:m1", health=health)
 
 

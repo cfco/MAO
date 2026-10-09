@@ -12,6 +12,7 @@
   ③ shell=False 优先参数模式，重定向目标也受项目根约束。
 启发式不可能穷尽：真要硬隔离得靠 OS/容器层。
 """
+
 from __future__ import annotations
 
 import re
@@ -28,24 +29,24 @@ import shlex
 # 这些正常开发命令会被大面积误拦。危险命令只有被当作命令执行（首词）时才有破坏力，
 # 因此改为首词匹配：`format D:`、`del /f /q /s x` 照拦，`ruff format .` 放行。
 _CMD_DANGEROUS = [
-    "format",        # 格式化磁盘
-    "fdisk",         # 分区（旧版 Windows）
-    "diskpart",      # 磁盘分区工具（可删除卷）
-    "clean",         # diskpart clean 清磁盘
-    "chkdsk",        # 修复磁盘（可能强制卸载卷）
-    "rd",            # rd /s /q 递归静默删除目录（比 rm -rf 还狠）
-    "rmdir",         # 同上
-    "del",           # del /f /q /s 强制静默递归删除文件
-    "erase",         # 同上
-    "shutdown",      # 关机/重启
-    "reboot",        # 重启（旧命令）
-    "reg",           # reg delete / reg import 删改注册表
-    "schtasks",      # schtasks /delete 删除计划任务
-    "taskkill",      # taskkill /f /im 强制杀进程
-    "wmic",          # wmic process delete 删除进程
-    "bootcfg",       # 修改引导配置
-    "bcdedit",       # 修改引导配置（Win Vista+）
-    "syskey",        # 系统数据库加密（不可逆）
+    "format",  # 格式化磁盘
+    "fdisk",  # 分区（旧版 Windows）
+    "diskpart",  # 磁盘分区工具（可删除卷）
+    "clean",  # diskpart clean 清磁盘
+    "chkdsk",  # 修复磁盘（可能强制卸载卷）
+    "rd",  # rd /s /q 递归静默删除目录（比 rm -rf 还狠）
+    "rmdir",  # 同上
+    "del",  # del /f /q /s 强制静默递归删除文件
+    "erase",  # 同上
+    "shutdown",  # 关机/重启
+    "reboot",  # 重启（旧命令）
+    "reg",  # reg delete / reg import 删改注册表
+    "schtasks",  # schtasks /delete 删除计划任务
+    "taskkill",  # taskkill /f /im 强制杀进程
+    "wmic",  # wmic process delete 删除进程
+    "bootcfg",  # 修改引导配置
+    "bcdedit",  # 修改引导配置（Win Vista+）
+    "syskey",  # 系统数据库加密（不可逆）
 ]
 _CMD_DANGEROUS_SET = frozenset(_CMD_DANGEROUS)
 
@@ -71,11 +72,13 @@ _PS_DANGEROUS = [
 
 # 全局注入模式：检测 shell 命令拼接（在参数模式下这些拼接不会生效，但用户写了就是意图）
 _INJECTION_PATTERNS = [
-    re.compile(r"(?:&&|\|\|)\s*\S+"),                      # cmd1 && cmd2 / cmd1 || cmd2
-    re.compile(r"[|&]\s*\S+\s*[|&]"),                      # 中间嵌套管道
-    re.compile(r";\s*\S+\s*;\s*\S+"),                       # 分号多段（Unix shell 风格，Windows cmd 不识别但 PowerShell 可）
-    re.compile(r"\$\([^)]+\)"),                             # 命令替换 $(...)
-    re.compile(r"`[^nrt]", re.DOTALL),                      # PowerShell 反引号转义接非控制字符
+    re.compile(r"(?:&&|\|\|)\s*\S+"),  # cmd1 && cmd2 / cmd1 || cmd2
+    re.compile(r"[|&]\s*\S+\s*[|&]"),  # 中间嵌套管道
+    re.compile(
+        r";\s*\S+\s*;\s*\S+"
+    ),  # 分号多段（Unix shell 风格，Windows cmd 不识别但 PowerShell 可）
+    re.compile(r"\$\([^)]+\)"),  # 命令替换 $(...)
+    re.compile(r"`[^nrt]", re.DOTALL),  # PowerShell 反引号转义接非控制字符
 ]
 
 # shell=False 无法支持的 shell 专有语法特征（检测到则退回 shell=True）
@@ -114,11 +117,11 @@ def _mask_quoted(command: str) -> str:
 # 用于检测「echo x > ..\..\etc\passwd」这类通过重定向绕过 cwd 限制的写越界。
 # 目标捕获：引号包裹的串 或 不含空白/特殊符号的 token。
 _REDIRECT_RE = re.compile(
-    r"(?:^|\s)"                          # 开头或空白分隔
-    r"(?:\d*&?)?"                        # 可选 fd 前缀：1/2/&（1>, 2>>, &>）
-    r"(?:>>|>|<)"                        # 操作符：>> 优先于 > 匹配
+    r"(?:^|\s)"  # 开头或空白分隔
+    r"(?:\d*&?)?"  # 可选 fd 前缀：1/2/&（1>, 2>>, &>）
+    r"(?:>>|>|<)"  # 操作符：>> 优先于 > 匹配
     r"\s*"
-    r"(\"[^\"]*\"|'[^']*'|[^\s&|<>]+)"   # 目标：引号串 或 非特殊 token
+    r"(\"[^\"]*\"|'[^']*'|[^\s&|<>]+)"  # 目标：引号串 或 非特殊 token
 )
 
 
@@ -148,12 +151,10 @@ def _check_redirect_targets(command: str) -> str | None:
             continue
         # 绝对路径（盘符 C: 或根斜杠）直接越界
         if re.match(r"^[a-zA-Z]:", target) or target.startswith(("/", "\\")):
-            return (f"命令拦截：重定向目标 `{target}` 是绝对路径，"
-                    f"可能写出项目根目录，已拒绝")
+            return f"命令拦截：重定向目标 `{target}` 是绝对路径，可能写出项目根目录，已拒绝"
         # 相对路径穿越：含 .. 的目标可能逃出项目根
         if ".." in target.replace("\\", "/").split("/"):
-            return (f"命令拦截：重定向目标 `{target}` 含路径穿越(..)，"
-                    f"可能写出项目根目录，已拒绝")
+            return f"命令拦截：重定向目标 `{target}` 含路径穿越(..)，可能写出项目根目录，已拒绝"
     return None
 
 
@@ -205,19 +206,48 @@ _PS_PATTERNS = [(re.compile(p, re.IGNORECASE), desc) for p, desc in _PS_DANGEROU
 # 再扫一遍危险 API / 内嵌 shell 命令 / 重定向越界。纵深防御、非沙箱。
 # ==============================================================
 _INTERP_INLINE = {
-    "python", "python3", "python2", "py", "pypy", "pypy3",
-    "node", "nodejs", "deno", "bun",
-    "ruby", "perl", "php", "osascript", "tclsh", "wish", "expect",
+    "python",
+    "python3",
+    "python2",
+    "py",
+    "pypy",
+    "pypy3",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "ruby",
+    "perl",
+    "php",
+    "osascript",
+    "tclsh",
+    "wish",
+    "expect",
+    # POSIX shell 家族同属"首词是解释器、破坏藏在正文里"的绕过点。Windows 上装了
+    # Git-Bash/WSL 就能执行，而危险词表是 Windows 向的（rm 只在正文扫描里生效），
+    # 不收进本集合则 `bash -c "rm -rf ~"` 三层防护一层都不触发。
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
 }
 # 携带"内联代码字符串"的开关（powershell/pwsh 的 -Command 走它自己的分支）
 _INLINE_CODE_FLAGS = {"-c", "-e", "--eval", "-r", "--rc", "-import", "--import"}
+# POSIX shell 的单横线短选项簇：`bash -lc` / `sh -xlc` 的正文位置与 -c 完全一致。
+# 只认单横线，`--norc`（双横线、也以 c 结尾）不会被误当成内联开关。
+_SHELL_CODE_FLAG = re.compile(r"-[a-z]{0,3}c\Z")
+_POSIX_SHELL_INTERP = {"sh", "bash", "zsh", "dash", "ksh"}
 # POSIX 侧破坏性命令（内联代码常调 sh/os.system，补齐 Windows 集合看不到的词）
 _POSIX_DANGEROUS_SET = {"rm", "rmdir", "mkfs", "dd", "shred", "mkfstools", "truncate"}
 _ALL_DANGEROUS_SET = _CMD_DANGEROUS_SET | _POSIX_DANGEROUS_SET
 # 内联代码里的"高危 API"：无 shell 对应词、破坏性/绕过黑名单意图明显
 _CODE_HIGH_RISK = [
     (r"\bshutil\s*\.\s*rmtree\b", "shutil.rmtree（递归删除）"),
-    (r"\bos\s*\.\s*(remove|unlink|removedirs|kill|killpg|startfile|ftruncate)\b", "os 文件/进程删除"),
+    (
+        r"\bos\s*\.\s*(remove|unlink|removedirs|kill|killpg|startfile|ftruncate)\b",
+        "os 文件/进程删除",
+    ),
     (r"\bos\s*\.\s*execv?[e]?\b", "os.exec*（替换进程执行）"),
     (r"\bpty\s*\.\s*spawn\b", "pty.spawn"),
     (r"\bctypes\b", "ctypes 直连系统 API"),
@@ -249,9 +279,11 @@ def _extract_inline_code(tokens: list[str]) -> tuple[str | None, str]:
         interp = interp[:-4]
     if interp not in _INTERP_INLINE:
         return None, ""
+    is_shell = interp in _POSIX_SHELL_INTERP
     for i, t in enumerate(tokens[1:], start=1):
         flag = _strip_wrapping_quotes(t).strip().lower()
-        if flag in _INLINE_CODE_FLAGS and i + 1 < len(tokens):
+        hit = flag in _INLINE_CODE_FLAGS or (is_shell and _SHELL_CODE_FLAG.fullmatch(flag))
+        if hit and i + 1 < len(tokens):
             return interp, _strip_wrapping_quotes(tokens[i + 1])
     return None, ""  # 是解释器但无内联代码（如 python script.py：正文不可静态扫描，放行）
 
@@ -312,7 +344,7 @@ def _check_command_safety(command: str) -> str | None:
     for pat in _INJECTION_PATTERNS:
         m = pat.search(scan)
         if m:
-            snippet = stripped[m.start():m.end()]
+            snippet = stripped[m.start() : m.end()]
             return f"命令拦截：检测到 shell 拼接模式 `{snippet}`，存在命令注入风险"
 
     # ---- 1.5 重定向目标越界检查 ----

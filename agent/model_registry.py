@@ -7,18 +7,28 @@
    config.py 的加载流程用它把 NODE_A_MODELS 等内容注入 os.environ，
    供 config.yaml 的 ${NODE_A_MODELS} 插值使用（.env 不再承载模型清单）。
 2. retire_model() —— 给指定变量名下一行的某个模型加 `#`（自动下线标记），
-   幂等：已带 # 不重复加；文件里没有该行/该模型时静默返回 False。
+   返回三态（本次下线 / 已带 # / 未找到或写入失败），幂等：已带 # 不重复加。
    删掉 # 即恢复模型（人工 / 手动编辑），符合"标记删除但可手动恢复"的需求。
 
 安全约定：本模块不碰 .env，不打印任何值；写盘用临时文件 + os.replace 原子替换，
 避免中途断电/并发写坏文件。模型名匹配按"逗号分隔的裸条目"比较（不含 @ 尺寸后缀
 前的模型名部分：`laguna-s-2.1@256k` 匹配模型 `laguna-s-2.1`）。
 """
+
 from __future__ import annotations
 
-import os
+import re
 import threading
 from pathlib import Path
+
+from .core.ledger import atomic_write_text
+
+# retire_model 的三态返回值（对外稳定：调用方按值拼提示文本）
+RETIRE_OFFLINED = "offlined"
+RETIRE_ALREADY = "already"
+RETIRE_MISSING = "missing"
+# 什么算"窗口标注"后缀：纯数字、可带 k/K（与 config._split_models 同一条规则）
+_SIZE_SUFFIX = re.compile(r"\d+[kK]?")
 
 
 def load_model_registry(path: Path) -> dict[str, str]:
@@ -49,20 +59,29 @@ def _split_items(raw: str) -> list[str]:
 
 
 def _bare_model(item: str) -> str:
-    """去掉条目里的依赖信息：`#laguna-s-2.1@256k` → `#laguna-s-2.1`。
-    返回时保留行首的 `#`（屏蔽标记），模型名本身与 @ 尺寸后缀剥离开。
+    """剥掉条目的窗口标注得到模型名：`#laguna-s-2.1@256k` → `#laguna-s-2.1`。
+
+    行首 `#`（下线标记）保留。`@` 之后**不像尺寸标注**时整串都是模型名：Cloudflare
+    的模型名本身带 @（`@cf/meta/llama-3.1-8b-instruct`），只按"最后一个 @"硬切会把
+    不带 @ 的普通条目切成**空串**（`"m-one".rpartition("@")[0]` 是 `''`），于是
+    retire_model 对清单里绝大多数模型永远匹配不上、自动下线静默失效。
+    口径与 config._split_models 必须一致（同一份"什么算窗口标注"的规则）。
     """
-    name = item.lstrip("#").partition("@")[0].strip()
-    return ("#" if item.startswith("#") else "") + name
+    body = item.lstrip("#")
+    name, sep, suffix = body.rpartition("@")
+    bare = name.strip() if sep and _SIZE_SUFFIX.fullmatch(suffix.strip()) else body.strip()
+    return ("#" if item.startswith("#") else "") + bare
 
 
-def retire_model(path: Path, env_var: str, model: str) -> bool:
+def retire_model(path: Path, env_var: str, model: str) -> str:
     """给 model_registry.txt 中 `env_var=` 这一行的 `model` 加 `#` 下线标记。
 
-    - 幂等：模型已带 # 或已不存在 → 不动文件，返回 False；
-    - 命中：给该模型加 # 后原子写回，返回 True；
-    - 文件/该变量行缺失：静默返回 False（不报错）。
-    并发安全：进程内串行化（线程锁），写盘临时文件 + os.replace。
+    返回三态（调用方据此拼提示，不必自己再解析一遍文件）：
+    - RETIRE_OFFLINED：本次加上了 #，已原子写回；
+    - RETIRE_ALREADY：该条目已带 #（曾自动下线或人工屏蔽），不动文件；
+    - RETIRE_MISSING：没有该变量行 / 行里没有该模型 / 读写失败（含文件缺失）。
+    删掉 # 即恢复模型（人工 / 手动编辑），符合"标记删除但可手动恢复"的需求。
+    并发安全：进程内按文件串行化（线程锁），写盘临时文件 + os.replace。
     """
     file_path = Path(path)
     lock = _locks.setdefault(str(file_path), threading.Lock())
@@ -70,7 +89,8 @@ def retire_model(path: Path, env_var: str, model: str) -> bool:
         try:
             lines = file_path.read_text(encoding="utf-8").splitlines()
         except OSError:
-            return False
+            return RETIRE_MISSING
+        found = False  # 该变量行里是否出现过这个模型的条目（带不带 # 都算出现）
         changed = False
         for i, line in enumerate(lines):
             if not line.strip().startswith(f"{env_var}="):
@@ -79,30 +99,22 @@ def retire_model(path: Path, env_var: str, model: str) -> bool:
             items = _split_items(value)
             target = model.strip()
             for j, item in enumerate(items):
-                if _bare_model(item).lstrip("#") == target and not item.startswith("#"):
+                if _bare_model(item).lstrip("#") != target:
+                    continue
+                found = True
+                if not item.startswith("#"):
                     items[j] = "#" + item  # 加 # = 下线标记
                     changed = True
             if changed:
                 lines[i] = f"{env_var}={','.join(items)}"
             break  # 变量名唯一，处理第一处匹配即可
         if not changed:
-            return False
-        _atomic_write(file_path, "\n".join(lines) + ("\n" if lines else ""))
-        return True
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    """临时文件 + os.replace 原子写盘（失败静默，留旧文件不动）。"""
-    tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
+            return RETIRE_ALREADY if found else RETIRE_MISSING
         try:
-            tmp.unlink(missing_ok=True)
+            atomic_write_text(file_path, "\n".join(lines) + ("\n" if lines else ""))
         except OSError:
-            pass
+            return RETIRE_MISSING  # 写不进去：当作没下线，绝不让 IO 异常炸到派工路径
+        return RETIRE_OFFLINED
 
 
 # 每个文件一把线程锁（同一模型清单文件并发改写串行化）

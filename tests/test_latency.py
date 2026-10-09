@@ -3,13 +3,15 @@
 覆盖：
 - LatencyStore：取样本中位数（抗单次长尾）、非法值忽略、落盘后换实例可读回、
   按档案路径进程内共享（防多池互相覆写丢更新）、并发落盘不丢样本
-- LatencyProber：从未探测过则首次即到期、一轮未结束不叠新一轮（单飞）、
+- LatencyProber：从未探测过则首次即到期、一轮未结束不叠新一轮（单飞，**含同步强制
+  刷新撞上自动轮时排队**）、起线程失败要回滚名额、
   探测覆盖**全部节点（含冷却/隔离中的不可用节点）**、
   探测失败不写样本也**不**改可用性判定（不进冷却、不当日隔离）
 - pick()：按延迟升序、只留延迟最低的 60%（>5 个时等于弃掉最高延迟的 40%）、
   小池上同一公式落在"最低的 2~3 个"、证据不足（冷启动）不裁剪、显式 limit 不裁剪
 - 真实成功派工回填延迟档案；同站回退优先挑延迟更低的候选
 """
+
 from __future__ import annotations
 
 import threading
@@ -23,10 +25,14 @@ from agent.core.orchestrator import WorkerPool
 
 
 def _lat_cfg(models, **collab) -> Config:
-    return Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": models}],
-        "collaboration": collab,
-    }))
+    return Config(
+        _interpolate(
+            {
+                "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": models}],
+                "collaboration": collab,
+            }
+        )
+    )
 
 
 def _mk_pool(tmp_path, models, latencies=None, tag="lat", **collab) -> WorkerPool:
@@ -44,6 +50,7 @@ def _workers(models: list[str]) -> list[str]:
 
 # ---------------- 档案层 ----------------
 
+
 def test_latency_store_median_and_persistence(tmp_path):
     """取最近样本中位数（单次长尾不改变结论）；非法值忽略；换实例能从盘上读回。"""
     path = tmp_path / "lat.json"
@@ -53,7 +60,7 @@ def test_latency_store_median_and_persistence(tmp_path):
     assert s.get_ms("w1") == 120.0, "中位数抗单次长尾"
     assert s.get_ms("w2") is None, "无样本返回 None（不是 0）"
     s.record("w1", "not-a-number")  # 非法值忽略，不抛
-    s.record("w1", -5)              # 负数忽略
+    s.record("w1", -5)  # 负数忽略
     assert s.get_ms("w1") == 120.0
     assert LatencyStore(path).snapshot() == {"w1": 120.0}, "换实例应能从盘上读回"
 
@@ -106,6 +113,7 @@ def test_get_latency_shares_instance_per_path(tmp_path):
 
 # ---------------- 探测器 ----------------
 
+
 def test_probe_round_covers_all_nodes_including_unavailable(tmp_path):
     """探测必须覆盖**全部节点**（含冷却中 / 当日隔离的），且不改可用性判定。
 
@@ -114,13 +122,13 @@ def test_probe_round_covers_all_nodes_including_unavailable(tmp_path):
     否则定时探测器会变成自己给自己制造隔离的噪声源。
     """
     pool = _mk_pool(tmp_path, ["m1", "m2", "m3"])
-    pool._cooldowns["st:m2"] = time.time() + 999          # 冷却中
-    pool.health.record_failure("st:m3", "m3", "")         # 当日隔离
+    pool._cooldowns["st:m2"] = time.monotonic() + 999  # 冷却中
+    pool.health.record_failure("st:m3", "m3", "")  # 当日隔离
     seen: list[str] = []
 
     def fake_probe(name):
         seen.append(name)
-        return None if name == "st:m2" else 42.0          # m2 探测失败
+        return None if name == "st:m2" else 42.0  # m2 探测失败
 
     prober = LatencyProber(pool.latency, 600, fake_probe)
     res = prober.probe_all(pool.names())
@@ -163,13 +171,73 @@ def test_prober_is_lazy_and_single_flight(tmp_path):
     assert prober.due() is True, "过了周期 ⇒ 到期"
 
 
+def test_forced_probe_never_overlaps_auto_round(tmp_path):
+    """强制刷新撞上自动轮：排队而不是叠第二轮在飞。
+
+    probe_latency_now 是同步入口、不经 _claim，与后台自动轮撞上时会两轮同时打网络：
+    白烧额度、抢同一批站门，样本测的其实是站端排队（档案还是裁剪选路的依据）。
+    更隐蔽的是先结束的一方无条件把 _running 清 False，于是还能叠出第三轮。
+    """
+    pool = _mk_pool(tmp_path, ["m1"])
+    clock = [1000.0]
+    inflight, peak = [0], [0]
+    entered, release = threading.Event(), threading.Event()
+
+    def probe(name):
+        inflight[0] += 1
+        peak[0] = max(peak[0], inflight[0])
+        entered.set()
+        assert release.wait(10), "测试释放超时"
+        inflight[0] -= 1
+        return 5.0
+
+    prober = LatencyProber(pool.latency, 600, probe, clock=lambda: clock[0])
+    assert prober.maybe_start(["st:m1"]) is True
+    assert entered.wait(5), "应真的起了后台探测线程"
+
+    forced_done = threading.Event()
+    threading.Thread(
+        target=lambda: (prober.probe_all(["st:m1"]), forced_done.set()), daemon=True
+    ).start()
+    time.sleep(0.3)  # 让强制轮撞上 _round_lock 排队
+    assert prober.stats()["running"] is True, "在飞标志不该被排队的一方清掉"
+
+    release.set()
+    assert forced_done.wait(10), "排队的强制轮应在后台轮结束后跑完"
+    assert peak[0] == 1, f"两轮同时在打网络，在飞峰值={peak[0]}"
+    st = prober.stats()
+    assert st["rounds"] == 2 and st["running"] is False
+    assert prober.due() is False, "刚跑完 ⇒ 未到周期不再到期"
+
+
+def test_maybe_start_rolls_back_claim_when_thread_fails(tmp_path, monkeypatch):
+    """线程起不来时必须回滚名额，否则自动探测永久静默停摆。"""
+    import agent.core.latency as lat_mod
+
+    pool = _mk_pool(tmp_path, ["m1"])
+    prober = lat_mod.LatencyProber(pool.latency, 600, lambda n: 5.0)
+
+    class _NoStartThread:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(lat_mod.threading, "Thread", _NoStartThread)
+    assert prober.maybe_start(["st:m1"]) is False, "起线程失败应报告未启动"
+    assert prober.stats()["running"] is False, "名额必须回滚，否则再无自动轮"
+    assert prober.due() is True, "回滚到上一轮结束点 ⇒ 下个检查点仍能重试（自愈）"
+
+
 def test_touch_latency_probe_covers_unavailable_nodes(tmp_path, monkeypatch):
     """派工入口触发的探测同样带上全部工人（含冷却中的）——这是"每 10 分钟探测所有节点"的落点。"""
     monkeypatch.setenv("MAO_LATENCY_PROBE", "1")  # 本用例单独开启探测（其余用例由夹具关闭）
-    pool = WorkerPool(_lat_cfg(["m1", "m2"]), exclude=None,
-                      latency=LatencyStore(tmp_path / "l.json"))
+    pool = WorkerPool(
+        _lat_cfg(["m1", "m2"]), exclude=None, latency=LatencyStore(tmp_path / "l.json")
+    )
     assert pool._prober is not None, "latency_probe=true 时应有探测器"
-    pool._cooldowns["st:m2"] = time.time() + 999
+    pool._cooldowns["st:m2"] = time.monotonic() + 999
     seen: list[str] = []
     pool._prober._probe_one = lambda name: (seen.append(name), 5.0)[1]
 
@@ -197,7 +265,7 @@ def test_probe_disabled_by_config_does_not_probe(tmp_path):
 def test_probe_latency_now_forces_round_even_when_auto_off(tmp_path):
     """手动 probe_latency_now 不受自动开关影响：随时可强制刷一轮全部节点。"""
     pool = _mk_pool(tmp_path, ["m1", "m2"])
-    pool._cooldowns["st:m2"] = time.time() + 999  # 不可用节点也要被探（恢复后需要基线）
+    pool._cooldowns["st:m2"] = time.monotonic() + 999  # 不可用节点也要被探（恢复后需要基线）
     seen: list[str] = []
     pool._prober._probe_one = lambda name: (seen.append(name), 33.0)[1]
     res = pool.probe_latency_now()
@@ -231,7 +299,9 @@ def test_probe_uses_short_timeout_and_no_retry(tmp_path, monkeypatch):
     assert ms is not None, "有效回复应返回耗时（None 只代表空回复被丢弃）"
     assert len(captured) == 1
     assert captured[0]["max_retries"] == 0, "探测客户端不得重试（只发一次请求）"
-    assert captured[0]["timeout"] == pool._latency_probe_timeout, "探测用短超时，不沿用派工 llm.timeout"
+    assert captured[0]["timeout"] == pool._latency_probe_timeout, (
+        "探测用短超时，不沿用派工 llm.timeout"
+    )
     assert captured[0]["timeout"] < 60, "探测超时必须显著短于派工超时（默认 8s vs 120s）"
 
     pool._probe_one("st:m1")  # 同一工人第二次探测应复用缓存客户端，不再重建连接池
@@ -263,14 +333,16 @@ def test_bridge_latency_command_reports_and_refreshes(tmp_path, monkeypatch):
 
 # ---------------- 延迟选路（pick） ----------------
 
+
 def test_pick_drops_slowest_share_and_sorts_by_latency(tmp_path):
     """10 个可用：只用延迟最低的 60%（6 个），最高延迟的 40% 永不被选中；候选按延迟升序。"""
     models = [f"m{i}" for i in range(1, 11)]
     lat = {f"st:m{i}": i * 10.0 for i in range(1, 11)}
     pool = _mk_pool(tmp_path, models, lat, max_participants=5)
 
-    assert pool.pick() == ["st:m1", "st:m2", "st:m3", "st:m4", "st:m5"], \
+    assert pool.pick() == ["st:m1", "st:m2", "st:m3", "st:m4", "st:m5"], (
         "先按延迟升序排序，再取人数上限（优先派延迟低的）"
+    )
     got: set[str] = set()
     for _ in range(8):
         got |= set(pool.pick())
@@ -300,8 +372,9 @@ def test_pick_without_enough_latency_data_does_not_prune(tmp_path):
     """证据不足不动刀：空档案（冷启动）不裁剪；样本数不到下限不裁剪；显式 limit 不裁剪。"""
     models = ["m1", "m2", "m3", "m4"]
     cold = _mk_pool(tmp_path, models, tag="cold")
-    assert cold.pick() == ["st:m1", "st:m2", "st:m3", "st:m4"], \
+    assert cold.pick() == ["st:m1", "st:m2", "st:m3", "st:m4"], (
         "无任何延迟样本 ⇒ 原样返回（旧行为不变，冷启动不把工人踢出去）"
+    )
 
     one = _mk_pool(tmp_path, models, {"st:m1": 10.0}, tag="one")
     assert len(one.pick()) == 4, "已知样本少于 latency_min_samples(2) ⇒ 不裁剪"
@@ -315,8 +388,10 @@ def test_pick_without_enough_latency_data_does_not_prune(tmp_path):
 
 # ---------------- 与派工/回退链的联动 ----------------
 
+
 def test_successful_dispatch_backfills_latency(tmp_path, monkeypatch):
     """真实成功派工把往返耗时写回同一份档案（探测给基线，真实负载给实际表现）。"""
+
     class Slowish:
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
@@ -336,6 +411,7 @@ def test_successful_dispatch_backfills_latency(tmp_path, monkeypatch):
 
 def test_fallback_prefers_low_latency_peer(tmp_path, monkeypatch):
     """回退候选也按延迟升序挑：同站两个候选中优先选延迟更低的那个。"""
+
     class M1Boom:
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model

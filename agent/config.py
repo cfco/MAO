@@ -5,13 +5,14 @@ v4（2026-09-23 配置重构二期）：
       不写任何真实运行值；
     - .env 承载**全部配置值**（端点 / KEY / LLM 参数 / 协作参数 / 工具参数），
       密级、不进 git；
-    - model_registry.txt 承载**全部模型清单**（NODE_A_MODELS / LLM_MODEL 等），
+    - model_registry.txt 承载**全部模型清单**（NODE_A_MODELS / NODE_B_MODELS / NODE_C_MODELS / NODE_D_MODELS 等），
       随仓库维护、git pull 即更新，也是自动下线机制唯一可改写区（给模型名加 #）。
     模型名与配置彻底分家：.env 里出现 *_MODEL(S) 会被分层守卫点名提醒。
 
 配置分层（环境变量注入顺序，后层覆盖前层）：
     shell 环境变量 > .env（本地配置，含端点/key/参数）> model_registry.txt（模型清单基础层）
 """
+
 from __future__ import annotations
 
 import os
@@ -26,7 +27,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 # ${VAR} 取环境变量；${VAR:-默认值} 缺失时用默认值（不告警）。
 # 默认值语法是为了「同一份 config.yaml 既能开箱即用、又能被 .env 覆盖」：
-# 例如 llm.base_url: ${LLM_ENDPOINT:-https://api.deepseek.com/v1}
+# 例如 collaboration.cooldown_base: ${COLLAB_COOLDOWN_BASE:-10}
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}")
 # 启动时已打印过的缺失变量，避免同一变量在嵌套结构中重复警告
 _missing_logged: set[str] = set()
@@ -69,6 +70,7 @@ def _interpolate(value: Any) -> Any:
     警告必须走 stderr：bridge 协议与 CLI --stream 的 stdout 是纯 JSON 行，
     任何混入 stdout 的提示都会让按行 json.loads 的调用方解析失败。
     """
+
     def _sub(m: re.Match) -> str:
         key, default = m.group(1), m.group(2)
         val = os.environ.get(key)
@@ -77,7 +79,10 @@ def _interpolate(value: Any) -> Any:
         if default is not None:
             return default
         if key not in _missing_logged:
-            print(f"[配置警告] ${key} 未在 .env / model_registry.txt / 环境变量中定义，插值为空串", file=sys.stderr)
+            print(
+                f"[配置警告] ${key} 未在 .env / model_registry.txt / 环境变量中定义，插值为空串",
+                file=sys.stderr,
+            )
             _missing_logged.add(key)
         return ""
 
@@ -107,25 +112,30 @@ def _split_models(raw: Any) -> list[tuple[str, int]]:
         p = part.strip()
         if not p or p.startswith("#"):  # 空项或 # 前缀 = 临时屏蔽
             continue
-        name, _, ctx = p.partition("@")
-        name = name.strip()
+        # 取最后一个 @ 拆「窗口标注」；但模型名本身可能带 @（如 Cloudflare 的 @cf/...）。
+        # 只有当 @ 之后是纯数字（可带 k/K 上下文长度）时才算窗口标注，否则 @ 属于模型名。
+        name, sep, ctx = p.rpartition("@")
         ctx_len = 0
-        if ctx:
+        if sep:
             s = ctx.strip().lower()
             mul = 1024 if s.endswith("k") else 1
-            if s.endswith("k"):
-                s = s[:-1]
-            try:
-                ctx_len = int(float(s) * mul)
-            except ValueError:
-                ctx_len = 0
+            num = s[:-1] if s.endswith("k") else s
+            if num.isdigit():  # @ 之后是上下文长度 → 拆窗口
+                try:
+                    ctx_len = int(num) * mul
+                except ValueError:
+                    ctx_len = 0
+                name = name.strip()
+            else:  # @ 是模型名一部分（@cf/...），整串即模型名
+                name = p
+        else:  # 无 @ 标注，整串即模型名
+            name = p
         if name:
             out.append((name, ctx_len))
     return out
 
 
 DEFAULT_CONTEXT = 128_000  # 未标注上下文长度的模型按这个大小时钟估算裁剪历史
-CONTEXT_SAFETY = 0.75       # 历史 token 上限取 上下文长度×该系数，给回复/工具调用留余量
 
 
 @dataclass
@@ -295,8 +305,9 @@ class Config:
 
     @property
     def max_workers(self) -> int:
-        return self.as_int(self.collab_cfg.get("max_workers", 3), "collaboration.max_workers", 3,
-                           minimum=1)
+        return self.as_int(
+            self.collab_cfg.get("max_workers", 3), "collaboration.max_workers", 3, minimum=1
+        )
 
     @property
     def max_per_station(self) -> int:
@@ -313,8 +324,7 @@ class Config:
         max_workers=3。设成较大值即退回旧的"只看总并发、不看站"行为。
         """
         return self.as_int(
-            self.collab_cfg.get("max_per_station", 1), "collaboration.max_per_station", 1,
-            minimum=1
+            self.collab_cfg.get("max_per_station", 1), "collaboration.max_per_station", 1, minimum=1
         )
 
     @property
@@ -340,9 +350,7 @@ class Config:
         该用分工还是重复验证"——模式判断全部留给外部主。此属性只在
         Bridge 构造时读取一次，作为运行态开关的初始值（见 bridge.py）。
         """
-        return self.as_bool(
-            self.collab_cfg.get("economy", False), "collaboration.economy", False
-        )
+        return self.as_bool(self.collab_cfg.get("economy", False), "collaboration.economy", False)
 
     # ---------- 模型健康档案（collaboration.*） ----------
 
@@ -368,7 +376,9 @@ class Config:
         抖动废掉一整个免费额度。上限防止整站挂时把同站几十个模型挨个试（额度蔓延）。
         """
         return self.as_int(
-            self.collab_cfg.get("fallback_models", 2), "collaboration.fallback_models", 2,
+            self.collab_cfg.get("fallback_models", 2),
+            "collaboration.fallback_models",
+            2,
             minimum=0,
         )
 
@@ -382,7 +392,8 @@ class Config:
         """
         return self.as_bool(
             self.collab_cfg.get("fallback_cross_station", True),
-            "collaboration.fallback_cross_station", True,
+            "collaboration.fallback_cross_station",
+            True,
         )
 
     @property
@@ -446,7 +457,9 @@ class Config:
         """延迟探测周期（秒，默认 600 = 10 分钟；下限 10s 防误配成高频探测烧额度）。"""
         return self.as_float(
             self.collab_cfg.get("latency_probe_interval", 600),
-            "collaboration.latency_probe_interval", 600.0, minimum=10.0,
+            "collaboration.latency_probe_interval",
+            600.0,
+            minimum=10.0,
         )
 
     @property
@@ -461,7 +474,9 @@ class Config:
         """
         return self.as_float(
             self.collab_cfg.get("latency_probe_timeout", 8),
-            "collaboration.latency_probe_timeout", 8.0, minimum=1.0,
+            "collaboration.latency_probe_timeout",
+            8.0,
+            minimum=1.0,
         )
 
     @property
@@ -474,7 +489,9 @@ class Config:
         """
         raw = self.as_float(
             self.collab_cfg.get("latency_keep_ratio", 0.6),
-            "collaboration.latency_keep_ratio", 0.6, minimum=0.1,
+            "collaboration.latency_keep_ratio",
+            0.6,
+            minimum=0.1,
         )
         return min(1.0, raw)
 
@@ -487,14 +504,10 @@ class Config:
         """
         return self.as_int(
             self.collab_cfg.get("latency_min_samples", 2),
-            "collaboration.latency_min_samples", 2, minimum=1,
+            "collaboration.latency_min_samples",
+            2,
+            minimum=1,
         )
-
-    # ---------- 兼容旧配置的兜底单模型 ----------
-
-    @property
-    def llm(self) -> dict:
-        return self.llm_cfg
 
     # ---------- 常规 ----------
 
@@ -559,9 +572,19 @@ def _load_dotenv(path: Path, into: set[str] | None = None) -> list[str]:
                 continue
             key, _, val = line.partition("=")
             key = key.strip()
-            # 剥行内注释：值里以"空格+#"开头的部分视为注释（如 `TOOLS_SHELL_TIMEOUT=120 # 秒`）。
-            # 不剥模型清单的屏蔽标记：`NODE_A_MODELS=#m-one` 的 # 紧贴值无前导空格，不受影响。
-            val = val.split(" #", 1)[0].strip().strip('"').strip("'")
+            # 引号优先于注释剥离（审计：旧实现先 split(" #") 再 strip('"')）：
+            # `KEY="a #b"` 的 # 属于值本身，旧写法会把它静默截成 `a`。
+            val = val.strip()
+            if val[:1] in ('"', "'"):
+                quote = val[0]
+                end = val.find(quote, 1)
+                # 闭合引号之后的内容（` " # 备注`）视为注释丢弃；未闭合则取起始引号之后
+                val = val[1:end] if end != -1 else val[1:]
+            else:
+                # 未加引号时才剥行内注释：值里以"空格+#"开头的部分视为注释（如
+                # `TOOLS_SHELL_TIMEOUT=120 # 秒`）。不剥模型清单的屏蔽标记：
+                # `NODE_A_MODELS=#m-one` 的 # 紧贴值无前导空格，不受影响。
+                val = val.split(" #", 1)[0].strip()
             if not key:
                 continue
             names.append(key)
@@ -610,8 +633,13 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     cacheable = path is None
     registry_path = ROOT / "model_registry.txt"
     dotenv_path = ROOT / ".env"
-    _load_dotenv(registry_path)          # 基础层：模型清单
-    env_names = _load_dotenv(dotenv_path)  # 配置层：端点/KEY/参数
+    # 两层 dotenv 只解析**一次**，注入与后面的回收/分层体检共用同一结果。
+    # 旧实现在这里先无参解析一遍（只为拿 os.environ 供缓存判定用），确认要重建后又带
+    # injected 再解析一遍：命中缓存时白解析（每次调用都吃两份磁盘 IO），未命中时
+    # 第一遍的注入副作用又被第二遍覆盖，逻辑绕且容易改一处漏一处。
+    injected: set[str] = set()
+    _load_dotenv(registry_path, injected)  # 基础层：模型清单
+    env_names = _load_dotenv(dotenv_path, injected)  # 配置层：端点/KEY/参数
 
     cfg_mtime = _safe_mtime(p)
     dotenv_mtime = _safe_mtime(dotenv_path)
@@ -633,9 +661,6 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     # "停用某 key" 永远不会生效（配置/安全语义泄漏）。回收集合只含**本次实际注入**
     # 的 key：shell 预置（不在 _dotenv_keys）的变量不受影响；registry/.env 两层任一
     # 层还有该 key 也不会被回收。
-    injected: set[str] = set()
-    _load_dotenv(registry_path, injected)
-    env_names = _load_dotenv(dotenv_path, injected)
     for stale in _dotenv_keys - injected:
         os.environ.pop(stale, None)
     _dotenv_keys = injected
@@ -666,7 +691,7 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
 
 # ---------- 进程内配置缓存（热加载用）----------
 _cfg_cache: Config | None = None
-_cfg_cache_mtime: float = 0.0             # config.yaml 的 mtime，变化即重载
-_cfg_cache_dotenv_mtime: float = 0.0      # .env 的 mtime，变化即重载
-_cfg_cache_registry_mtime: float = 0.0    # model_registry.txt 的 mtime，变化即重载
-_dotenv_keys: set[str] = set()            # 由 dotenv 文件注入的变量名（热加载时需更新）
+_cfg_cache_mtime: float = 0.0  # config.yaml 的 mtime，变化即重载
+_cfg_cache_dotenv_mtime: float = 0.0  # .env 的 mtime，变化即重载
+_cfg_cache_registry_mtime: float = 0.0  # model_registry.txt 的 mtime，变化即重载
+_dotenv_keys: set[str] = set()  # 由 dotenv 文件注入的变量名（热加载时需更新）

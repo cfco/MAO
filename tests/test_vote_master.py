@@ -9,6 +9,7 @@
 - 工人全失败但有主方案 → 主方案兜底直接胜出（不再报"无可用方案"）
 - bridge ask_vote 透传 master_contribution
 """
+
 from __future__ import annotations
 
 import agent.core.orchestrator as orch
@@ -18,9 +19,15 @@ from agent.core.orchestrator import WorkerPool
 
 def _two_worker_pool() -> WorkerPool:
     """一站两模型的最小池（与 test_core 的同名设施一致的轻量构造）。"""
-    cfg = Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "http://x", "api_key": "k", "models": ["m1", "m2"]}],
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "st", "base_url": "http://x", "api_key": "k", "models": ["m1", "m2"]}
+                ],
+            }
+        )
+    )
     return WorkerPool(cfg, exclude=None)
 
 
@@ -142,7 +149,7 @@ def test_bridge_ask_vote_passes_master_contribution(monkeypatch):
 
     class FakeClient:
         def __init__(self, *_a, **_k):
-            pass  # 空 agents → 走兜底 solo，但本用例只关心透传，不会真调
+            pass  # 本用例只验证透传，vote 已被 spy 替换，不会真调 chat
 
         def chat(self, messages):
             return {"role": "assistant", "content": "1"}
@@ -150,11 +157,16 @@ def test_bridge_ask_vote_passes_master_contribution(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(br, "LLMClient", FakeClient)
-    cfg = Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "http://x", "api_key": "k", "models": ["m1"]}],
-        "llm": {"base_url": "u", "api_key": "k", "model": "m"},
-    }))
+    monkeypatch.setattr(orch, "LLMClient", FakeClient)
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "st", "base_url": "http://x", "api_key": "k", "models": ["m1"]}
+                ],
+            }
+        )
+    )
     b = br.Bridge(cfg)
     orig_vote = b.workers.vote
 

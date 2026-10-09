@@ -13,17 +13,19 @@
 进程内共享（get_latency）：与 health 同理，同一档案路径全进程唯一实例，避免多池各持
 账本互相覆写（lost update）。落盘只记延迟数值，不含任何密钥。
 """
+
 from __future__ import annotations
 
 import json
-import os
 import statistics
 import threading
 import time
 from pathlib import Path
 
-_MAX_SAMPLES = 5      # 每工人保留最近 N 次延迟样本（中位数抗单次抖动）
-_VIEW_KEEP = 500      # 档案最多保留的工人条数（防异常膨胀）
+from .ledger import AtomicJsonLedger, shared_by_path
+
+_MAX_SAMPLES = 5  # 每工人保留最近 N 次延迟样本（中位数抗单次抖动）
+_VIEW_KEEP = 500  # 档案最多保留的工人条数（防异常膨胀）
 # 探测用的极短提示：只要一次最小往返，测的是"节点响应快不快"、不关心回答内容。
 # 空回复视为无效往返（节点不可信，不计入延迟样本，见 LatencyMixin._probe_one）。
 _PROBE_PROMPT = "ping"
@@ -54,16 +56,12 @@ def _trim(data: dict[str, dict]) -> dict[str, dict]:
     return dict(items[-_VIEW_KEEP:])
 
 
-class LatencyStore:
+class LatencyStore(AtomicJsonLedger):
     """模型延迟账本：最近 N 次往返延迟样本 → 中位数。热路径只读内存。"""
 
     def __init__(self, store_path: Path):
-        self.store_path = Path(store_path)
-        self._lock = threading.Lock()
-        # 写盘专用锁：**取快照 + 写盘**整段串行（见 _write_payload）。写盘在 _lock 之外
-        # （get_ms/snapshot 是热路径）；若快照取在 _write_lock 之外，写盘顺序可能与快照
-        # 顺序相反，旧快照会覆盖新快照丢样本。嵌套方向恒为 write_lock→lock。
-        self._write_lock = threading.Lock()
+        # _lock / _write_lock / store_path 与落盘口径由基类提供（见 ledger.py）
+        super().__init__(store_path)
         self._data: dict[str, dict] | None = None  # 懒加载：首次使用时才读盘
 
     # ---------- 查询 ----------
@@ -108,7 +106,7 @@ class LatencyStore:
             entry["samples"] = samples[-_MAX_SAMPLES:]
             entry["updated_at"] = time.time()
             self._data = _trim(self._data)
-        self._write_payload()  # 快照+落盘都在 _write_lock 内串行，见 _write_payload
+        self.write()  # 快照+落盘都在 _write_lock 内串行，见 ledger.AtomicJsonLedger.write
 
     # ---------- 落盘 ----------
 
@@ -130,31 +128,6 @@ class LatencyStore:
         payload = {"version": 1, "models": self._data}
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def _write_payload(self) -> None:
-        """取账本快照并原子写入档案（**_lock 之外调用**）：临时文件 + os.replace，失败只丢持久化。
-
-        快照在 _write_lock **之内**取（与 health._write_payload 同一口径）：分开取的话两个
-        线程的写盘顺序可能与快照顺序相反，旧快照覆盖新快照丢样本。落盘 IO 仍留在 _lock 之外，
-        get_ms/snapshot 不被慢盘拖住。
-        """
-        tmp: Path | None = None
-        with self._write_lock:
-            with self._lock:
-                text = self._snapshot_locked()
-            try:
-                self.store_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = self.store_path.with_name(
-                    f"{self.store_path.name}.{os.getpid()}-{threading.get_ident()}.tmp"
-                )
-                tmp.write_text(text, encoding="utf-8")
-                os.replace(tmp, self.store_path)
-            except OSError:
-                if tmp is not None:
-                    try:
-                        tmp.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
 
 class LatencyProber:
     """延迟探测器：每 interval 秒对**全部工人（含当前不可用节点）**做一轮轻量往返测量。
@@ -164,13 +137,15 @@ class LatencyProber:
     到点"——使用期内仍是每 interval 秒刷新一轮（"每 10 分钟自动探测一次所有节点"），
     空载不探测。首轮立即到期（_last_start=0），冷启动也能尽快拿到基线。
 
-    探测跑在守护线程里，绝不阻塞派工主流程；一轮未结束不叠新一轮（_running 守卫）。
-    探测只写延迟档案，**不碰**冷却与当日隔离：延迟是"快不快"的事实，改不了"能不能用"
-    的判定（那是 health 的职责），否则定时器会变成自己给自己制造隔离的噪声源。
+    探测跑在守护线程里，绝不阻塞派工主流程；**同一时刻只允许一轮在飞**：自动轮由
+    _claim 占名额（并发的派工不会各起一轮），同步强制刷新由 _round_lock 排队
+    （见 probe_all）。探测只写延迟档案，**不碰**冷却与当日隔离：延迟是"快不快"的事实，
+    改不了"能不能用"的判定（那是 health 的职责），否则定时器会变成自己给自己制造隔离的噪声源。
     """
 
-    def __init__(self, store: LatencyStore, interval: float, probe_one, concurrency: int = 5,
-                 clock=time.time):
+    def __init__(
+        self, store: LatencyStore, interval: float, probe_one, concurrency: int = 5, clock=time.time
+    ):
         """store       延迟档案（探测结果写入此处）
         interval    探测周期（秒）
         probe_one   (工人名) -> 毫秒或 None；由调用方注入真实测量逻辑（可测）
@@ -183,7 +158,10 @@ class LatencyProber:
         self._concurrency = max(1, int(concurrency))
         self._clock = clock
         self._lock = threading.Lock()
-        self._last_start = 0.0   # 0 = 从未探测 ⇒ 首次检查即到期
+        # 整轮串行锁：自动轮与同步强制刷新都要过这把锁，保证绝不会有两轮同时在打网络。
+        # 嵌套方向恒为 _round_lock → _lock，反向不存在（_lock 临界区内不碰轮锁）。
+        self._round_lock = threading.Lock()
+        self._last_start = 0.0  # 0 = 从未探测 ⇒ 首次检查即到期
         self._last_finish = 0.0
         self._running = False
         self._rounds = 0
@@ -199,9 +177,13 @@ class LatencyProber:
         """到点且无在飞 ⇒ 起守护线程跑一轮；返回是否真的起了（调用方不等待）。"""
         if not self._claim():
             return False
-        threading.Thread(
-            target=self.probe_all, args=(list(names),), daemon=True
-        ).start()
+        try:
+            threading.Thread(target=self.probe_all, args=(list(names),), daemon=True).start()
+        except (RuntimeError, OSError):
+            # 线程起不来（系统线程资源耗尽等）必须把名额还回去，否则 _running 永久为
+            # True、自动探测从此静默停摆且没有自愈机会。回滚后下个检查点照旧到期重试。
+            self._release_claim()
+            return False
         return True
 
     def _claim(self) -> bool:
@@ -214,10 +196,37 @@ class LatencyProber:
             self._last_start = now
             return True
 
+    def _release_claim(self) -> None:
+        """回滚一次没跑成的占位：周期起算点退回上一轮结束时间（从未跑过则为 0 ⇒ 立即再到期）。"""
+        with self._lock:
+            self._running = False
+            self._last_start = self._last_finish
+
     # ---------- 探测 ----------
 
     def probe_all(self, names) -> dict:
         """同步跑完一轮探测，返回 {工人: 毫秒 或 None}（外部主强制刷新 / 测试用）。
+
+        **绝不与另一轮同时在飞**：自动轮由 _claim 把关，但这里是同步入口、不经 _claim，
+        撞上后台轮就会两轮同时打网络——白烧额度、抢同一批站门，而且样本测的是站端排队
+        （档案是裁剪选路的依据，排名会被系统性带偏）。_round_lock 让后到的一轮排队；
+        _running 由真正在跑的那轮复位，不再出现"先结束的清标志、另一轮还在飞"。
+        """
+        with self._round_lock:
+            with self._lock:
+                # 强制刷新同样构成一轮：周期起算点就此刷新，避免紧接着又叠一轮自动探测
+                self._running = True
+                self._last_start = self._clock()
+            try:
+                return self._run_round(names)
+            finally:
+                with self._lock:
+                    self._running = False
+                    self._last_finish = self._clock()
+                    self._rounds += 1
+
+    def _run_round(self, names) -> dict:
+        """一轮探测的实际执行体（调用方已持 _round_lock，保证单轮在飞）。
 
         每个工人独立探测，单个失败/超时不牵连其它工人；成功样本写进档案。
         探测失败**不**记 health / 冷却（见类文档）。
@@ -247,10 +256,6 @@ class LatencyProber:
             t.start()
         for t in waiters:
             t.join()
-        with self._lock:
-            self._running = False
-            self._last_finish = self._clock()
-            self._rounds += 1
         return out
 
     def stats(self) -> dict:
@@ -287,7 +292,7 @@ class LatencyMixin:
         self._latency_probe_timeout = cfg.latency_probe_timeout
         # 探测器常驻（外部主的 probe_latency_now 随时可用），但**自动**触发由 latency_probe
         # 把关：每 latency_probe_interval 秒对全部工人（含当前不可用节点）打一次极短往返
-        #（用户口径：每 10 分钟自动探测一次所有节点）。关掉它 = 不自动探测，
+        # （用户口径：每 10 分钟自动探测一次所有节点）。关掉它 = 不自动探测，
         # 离线/测试场景必须关（否则首个派工就会起后台线程真打网络）。
         self._latency_auto_probe = cfg.latency_probe
         self._prober = LatencyProber(self.latency, cfg.latency_probe_interval, self._probe_one)
@@ -326,7 +331,7 @@ class LatencyMixin:
             return live
         ordered = self._latency_sorted(live)
         drop = int(len(ordered) * (1.0 - self._latency_keep_ratio))
-        return ordered[:max(1, len(ordered) - drop)]
+        return ordered[: max(1, len(ordered) - drop)]
 
     # ---------- 探测与记账 ----------
 
@@ -384,7 +389,8 @@ class LatencyMixin:
         """**同步**强制跑一轮全节点探测并返回 {工人: 毫秒 或 None}。
 
         给外部主/诊断用：新增了节点、或刚怀疑"某个模型变慢了"时立即刷新一遍，
-        不必等自动探测的 10 分钟周期。与自动探测同一份档案、同一套测量口径。
+        不必等自动探测的 10 分钟周期。与自动探测同一份档案、同一套测量口径，
+        且同一时刻只跑一轮（撞上在飞的自动轮就在 _round_lock 上排队，见 probe_all）。
         """
         return self._prober.probe_all(list(self.profiles))
 
@@ -411,9 +417,4 @@ def get_latency(store_path: Path) -> LatencyStore:
     直接 LatencyStore(...) 仍返回独立实例，保留"新实例=模拟新进程重读盘"的可测性。
     """
     key = Path(store_path)
-    with _shared_lock:
-        inst = _shared_instances.get(key)
-        if inst is None:
-            inst = LatencyStore(key)
-            _shared_instances[key] = inst
-        return inst
+    return shared_by_path(_shared_instances, _shared_lock, key, lambda: LatencyStore(key))

@@ -23,6 +23,7 @@ voting.py 同理。本文件不单独实例化：方法通过 self 访问 Worker
   两个工人反向回退（A→B、B→A）就会互相等成死锁；
 - 排队时间不计入延迟样本（计时在门内开始），否则串行本身会伪造出"慢模型"。
 """
+
 from __future__ import annotations
 
 import threading
@@ -57,7 +58,10 @@ class StationGateMixin:
             return gate
 
     def _chat_gated(
-        self, client: LLMClient, station: tuple[str, str], messages: list[dict],
+        self,
+        client: LLMClient,
+        station: tuple[str, str],
+        messages: list[dict],
     ) -> tuple[dict | None, Exception | None, float]:
         """在「同站串行门」内发**一次**请求，返回 (resp, error, 往返毫秒)。
 
@@ -73,6 +77,18 @@ class StationGateMixin:
             except Exception as e:  # noqa: BLE001 - 交回上层按 LLMError/意外异常分类
                 return None, e, (time.monotonic() - t0) * 1000.0
 
+    def _station_parallel_cap(self, stations: int) -> int:
+        """并发口径的**唯一公式**：min(全局上限 max_workers, 每站配额 × 站数)，下限 1。
+
+        站数由调用方决定口径——`concurrency_status()` 传全池站数（给外部主看的真实
+        容量），`_batch_concurrency()` 传本批涉及的站数（决定批次数）。两处曾经各自
+        复制这条公式，参数来源还不一样，改口径时极易只改一边漂移出"报告说能跑 6 路、
+        实际按 2 路分批"的矛盾，故收敛到这一个函数。
+        """
+        cap = max(1, self.cfg.max_workers)
+        per_station = max(1, getattr(self, "_max_per_station", self.cfg.max_per_station))
+        return max(1, min(cap, per_station * max(1, stations)))
+
     def concurrency_status(self) -> dict:
         """派工前的并发口径快照：一批**真能**并行几路（同站串行下不等于 max_workers）。
 
@@ -81,10 +97,9 @@ class StationGateMixin:
         """
         stations = len({(p.base_url, p.api_key) for p in self.profiles.values()})
         per_station = max(1, self._max_per_station)
-        cap = max(1, self.cfg.max_workers)
         return {
             "stations": stations,
-            "max_workers": cap,
+            "max_workers": max(1, self.cfg.max_workers),
             "max_per_station": per_station,
-            "effective": max(1, min(cap, per_station * max(1, stations))),
+            "effective": self._station_parallel_cap(stations),
         }

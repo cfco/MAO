@@ -34,16 +34,16 @@
     - ask_vote：ok = 投票是否真正产出结果，另带 consensus 布尔（是否过半）。
   · ask / ask_many 的结构化条目带稳定 status 码：ok|error|cooldown|quarantined|missing|timeout。
 """
+
 from __future__ import annotations
 
 import json
 import sys
-from threading import Lock
 
 from . import __version__
 from .config import Config
-from .core.llm import LLMClient, LLMError
-from .core.orchestrator import WORKER_SYSTEM, WorkerPool
+from .core.orchestrator import WorkerPool
+from .core.redact import safe_error_text
 from .skills_manager import SkillManager, register_skill_tools
 from .tools.base import ToolRegistry
 from .tools.builtin import build_builtin_tools
@@ -79,7 +79,7 @@ def _parse_economy(raw) -> bool | None:
 
 
 class Bridge:
-    """一个 bridge 连接：共享的注册表 + 技能 + MCP 连接组 + 工人池 + 兜底单模型。"""
+    """一个 bridge 连接：共享的注册表 + 技能 + MCP 连接组 + 工人池。"""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -93,6 +93,7 @@ class Bridge:
         self.mcp_status: list[str] = []
         if cfg.mcp_servers:
             from .tools.mcp_client import acquire_group, register_group_tools
+
             self.mcp_group = acquire_group(cfg.mcp_servers)
             self.mcp_status = list(self.mcp_group.status)
             register_group_tools(self.registry, self.mcp_group)
@@ -100,37 +101,6 @@ class Bridge:
         # 省 token 开关（运行态）：初始值来自 collaboration.economy（.env COLLAB_ECONOMY）。
         # 外部主可经 set_economy 指令运行期切换；MAO 只透传开关、不做模式判断。
         self._economy: bool = cfg.economy
-        # 兜底单模型客户端（ask 未指定 agent 时用）：首次访问创建后复用，
-        # 避免每次 ask 都新建一个 OpenAI 客户端（各自一套 httpx 连接池，用完即弃）。
-        self._fallback_llm: LLMClient | None = None
-        self._llm_lock = Lock()
-
-    # ---------- 兜底单模型 ----------
-
-    def _fallback_client(self) -> LLMClient:
-        """返回兜底单模型客户端（懒创建 + 复用）。
-
-        temperature/timeout/max_retries 与 WorkerPool 同源读 llm 配置：用代码默认值
-        会让 config.yaml 的调整对这条路径不生效，免费节点友好策略在 bridge 下静默降级。
-        """
-        with self._llm_lock:
-            if self._fallback_llm is None:
-                llm = self.cfg.llm
-                self._fallback_llm = LLMClient(
-                    str(llm.get("base_url", "")),
-                    str(llm.get("api_key", "")),
-                    str(llm.get("model", "")),
-                    temperature=self.cfg.as_float(
-                        llm.get("temperature", 0.7), "llm.temperature", 0.7, minimum=0.0
-                    ),
-                    timeout=self.cfg.as_float(
-                        llm.get("timeout", 120) or 120, "llm.timeout", 120.0, minimum=1.0
-                    ),
-                    max_retries=self.cfg.as_int(
-                        llm.get("max_retries", 2) or 0, "llm.max_retries", 2, minimum=0
-                    ),
-                )
-            return self._fallback_llm
 
     # ---------- 指令分发 ----------
 
@@ -138,7 +108,11 @@ class Bridge:
         """处理一条请求，返回最终响应 dict（serve 循环负责写 stdout）。"""
         cmd = req.get("cmd")
         if cmd == "ping":
-            return {"ok": True, "version": __version__, "agents": [p.name for p in self.cfg.agent_profiles]}
+            return {
+                "ok": True,
+                "version": __version__,
+                "agents": [p.name for p in self.cfg.agent_profiles],
+            }
         if cmd == "list_agents":
             return {"ok": True, "agents": [p.brief() for p in self.cfg.agent_profiles]}
         if cmd == "list_tools":
@@ -148,8 +122,12 @@ class Bridge:
             # 顺带回显 economy 开关：外部主每次派工前都无需记忆上次 set 的状态。
             # 再带回 concurrency（同站串行后的**真实**并行度）：点名一批工人能并行几路不再
             # 等于 max_workers，主据此决定"一批几个、分几轮、要不要跨站点名"。
-            out = {"ok": True, "workers": self.workers.health_status(), "economy": self._economy,
-                   "concurrency": self.workers.concurrency_status()}
+            out = {
+                "ok": True,
+                "workers": self.workers.health_status(),
+                "economy": self._economy,
+                "concurrency": self.workers.concurrency_status(),
+            }
             return out
         if cmd == "latency":
             # 延迟维度快照（问题5）：各工人当前延迟（往返耗时中位数，毫秒）+ 探测调度状态。
@@ -167,8 +145,11 @@ class Bridge:
                     f"[bridge] set_economy 收到非法值 {req.get('value')!r}，保持当前 {self._economy}",
                     file=sys.stderr,
                 )
-                return {"ok": False, "economy": self._economy,
-                        "error": "value 必须是布尔值或 true/false/1/0 等字面量"}
+                return {
+                    "ok": False,
+                    "economy": self._economy,
+                    "error": "value 必须是布尔值或 true/false/1/0 等字面量",
+                }
             self._economy = val
             return {"ok": True, "economy": self._economy}
         if cmd == "call_tool":
@@ -205,27 +186,19 @@ class Bridge:
                 if r["ok"]:
                     return {"ok": True, "answer": r["answer"], "status": r["status"]}
                 return {"ok": False, "answer": "", "status": r["status"], "error": r["error"]}
-            # 未指定 agent：用兜底单模型（懒创建复用）。#8：也纳入健康体系——
-            # 冷却/当日隔离按合成键 solo:<model> 走与工人同一套判定；失败按 retryable
-            # 分级（终态错误当天隔离，瞬时失败只短时退避）。契约与工人 ask 对称
-            # （#3：失败归一成 {ok:false, answer:"", status, error}，不再冒泡成另一种形状）。
-            sk = self.workers.solo_key()
-            ok_now, reason = self.workers.is_dispatchable(sk)
-            if not ok_now:
-                status = "quarantined" if reason == "当日失败隔离" else "cooldown"
-                return {"ok": False, "answer": "", "status": status,
-                        "error": f"兜底模型今日不可用（{reason}），请指定 agent 或稍后再试"}
-            client = self._fallback_client()
-            try:
-                resp = client.chat([
-                    {"role": "system", "content": str(req.get("system") or WORKER_SYSTEM)},
-                    {"role": "user", "content": prompt},
-                ])
-            except LLMError as e:
-                self.workers.note_result(sk, ok=False, fatal=not e.retryable)
-                return {"ok": False, "answer": "", "status": "error", "error": str(e)}
-            self.workers.note_result(sk, ok=True)
-            return {"ok": True, "answer": resp.get("content", ""), "status": "ok"}
+            # 未指定 agent：从池中挑一个当前可用工人（即"主模型"充当兜底），
+            # 复用工人池的健康/冷却/回退链，不再需要单独的兜底单模型配置。
+            pool = self.workers.pick(limit=1)
+            if not pool:
+                return {
+                    "ok": False,
+                    "status": "missing",
+                    "error": "当前没有可用工人（池全挂/全冷却），请指定 agent 或稍后再试",
+                }
+            r = self.workers.ask_result(pool[0], prompt, req.get("system"))
+            if r["ok"]:
+                return {"ok": True, "answer": r["answer"], "status": r["status"]}
+            return {"ok": False, "answer": "", "status": r["status"], "error": r["error"]}
         if cmd == "ask_many":
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
@@ -237,7 +210,8 @@ class Bridge:
                 req.get("system"),
             )
             text = "\n\n".join(
-                f"### 工人 {r['worker']} 的结果\n" + (r["answer"] if r["ok"] else f"（{r['status']}）")
+                f"### 工人 {r['worker']} 的结果\n"
+                + (r["answer"] if r["ok"] else f"（{r['status']}）")
                 for r in recs
             )
             # #2：外层 ok = 至少一个工人成功；全失败/无可用工人 → ok:false
@@ -283,10 +257,10 @@ class Bridge:
         return {"ok": False, "error": f"未知指令: {cmd}"}
 
     def close(self) -> None:
-        """释放共享工人池、兜底单模型客户端与 MCP 连接组引用。"""
-        # 工人池与兜底客户端都持有 httpx 连接池，进程退出前显式释放。
+        """释放共享工人池与 MCP 连接组引用。"""
+        # 工人池持有 httpx 连接池，进程退出前显式释放。
         # MCP 只解除本使用者的引用（引用归零时组内部才真正断开）。
-        for holder in (self.workers, self._fallback_llm):
+        for holder in (self.workers,):
             if holder is None:
                 continue
             try:
@@ -295,6 +269,7 @@ class Bridge:
                 pass
         if self.mcp_group is not None:
             from .tools.mcp_client import release_group
+
             release_group(self.mcp_group)
             self.mcp_group = None
 
@@ -347,9 +322,11 @@ def serve(cfg: Config) -> None:
                 else:
                     resp = {"ok": False, "error": "请求必须是 JSON 对象"}
             except json.JSONDecodeError as e:
-                resp = {"ok": False, "error": f"JSON 解析失败: {e}"}
+                # 统一走脱敏：这一行直接进 stdout 的 JSON 行协议，不留"哪个分支可以原文透传"的判断
+                resp = {"ok": False, "error": f"JSON 解析失败: {safe_error_text(e)}"}
             except Exception as e:  # noqa: BLE001 - 单条指令失败不能拖垮协议循环
-                resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                # 这一行会直接写进 stdout 的 JSON 行协议，异常原文可能带 endpoint，先脱敏
+                resp = {"ok": False, "error": f"{type(e).__name__}: {safe_error_text(e)}"}
             sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
             sys.stdout.flush()
     finally:

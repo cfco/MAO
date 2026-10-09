@@ -30,18 +30,20 @@ fail_dates 只保留最近 _MAX_DATES_KEPT 条、active_dates 只保留最近 _M
 条，防止文件无界增长。旧版 version 1（无 active_dates）可读：视为运行日未知。
 
 并发：自带独立锁（与 WorkerPool 的锁相互独立，嵌套方向恒为 pool→health，
-不会反向，无死锁环）；落盘另有 _write_lock，嵌套方向恒为 write_lock→health。写盘原子化（临时文件 + os.replace）。
+不会反向，无死锁环）；落盘走 core/ledger.py 的原子写骨架（快照与写盘同域串行、
+落盘在账本锁之外、失败只丢持久化，口径与理由见该模块文档）。写盘原子化（临时文件 + os.replace）。
 离线可测：record_failure 支持显式指定日期 day，不必等真实时间流逝。
 """
+
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from pathlib import Path
 
-from ..model_registry import retire_model
+from ..model_registry import RETIRE_ALREADY, RETIRE_OFFLINED, retire_model
+from .ledger import AtomicJsonLedger, shared_by_path
 
 _MAX_DATES_KEPT = 30
 _MAX_ACTIVE_KEPT = 60
@@ -51,7 +53,7 @@ def _today() -> str:
     return time.strftime("%Y-%m-%d")
 
 
-class ModelHealth:
+class ModelHealth(AtomicJsonLedger):
     """模型健康账本：当日失败隔离查询 + 失败记账 + 连续运行日达阈值下线改写。"""
 
     def __init__(
@@ -60,14 +62,10 @@ class ModelHealth:
         registry_path: Path | None = None,
         retire_days: int = 7,
     ):
-        self.store_path = Path(store_path)
+        # _lock / _write_lock / store_path 由基类建好（落盘口径见 ledger.py）
+        super().__init__(store_path)
         self.registry_path = Path(registry_path) if registry_path else None
         self.retire_days = max(1, int(retire_days))
-        self._lock = threading.Lock()
-        # 落盘专用锁：**取快照 + 写盘**整段串行（见 _write_payload）。写盘在 _lock 之外，
-        # 多线程可能同时落盘；若快照在 _write_lock 之外取，写盘顺序可能与快照顺序相反，
-        # 旧快照会覆盖新快照丢记账。嵌套方向恒为 write_lock→lock，与 pool→health 同向无环。
-        self._write_lock = threading.Lock()
         self._data: dict[str, dict] | None = None  # 懒加载：首次使用时才读盘
         self._active: list[str] = []  # 运行日清单（加载后随记账增长）
 
@@ -82,13 +80,14 @@ class ModelHealth:
 
     # ---------- 记账 ----------
 
-    def record_failure(self, name: str, model: str = "", models_env: str = "",
-                       day: str | None = None) -> str | None:
+    def record_failure(
+        self, name: str, model: str = "", models_env: str = "", day: str | None = None
+    ) -> str | None:
         """记一次终态失败：往该模型 fail_dates 记当天日期（⇒ 当天隔离，不再派工）。
 
         仅由 WorkerPool 在判定为"终态不可重试失败"（auth / 非重试 4xx）时调用；可重试的
         瞬时失败由冷却承接，不会走到这里。
-        name       档案键（通常是 AgentProfile.name，主智能体兜底模型用 solo:<model>）
+        name       档案键（通常是 AgentProfile.name，即池内工人的健康键）
         model      模型名（改写 model_registry.txt 时按 @ 前的名字精确匹配条目）
         models_env 该模型清单所在变量名（如 NODE_A_MODELS），定位改写行
         day        记账日期（缺省=今天；测试可注入历史日期构造连击）
@@ -108,9 +107,9 @@ class ModelHealth:
                 entry["disabled"] = day
                 disabled_now = True  # registry 改写是 IO，放锁外做（理由同写盘）
         # 文件 IO 放锁外：quarantined() 是派工热路径，持锁写会把 health 锁串到
-        # pool 锁、卡住全进程派工。快照与落盘都在 _write_lock 内串行（见 _write_payload），
+        # pool 锁、卡住全进程派工。快照与落盘都在 _write_lock 内串行（见 ledger.py），
         # 这里只负责记账完就通知落盘。
-        self._write_payload()
+        self.write()
         if disabled_now:
             notice = self._notice_and_retire(name, model, models_env)
         return notice
@@ -120,7 +119,7 @@ class ModelHealth:
         with self._lock:
             self._ensure_loaded()
             self._mark_active_locked(day or _today())
-        self._write_payload()  # 落盘放锁外，理由同 record_failure
+        self.write()  # 落盘放锁外，理由同 record_failure
 
     # ---------- 运行日记录 ----------
 
@@ -139,7 +138,7 @@ class ModelHealth:
         """
         if len(self._active) < self.retire_days:
             return False
-        window = self._active[-self.retire_days:]
+        window = self._active[-self.retire_days :]
         dset = set(fail_dates)
         return all(d in dset for d in window)
 
@@ -165,30 +164,18 @@ class ModelHealth:
         """给 model_registry.txt 的 models_env 行里的 model 加 #，返回命中的变量名。
 
         只改写精确变量行（AgentProfile.models_env 定位，agents 池的模型才有）；
-        已经带 # 的条目视为已处理（幂等，return 命中变量名但不重写文件）。
-        LLM_MODEL 兜底行不自动动（solo 走不到这里；该行也不经 models_env 传入）。
+        已经带 # 的条目视为已处理（RETIRE_ALREADY，幂等：给调用方正确的"已下线"提示，
+        但不重复写文件）。自动下线只作用于池模型行（models_env 非空）；无 models_env
+        的键不会被改写。
+
+        三态判定在 retire_model 内部完成——旧写法这里先自己解析一遍文件判断"是否已
+        下线"、随后 retire_model 又读一遍同一文件（双份 IO + 双份解析口径，两次读之间
+        文件被改还会误判），是同款逻辑复制两份的典型。
         """
         if not model or not models_env or self.registry_path is None:
             return None
-        if self._already_retired(model, models_env):
-            return models_env  # 历史已下线：不再重复写，但给调用方正确的"已下线"提示
-        ok = retire_model(self.registry_path, models_env, model)
-        return models_env if ok else None
-
-    def _already_retired(self, model: str, models_env: str) -> bool:
-        """models_env 行里是否已有该模型的 # 前缀条目（曾自动/手动下线）。"""
-        try:
-            text = self.registry_path.read_text(encoding="utf-8")
-        except OSError:
-            return False
-        for line in text.splitlines():
-            if not line.strip().startswith(f"{models_env}="):
-                continue
-            for item in line.partition("=")[2].split(","):
-                item = item.strip()
-                if item.startswith("#") and item.lstrip("#").partition("@")[0].strip() == model:
-                    return True
-        return False
+        state = retire_model(self.registry_path, models_env, model)
+        return models_env if state in (RETIRE_OFFLINED, RETIRE_ALREADY) else None
 
     # ---------- 落盘 ----------
 
@@ -220,38 +207,6 @@ class ModelHealth:
         payload = {"version": 2, "active_dates": list(self._active), "models": self._data}
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def _write_payload(self) -> None:
-        """取账本快照并原子写入档案。**_lock 之外调用**，不阻塞 quarantined() 等热路径。
-
-        快照必须在 _write_lock **之内**取：若调用方在 _lock 里先取好文本、再来排队写盘，
-        两个线程的"写盘顺序"与"快照顺序"可能相反 —— 后写盘的反而拿着更早（少记账）的快照，
-        把先写盘的全量快照整段覆盖掉（lost update；并发 record_failure 实测会丢档案条目，
-        慢盘/多核 Linux 上尤其容易撞见）。取快照与写盘同域串行后，写盘顺序即快照顺序，
-        每次落盘都是上一次的超集。落盘 IO 仍留在 _lock 之外：quarantined() 只拿 _lock，
-        不会被慢盘阻塞（见 tests/test_audit2_fixes.py 的 M17 变异用例）。
-
-        另带一把写盘锁串行化本身：并发 os.replace 到同一目标在 Windows 上会互相踩
-        （实测残留 .tmp 垃圾文件）。临时文件名带 pid+线程号，失败时清理，不留残留。
-        """
-        tmp: Path | None = None
-        with self._write_lock:
-            with self._lock:
-                text = self._snapshot_locked()
-            try:
-                self.store_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = self.store_path.with_name(
-                    f"{self.store_path.name}.{os.getpid()}-{threading.get_ident()}.tmp"
-                )
-                tmp.write_text(text, encoding="utf-8")
-                os.replace(tmp, self.store_path)
-            except OSError:
-                # 档案写不进去只损失持久化，内存账本照常工作；顺手清掉写了一半的临时文件
-                if tmp is not None:
-                    try:
-                        tmp.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
     def snapshot(self) -> dict[str, dict]:
         """当前档案的浅拷贝（诊断/测试用，不含任何密钥）。"""
         with self._lock:
@@ -265,13 +220,14 @@ _shared_lock = threading.Lock()
 _shared_instances: dict[Path, ModelHealth] = {}
 
 
-def get_health(store_path: Path, registry_path: Path | None = None,
-               retire_days: int = 7) -> ModelHealth:
+def get_health(
+    store_path: Path, registry_path: Path | None = None, retire_days: int = 7
+) -> ModelHealth:
     """按档案路径取进程内共享的 ModelHealth 实例（WorkerPool 的默认构造入口）。
 
     为什么必须共享：一个进程里可能有多个 WorkerPool（例如外部主在同一 bridge 进程里
     建了多套调用路径）。各持一份 ModelHealth 时，每个实例都有自己的内存账本 + 独立锁 +
-    全量覆写的 _write_payload（json.dumps(self._data)）：A 记下 node-a 今天失败并写盘后，
+    全量覆写的 write()（json.dumps(self._data)）：A 记下 node-a 今天失败并写盘后，
     B 只要持有更早的内存快照再写盘，就会把 A 的记录整段抹掉（lost update）；同时 B 的
     quarantined() 也看不到 A 的隔离结果 —— 当日隔离形同虚设，坏节点当天被反复打。共享
     同一实例后内存账本与锁唯一，写盘不再互相覆盖，隔离状态全进程一致。
@@ -284,9 +240,9 @@ def get_health(store_path: Path, registry_path: Path | None = None,
     后续调用即使参数不同也复用既有实例（保证"同一档案=同一个账本"的语义不被打破）。
     """
     key = Path(store_path)
-    with _shared_lock:
-        inst = _shared_instances.get(key)
-        if inst is None:
-            inst = ModelHealth(key, registry_path, retire_days)
-            _shared_instances[key] = inst
-        return inst
+    return shared_by_path(
+        _shared_instances,
+        _shared_lock,
+        key,
+        lambda: ModelHealth(key, registry_path, retire_days),
+    )

@@ -4,9 +4,10 @@
 - MCP 断线重连：曾连上后重连失败不得永久放弃（旧实现第一次重连失败即 break）
 - MCP _connect_once 失败回滚：transport 已 enter 后失败必须退出，不泄漏子进程
 - WorkerPool.ask：命中缓存的回答不得被节点冷却误拦；无缓存的新请求仍被冷却挡住
-- bridge ask 兜底单模型：timeout/max_retries/temperature 须读 llm 配置
+- bridge ask 未指定 agent 时从池中挑一个可用工人（主模型充当兜底，复用工人池健康/冷却/回退链）
 - bridge stderr 编码：诊断（配置警告）必须是 UTF-8，外部驱动方按 UTF-8 解码不得报错
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -16,6 +17,7 @@ import time
 from agent.config import Config, _interpolate
 
 # ---------------- MCP：断线重连持续重试 ----------------
+
 
 def test_mcp_reconnect_retries_after_failed_reconnect():
     """曾连上过 → 断开 → 重连失败时应持续退避重试，而不是第一次失败就终结线程。
@@ -53,7 +55,8 @@ def test_mcp_reconnect_retries_after_failed_reconnect():
             time.sleep(0.02)
         assert len(attempts) >= 4, (
             f"重连失败后应持续重试，实际尝试 {len(attempts)} 次"
-            "（旧实现停在 2 次：断开后第一次重连失败即 break）")
+            "（旧实现停在 2 次：断开后第一次重连失败即 break）"
+        )
         assert len(backoffs) >= 2, "断开与每次重连失败都应经历退避"
     finally:
         conn._stop.set()
@@ -84,6 +87,7 @@ def test_mcp_first_connect_failure_still_fails_fast():
 
 
 # ---------------- MCP：_connect_once 失败回滚 transport ----------------
+
 
 def test_mcp_connect_once_rolls_back_entered_transport(monkeypatch):
     """transport __aenter__ 成功、session 建立失败：已进入的 transport 必须被退出。
@@ -126,77 +130,18 @@ def test_mcp_connect_once_rolls_back_entered_transport(monkeypatch):
     assert conn.error and "boom" in conn.error
 
 
-# ---------------- bridge：ask 兜底单模型读 llm 配置 ----------------
-
-def test_bridge_ask_fallback_uses_llm_config(monkeypatch):
-    from agent import bridge as br
-
-    captured: dict = {}
-
-    class FakeClient:
-        def __init__(self, base_url, api_key, model,
-                     temperature=0.7, timeout=120.0, max_retries=2):
-            captured.update(temperature=temperature, timeout=timeout, max_retries=max_retries)
-
-        def chat(self, messages):
-            return {"content": "ok"}
-
-    monkeypatch.setattr(br, "LLMClient", FakeClient)
-    cfg = Config(_interpolate({
-        "agents": [],
-        "llm": {"base_url": "u", "api_key": "k", "model": "m",
-                "temperature": 0.1, "timeout": 33, "max_retries": 5},
-    }))
-    b = br.Bridge(cfg)
-    try:
-        out = b.handle({"cmd": "ask", "prompt": "hi"})
-        assert out["ok"] and out["answer"] == "ok"
-        assert captured == {"temperature": 0.1, "timeout": 33.0, "max_retries": 5}, (
-            f"bridge ask 兜底应读 llm 配置，实际：{captured}")
-    finally:
-        b.close()
-
-
-def test_bridge_fallback_participates_in_health(tmp_path, monkeypatch):
-    """#8：兜底单模型也纳入健康体系——终态失败当天隔离，第二次直接跳过不再打。"""
-    from agent import bridge as br
-    from agent.core.llm import LLMError
-
-    class Boom:
-        def __init__(self, *_a, **_k):
-            pass
-
-        def chat(self, messages):
-            raise LLMError("auth", "bad key", retryable=False)  # 终态不可重试
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(br, "LLMClient", Boom)
-    cfg = Config(_interpolate({
-        "agents": [],
-        "llm": {"base_url": "u", "api_key": "k", "model": "solo-m"},
-    }))
-    b = br.Bridge(cfg)
-    try:
-        first = b.handle({"cmd": "ask", "prompt": "hi"})
-        assert first["ok"] is False and first["status"] == "error"
-        sk = b.workers.solo_key()
-        assert b.workers.health.quarantined(sk), "终态失败应把兜底模型当天隔离"
-        second = b.handle({"cmd": "ask", "prompt": "hi"})
-        assert second["ok"] is False and second["status"] == "quarantined", (
-            "隔离后当天不再打，直接返回 quarantine")
-    finally:
-        b.close()
-
-
 def test_bridge_call_tool_reports_failure_shape():
     """#3：call_tool 未知工具/失败必须回 ok:false，不再永远 ok:true 把错误塞进 result。"""
     from agent import bridge as br
-    cfg = Config(_interpolate({
-        "agents": [],
-        "llm": {"base_url": "u", "api_key": "k", "model": "m"},
-    }))
+
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [],
+                "llm": {"base_url": "u", "api_key": "k", "model": "m"},
+            }
+        )
+    )
     b = br.Bridge(cfg)
     try:
         bad = b.handle({"cmd": "call_tool", "name": "does_not_exist", "args": {}})
@@ -226,13 +171,24 @@ def test_bridge_stderr_decodes_as_utf8():
     root = Path(__file__).resolve().parent.parent
     env = dict(os.environ)
     # 确保存在缺失变量 → 触发 [配置警告]（若环境里恰好配了，删掉再跑）
-    for k in ("NODE_A_ENDPOINT", "NODE_A_KEY", "NODE_A_MODELS",
-              "NODE_B_ENDPOINT", "NODE_B_KEY", "NODE_B_MODELS"):
+    for k in (
+        "NODE_A_ENDPOINT",
+        "NODE_A_KEY",
+        "NODE_A_MODELS",
+        "NODE_B_ENDPOINT",
+        "NODE_B_KEY",
+        "NODE_B_MODELS",
+    ):
         env.pop(k, None)
     proc = subprocess.run(
         [sys.executable, "-m", "agent", "bridge"],
-        input=b'{"cmd": "ping"}\n', capture_output=True, cwd=str(root), env=env, timeout=120,
+        input=b'{"cmd": "ping"}\n',
+        capture_output=True,
+        cwd=str(root),
+        env=env,
+        timeout=120,
     )
     err = proc.stderr.decode("utf-8")  # 严格解码：GBK 字节在这里就会炸
     assert "配置警告" in err or proc.returncode == 0, (
-        f"应有可 UTF-8 解码的诊断或无输出；stderr={err[:200]!r}")
+        f"应有可 UTF-8 解码的诊断或无输出；stderr={err[:200]!r}"
+    )

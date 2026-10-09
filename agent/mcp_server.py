@@ -10,6 +10,7 @@ Cursor / Qoder / 千问办公等）几乎都内置了 MCP client——本模块�
 `Bridge.handle()`——bridge 与 mcp 两条外壳共享同一个内核，行为（含错误文案、
 无状态语义）逐字一致，测试也只需盯一处。
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -51,20 +52,27 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
     def list_agents() -> dict:
         return _h({"cmd": "list_agents"})
 
-    @app.tool(name="health",
-              description="派工前预检：各子 AI 可用性快照（冷却/当日隔离/标签/延迟ms）"
-                          "+ concurrency（真实并行度 = min(max_workers, max_per_station × 站数)，"
-                          "默认每站只跑 1 个模型 ⇒ 一批要点速度就跨站点名）")
+    @app.tool(
+        name="health",
+        description="派工前预检：各子 AI 可用性快照（冷却/当日隔离/标签/延迟ms）"
+        "+ concurrency（真实并行度 = min(max_workers, max_per_station × 站数)，"
+        "默认每站只跑 1 个模型 ⇒ 一批要点速度就跨站点名）",
+    )
     def health() -> dict:
         return _h({"cmd": "health"})
 
-    @app.tool(name="latency",
-              description="延迟档案与探测状态（问题5）：各工人往返耗时中位数（毫秒）+ 探测调度；"
-                          "probe=true 时先同步探测一轮**全部节点**（含不可用节点）再返回")
+    @app.tool(
+        name="latency",
+        description="延迟档案与探测状态（问题5）：各工人往返耗时中位数（毫秒）+ 探测调度；"
+        "probe=true 时先同步探测一轮**全部节点**（含不可用节点）再返回",
+    )
     def latency(probe: bool = False) -> dict:
         return _h({"cmd": "latency", "probe": probe})
 
-    @app.tool(name="set_economy", description="省 token 开关（二元）：value 为 true/false，返回切换后的真实状态；非法值 ok:false 并保持原值")
+    @app.tool(
+        name="set_economy",
+        description="省 token 开关（二元）：value 为 true/false，返回切换后的真实状态；非法值 ok:false 并保持原值",
+    )
     def set_economy(value: bool) -> dict:
         return _h({"cmd": "set_economy", "value": value})
 
@@ -84,25 +92,37 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
     def run_skill_script(skill: str, script: str, args: dict[str, Any] | None = None) -> dict:
         return _h({"cmd": "run_skill_script", "skill": skill, "script": script, "args": args or {}})
 
-    @app.tool(name="ask", description="把池内某个模型当纯文本子 AI 用；agent 留空走兜底单模型")
+    @app.tool(
+        name="ask",
+        description="把池内某个模型当纯文本子 AI 用；不指定 agent 时自动从池中挑一个可用工人",
+    )
     def ask(prompt: str, agent: str = "", system: str = "") -> dict:
         return _h({"cmd": "ask", "prompt": prompt, "agent": agent, "system": system or None})
 
-    @app.tool(name="ask_many",
-              description="同一任务并行派多个工人（多方案对比/交叉验证）；"
-                          "返回 workers 结构化逐工人结果（顺序与入参一致）+ results 文本；"
-                          "workers 缺省取前 N 个可派工人（collaboration.max_participants）")
+    @app.tool(
+        name="ask_many",
+        description="同一任务并行派多个工人（多方案对比/交叉验证）；"
+        "返回 workers 结构化逐工人结果（顺序与入参一致）+ results 文本；"
+        "workers 缺省取前 N 个可派工人（collaboration.max_participants）",
+    )
     def ask_many(prompt: str, workers: list[str] | None = None, system: str = "") -> dict:
-        return _h({"cmd": "ask_many", "prompt": prompt, "workers": workers, "system": system or None})
+        return _h(
+            {"cmd": "ask_many", "prompt": prompt, "workers": workers, "system": system or None}
+        )
 
-    @app.tool(name="ask_vote",
-              description="两步投票取共识：各出方案→对编号投票→超阈值给出胜出方案全文")
-    def ask_vote(prompt: str, workers: list[str] | None = None, threshold: float | None = None) -> dict:
+    @app.tool(
+        name="ask_vote", description="两步投票取共识：各出方案→对编号投票→超阈值给出胜出方案全文"
+    )
+    def ask_vote(
+        prompt: str, workers: list[str] | None = None, threshold: float | None = None
+    ) -> dict:
         return _h({"cmd": "ask_vote", "prompt": prompt, "workers": workers, "threshold": threshold})
 
-    @app.tool(name="run_review",
-              description="调用方给初稿（draft）+可选背景（context），多个工人只当评审团挑错；"
-                          "返回结构化 reviews")
+    @app.tool(
+        name="run_review",
+        description="调用方给初稿（draft）+可选背景（context），多个工人只当评审团挑错；"
+        "返回结构化 reviews",
+    )
     def run_review(draft: str, context: str = "", workers: list[str] | None = None) -> dict:
         return _h({"cmd": "run_review", "draft": draft, "context": context, "workers": workers})
 

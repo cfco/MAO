@@ -13,6 +13,7 @@
 的 cfg / profiles / pick / collect / _run_parallel / _effective_timeout 等属性与方法，
 调用签名完全不变（外部 bridge/mcp/call 三外壳无感）。
 """
+
 from __future__ import annotations
 
 import re
@@ -96,6 +97,25 @@ class VotingMixin:
         best_idx, best_n = max(tally.items(), key=lambda kv: kv[1])
         return best_idx, tally, total, best_n, invalid
 
+    def _vote_threshold(self, threshold: float | None) -> float:
+        """投票阈值：显式传入的也要过 as_float（审计 P1）。
+
+        外部主经 bridge 传 JSON 时 `"threshold":"0.5"`（字符串）会原样流到
+        `ratio >= th` 抛 TypeError。与数值配置同一态度：类型错警告一次、回退默认值，
+        不阻投票。select_best 与 vote 共用本函数，口径只有一份。
+        """
+        return self.cfg.as_float(
+            self.cfg.collab_cfg.get("vote_threshold", 0.5) if threshold is None else threshold,
+            "collaboration.vote_threshold",
+            0.5,
+            minimum=0.0,
+        )
+
+    def _voter_pool(self, workers: list[str] | None) -> list[str]:
+        """投票人名单：缺省取 pick() 的可用工人子集（受 max_participants 约束），
+        显式名单则去重、保序、剔掉不在池里的名字。两处入口共用同一口径。"""
+        return [w for w in dict.fromkeys(workers or self.pick()) if w in self.profiles]
+
     def select_best(
         self: WorkerPool,
         candidates: list[tuple[str, str]],
@@ -117,14 +137,8 @@ class VotingMixin:
             master_text = master_contribution.strip()
             if master_text:
                 candidates = [*candidates, ("@master", master_text)]
-        # 审计 P1：显式传入的 threshold 也过 as_float——外部主经 bridge 传 JSON 时
-        # "threshold":"0.5"（字符串）会原样流到 `ratio >= th` 抛 TypeError。
-        # 与数值配置同一态度：类型错警告一次、回退默认值，不阻投票。
-        th = self.cfg.as_float(
-            self.cfg.collab_cfg.get("vote_threshold", 0.5) if threshold is None else threshold,
-            "collaboration.vote_threshold", 0.5, minimum=0.0,
-        )
-        pool = [w for w in dict.fromkeys(voters or self.pick()) if w in self.profiles]
+        th = self._vote_threshold(threshold)
+        pool = self._voter_pool(voters)
         if not pool:
             return None
         result = self._run_ballot(candidates, pool, timeout)
@@ -132,9 +146,8 @@ class VotingMixin:
             return None
         best_idx, tally, total, best_n, _invalid = result
         winner = candidates[best_idx - 1]
-        summary = (
-            f"投票 {best_n}/{total} 票（阈值 {th:.0%}）；票况："
-            + ", ".join(f"[{i}]={tally.get(i, 0)}" for i in range(1, len(candidates) + 1))
+        summary = f"投票 {best_n}/{total} 票（阈值 {th:.0%}）；票况：" + ", ".join(
+            f"[{i}]={tally.get(i, 0)}" for i in range(1, len(candidates) + 1)
         )
         return winner[0], winner[1], summary
 
@@ -179,14 +192,8 @@ class VotingMixin:
           · ok=True & consensus=True：达成过半共识，report 含胜出方案全文；
           · ok=True & consensus=False：投票成功但未过半，report 列票况请主裁决。
         """
-        # 审计 P1：显式传入的 threshold 也过 as_float——外部主经 bridge 传 JSON 时
-        # "threshold":"0.5"（字符串）会原样流到 `ratio >= th` 抛 TypeError。
-        # 与数值配置同一态度：类型错警告一次、回退默认值，不阻投票。
-        th = self.cfg.as_float(
-            self.cfg.collab_cfg.get("vote_threshold", 0.5) if threshold is None else threshold,
-            "collaboration.vote_threshold", 0.5, minimum=0.0,
-        )
-        pool = [w for w in dict.fromkeys(workers or self.pick()) if w in self.profiles]
+        th = self._vote_threshold(threshold)
+        pool = self._voter_pool(workers)
         if not pool:
             return {"ok": False, "consensus": False, "report": "错误：没有可投票的子智能体。"}
 
@@ -201,31 +208,41 @@ class VotingMixin:
         # 只入候选、不出力（MAO 不调用主），所以不占工人名额、不消耗额度，也不进
         # 冷却/隔离/"投票人"名单；仅接受字符串（None/非字符串按未提供，行为与不传一致）。
         master_text = (
-            str(master_contribution).strip()
-            if isinstance(master_contribution, str)
-            else ""
+            str(master_contribution).strip() if isinstance(master_contribution, str) else ""
         )
         if master_text:
             candidates = [*candidates, ("@master", master_text)]
         if not candidates:
-            return {"ok": False, "consensus": False, "report": "错误：所有工人均未给出可用方案，无法投票。"}
+            return {
+                "ok": False,
+                "consensus": False,
+                "report": "错误：所有工人均未给出可用方案，无法投票。",
+            }
         # 全败兜底：工人一个方案都没有、只有主方案时，主方案即唯一答案，直接宣布
         # 胜出（不再发起投票——无工人候选时投票没意义，只会报"结果无法解析"）。
         if len(candidates) == 1 and candidates[0][0] == "@master":
             return {
-                "ok": True, "consensus": True,
+                "ok": True,
+                "consensus": True,
                 "report": "## 候选方案\n[1] @master：主智能体方案\n"
-                          "## 共识达成（1/1 票 ≥ 100%）\n"
-                          f"胜出方案（@master）：\n{master_text}",
+                "## 共识达成（1/1 票 ≥ 100%）\n"
+                f"胜出方案（@master）：\n{master_text}",
             }
 
         # 第二步：编号后发给全体投票
         result = self._run_ballot(candidates, pool, stage_timeout)
         if result is None:
-            return {"ok": False, "consensus": False, "report": "错误：投票结果无法解析（工人未输出编号）。"}
+            return {
+                "ok": False,
+                "consensus": False,
+                "report": "错误：投票结果无法解析（工人未输出编号）。",
+            }
         best_idx, tally, total, best_n, invalid = result
         ratio = best_n / total
-        body = ["## 候选方案", *[f"[{i}] {w}：{ans[:96]}…" for i, (w, ans) in enumerate(candidates, 1)]]
+        body = [
+            "## 候选方案",
+            *[f"[{i}] {w}：{ans[:96]}…" for i, (w, ans) in enumerate(candidates, 1)],
+        ]
         body.append("## 投票结果")
         for i in range(1, len(candidates) + 1):
             body.append(f"方案[{i}]: {tally.get(i, 0)}/{total} 票")

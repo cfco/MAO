@@ -13,6 +13,7 @@
   安全扫描（命令黑名单、注入检测、内联代码防护等）已独立到 shell_safety.py，
   本文件只保留工具定义 + 文件路径安全 + 备份机制 + run_shell 执行骨架。
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -22,6 +23,7 @@ import time
 from pathlib import Path
 
 from ..config import ROOT, Config  # 统一从 config 拿 ROOT，避免多处重复定义漂移
+from ..core.redact import safe_error_text
 from .base import FunctionTool, ToolRegistry, ToolResult
 from .shell_safety import (  # shell 命令安全扫描，独立模块见 shell_safety.py
     _check_command_safety,
@@ -37,11 +39,11 @@ ROOT_RESOLVED = ROOT.resolve()  # 规范化后的根，用于越界比对
 _WORKSPACE_ROOTS: tuple[Path, ...] = (ROOT_RESOLVED,)
 
 DEFAULT_READ_LIMIT = 2000
-MAX_READ_BYTES = 64 * 1024    # read_file 单次最多读 64KB，防超长单行/超大文件
-MAX_WRITE_BYTES = 1024 * 1024 # write_file / append_file 单次最多写 1MB，防误操作占满磁盘
-BACKUP_DIR = ROOT / "data" / "backup"   # 覆盖写前的自动留档目录（可回滚）
-BACKUP_KEEP_DAYS = 30          # 留档保留天数，超期惰性清理
-MAX_BACKUP_BYTES = 1024 * 1024 # 超过该大小不做留档（避免大文件反复整份复制）
+MAX_READ_BYTES = 64 * 1024  # read_file 单次最多读 64KB，防超长单行/超大文件
+MAX_WRITE_BYTES = 1024 * 1024  # write_file / append_file 单次最多写 1MB，防误操作占满磁盘
+BACKUP_DIR = ROOT / "data" / "backup"  # 覆盖写前的自动留档目录（可回滚）
+BACKUP_KEEP_DAYS = 30  # 留档保留天数，超期惰性清理
+MAX_BACKUP_BYTES = 1024 * 1024  # 超过该大小不做留档（避免大文件反复整份复制）
 
 
 def _decode(b: bytes) -> str:
@@ -81,7 +83,7 @@ def set_workspace_roots(extra: list[str] | None = None) -> tuple[Path, ...]:
             # 盘符根（C:\）或文件系统根（/）：一旦成为允许的工作区，越界防护等于
             # 把整台机器交出去。anchor 判定跨平台稳妥（C:/ 的 anchor 是 C:\、
             # / 的 anchor 是 / 自身），p==p.parent 作兜底。
-            print(f'[workspace] 拒绝把根目录设为工作区（会交出整机）: {p}', file=sys.stderr)
+            print(f"[workspace] 拒绝把根目录设为工作区（会交出整机）: {p}", file=sys.stderr)
             continue
         if p not in roots:
             roots.append(p)
@@ -176,7 +178,7 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     - 文件/目录路径安全（_resolve：限制在 _WORKSPACE_ROOTS 内）；
     - run_shell 前置安全检查（shell_safety._check_command_safety）。
     """
-    set_workspace_roots(cfg.workspace)   # 允许访问的根：MAO 项目根 + tools.workspace
+    set_workspace_roots(cfg.workspace)  # 允许访问的根：MAO 项目根 + tools.workspace
     registry = ToolRegistry()
     timeout = cfg.shell_timeout
 
@@ -194,10 +196,13 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         if danger:
             return ToolResult(
                 f"错误：{danger}（run_shell 已内置安全防护；如确需执行，可在项目根目录用终端手动运行）",
-                ok=False)
+                ok=False,
+            )
         # cwd 必须在项目根内且确实存在；`..`/绝对路径越界直接拒绝并给提示
         cwd_raw = str(args.get("cwd") or ".")
-        cwd = _resolve(cwd_raw) if cwd_raw not in (".", ROOT.as_posix(), str(ROOT)) else ROOT_RESOLVED
+        cwd = (
+            _resolve(cwd_raw) if cwd_raw not in (".", ROOT.as_posix(), str(ROOT)) else ROOT_RESOLVED
+        )
         if cwd is None:
             return ToolResult(f"错误：cwd 超出项目根目录，被拒绝：{cwd_raw}", ok=False)
         if not cwd.is_dir():
@@ -241,7 +246,7 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         except subprocess.TimeoutExpired:
             return ToolResult(f"错误：命令超过 {timeout} 秒未完成，已终止", ok=False)
         except OSError as e:  # noqa: BLE001 - 目录等系统级错误给友好提示
-            return ToolResult(f"错误：无法执行命令：{e}", ok=False)
+            return ToolResult(f"错误：无法执行命令：{safe_error_text(e)}", ok=False)
         parts = []
         if proc.stdout:
             parts.append(_decode(proc.stdout)[-8000:])
@@ -289,9 +294,15 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         p = _resolve(str(args.get("path", "")))
         if p is None:
             return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '')}", ok=False)
+        if p.is_dir():
+            # 不前置判断的话，IsADirectoryError 会逃到上层通用兜底，模型看到的是
+            # "工具执行出错：IsADirectoryError: [Errno 21]..." 而不是人话（read_file 已有同款）
+            return ToolResult(f"错误：{p} 是目录，write_file 只能写文件", ok=False)
         content = str(args.get("content", ""))
         if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
-            return ToolResult(f"错误：写入内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）", ok=False)
+            return ToolResult(
+                f"错误：写入内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）", ok=False
+            )
         backup = _backup_before_overwrite(p)  # 覆盖前留档，保证可回滚
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -303,9 +314,13 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         p = _resolve(str(args.get("path", "")))
         if p is None:
             return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '')}", ok=False)
+        if p.is_dir():
+            return ToolResult(f"错误：{p} 是目录，append_file 只能追加到文件", ok=False)
         content = str(args.get("content", ""))
         if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
-            return ToolResult(f"错误：追加内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）", ok=False)
+            return ToolResult(
+                f"错误：追加内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）", ok=False
+            )
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(content)
@@ -327,81 +342,91 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
             return ToolResult(f"错误：无权限访问 {p}", ok=False)
         return "\n".join(entries) if entries else "（空目录）"
 
-    registry.register(FunctionTool(
-        name="run_shell",
-        description=(
-            "在本机执行 shell 命令（Windows cmd 语法，如 dir、type、python、pip）。"
-            "适合系统操作、批量文件处理、调用本机程序。返回 stdout/stderr 与退出码。"
-            "注意：内置危险命令拦截（rm/del/format 等，且 python -c / node -e 这类内联代码"
-            "正文也会扫描破坏性调用），但这是命令卫生黑名单、**不是沙箱**；确需的不可逆操作"
-            "请引导用户用终端手动执行。工作目录限制在允许的工作区内（默认项目根，"
-            "可用 config 的 tools.workspace 扩展）。"
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "要执行的命令"},
-                "cwd": {"type": "string", "description": "工作目录，默认项目根目录"},
-            },
-            "required": ["command"],
-        },
-        func=run_shell,
-    ))
-    registry.register(FunctionTool(
-        name="read_file",
-        description="读取文本文件内容，默认最多 2000 行，超出会截断并提示。",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "文件路径（相对路径基于项目根；也可访问 tools.workspace 配置的外部目录）",
+    registry.register(
+        FunctionTool(
+            name="run_shell",
+            description=(
+                "在本机执行 shell 命令（Windows cmd 语法，如 dir、type、python、pip）。"
+                "适合系统操作、批量文件处理、调用本机程序。返回 stdout/stderr 与退出码。"
+                "注意：内置危险命令拦截（rm/del/format 等，且 python -c / node -e 这类内联代码"
+                "正文也会扫描破坏性调用），但这是命令卫生黑名单、**不是沙箱**；确需的不可逆操作"
+                "请引导用户用终端手动执行。工作目录限制在允许的工作区内（默认项目根，"
+                "可用 config 的 tools.workspace 扩展）。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "要执行的命令"},
+                    "cwd": {"type": "string", "description": "工作目录，默认项目根目录"},
                 },
-                "limit": {"type": "integer", "description": "最多读取行数，默认 2000"},
+                "required": ["command"],
             },
-            "required": ["path"],
-        },
-        func=read_file,
-    ))
-    registry.register(FunctionTool(
-        name="write_file",
-        description=(
-            "写入文本文件（覆盖），父目录不存在会自动创建。"
-            "目标文件已存在时，写入前会自动留档到 data/backup/（返回文本里给出留档路径，可回滚）。"
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "目标文件路径"},
-                "content": {"type": "string", "description": "要写入的完整内容"},
+            func=run_shell,
+        )
+    )
+    registry.register(
+        FunctionTool(
+            name="read_file",
+            description="读取文本文件内容，默认最多 2000 行，超出会截断并提示。",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径（相对路径基于项目根；也可访问 tools.workspace 配置的外部目录）",
+                    },
+                    "limit": {"type": "integer", "description": "最多读取行数，默认 2000"},
+                },
+                "required": ["path"],
             },
-            "required": ["path", "content"],
-        },
-        func=write_file,
-    ))
-    registry.register(FunctionTool(
-        name="append_file",
-        description="向文本文件末尾追加内容。",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "目标文件路径"},
-                "content": {"type": "string", "description": "要追加的内容"},
+            func=read_file,
+        )
+    )
+    registry.register(
+        FunctionTool(
+            name="write_file",
+            description=(
+                "写入文本文件（覆盖），父目录不存在会自动创建。"
+                "目标文件已存在时，写入前会自动留档到 data/backup/（返回文本里给出留档路径，可回滚）。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目标文件路径"},
+                    "content": {"type": "string", "description": "要写入的完整内容"},
+                },
+                "required": ["path", "content"],
             },
-            "required": ["path", "content"],
-        },
-        func=append_file,
-    ))
-    registry.register(FunctionTool(
-        name="list_dir",
-        description="列出目录内容，标记文件/文件夹及文件大小。",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "目录路径，默认项目根目录"},
+            func=write_file,
+        )
+    )
+    registry.register(
+        FunctionTool(
+            name="append_file",
+            description="向文本文件末尾追加内容。",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目标文件路径"},
+                    "content": {"type": "string", "description": "要追加的内容"},
+                },
+                "required": ["path", "content"],
             },
-            "required": [],
-        },
-        func=list_dir,
-    ))
+            func=append_file,
+        )
+    )
+    registry.register(
+        FunctionTool(
+            name="list_dir",
+            description="列出目录内容，标记文件/文件夹及文件大小。",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目录路径，默认项目根目录"},
+                },
+                "required": [],
+            },
+            func=list_dir,
+        )
+    )
     return registry

@@ -12,6 +12,7 @@
 这些用例都是"针对缺陷的断言"（去掉修复即失败），不是恒真用例：
 例如 test_hit_cache_still_usable_when_cooling 在恢复预过滤后会立刻挂在 collect 上。
 """
+
 from __future__ import annotations
 
 import json
@@ -28,14 +29,19 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _pool(models: str, cap: int = 3, max_workers: int = 3) -> WorkerPool:
-    cfg = Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": models}],
-        "collaboration": {"max_participants": cap, "max_workers": max_workers},
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": models}],
+                "collaboration": {"max_participants": cap, "max_workers": max_workers},
+            }
+        )
+    )
     return WorkerPool(cfg, exclude=None)
 
 
 # ---------------- 1) 健康档案共享（lost update） ----------------
+
 
 def test_get_health_returns_same_instance_per_path(tmp_path):
     store = tmp_path / "h.json"
@@ -80,6 +86,7 @@ def test_direct_construction_stays_independent(tmp_path):
 
 # ---------------- 2) 派工规模与限时 ----------------
 
+
 def test_pick_caps_participants_and_keeps_order():
     pool = _pool("m1,m2,m3,m4,m5,m6,m7,m8", cap=3)
     assert pool.pick() == ["st:m1", "st:m2", "st:m3"], "确定性顺序 + 受上限约束"
@@ -87,7 +94,7 @@ def test_pick_caps_participants_and_keeps_order():
 
 def test_pick_skips_unavailable_and_zero_means_unlimited():
     pool = _pool("m1,m2,m3", cap=2)
-    pool._cooldowns["st:m2"] = time.time() + 999
+    pool._cooldowns["st:m2"] = time.monotonic() + 999
     assert pool.pick() == ["st:m1", "st:m3"], "冷却中的工人不占名额"
     assert _pool("m1,m2,m3", cap=0).pick() == ["st:m1", "st:m2", "st:m3"], "0 = 不限"
 
@@ -107,13 +114,29 @@ def test_pick_rotates_across_calls():
 
 def test_pick_filters_by_tags():
     """#6：可选 tags 只保留能力标签全部命中的工人，供外部主按任务类型选路。"""
-    cfg = Config(_interpolate({
-        "agents": [
-            {"name": "coder", "base_url": "u", "api_key": "k", "model": "m", "tags": "code,中文"},
-            {"name": "reader", "base_url": "u", "api_key": "k", "model": "m", "tags": "长上下文"},
-        ],
-        "collaboration": {"max_participants": 0},
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {
+                        "name": "coder",
+                        "base_url": "u",
+                        "api_key": "k",
+                        "model": "m",
+                        "tags": "code,中文",
+                    },
+                    {
+                        "name": "reader",
+                        "base_url": "u",
+                        "api_key": "k",
+                        "model": "m",
+                        "tags": "长上下文",
+                    },
+                ],
+                "collaboration": {"max_participants": 0},
+            }
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     assert pool.pick(tags="code") == ["coder"]
     assert pool.pick(tags="长上下文") == ["reader"]
@@ -137,8 +160,13 @@ def test_default_fanout_is_bounded(monkeypatch):
 
     def spy(worker, prompt, system=None, memo=None):
         calls.append(worker)
-        return {"worker": worker, "ok": True, "status": "ok",
-                "answer": f"答案[{worker}]", "error": ""}
+        return {
+            "worker": worker,
+            "ok": True,
+            "status": "ok",
+            "answer": f"答案[{worker}]",
+            "error": "",
+        }
 
     monkeypatch.setattr(pool, "ask_result", spy)
 
@@ -166,8 +194,13 @@ def test_explicit_workers_are_not_capped(monkeypatch):
 
     def spy(worker, prompt, system=None, memo=None):
         calls.append(worker)
-        return {"worker": worker, "ok": True, "status": "ok",
-                "answer": f"答案[{worker}]", "error": ""}
+        return {
+            "worker": worker,
+            "ok": True,
+            "status": "ok",
+            "answer": f"答案[{worker}]",
+            "error": "",
+        }
 
     monkeypatch.setattr(pool, "ask_result", spy)
     out = pool.ask_many(["st:m4", "st:m5", "st:m6"], "q")
@@ -181,13 +214,16 @@ def test_explicit_workers_are_not_capped(monkeypatch):
 
 # ---------------- 3) MCP 连接共享 ----------------
 
+
 def test_mcp_group_shared_and_refcounted():
-    servers = [{
-        "name": "probe",
-        "transport": "stdio",
-        "command": "definitely-not-exist-xyz",
-        "args": [],
-    }]
+    servers = [
+        {
+            "name": "probe",
+            "transport": "stdio",
+            "command": "definitely-not-exist-xyz",
+            "args": [],
+        }
+    ]
     key = mcp_client._group_key(servers)
     g1 = mcp_client.acquire_group(servers)
     try:
@@ -206,15 +242,17 @@ def test_mcp_group_shared_and_refcounted():
 
 # ---------------- 4) 缓存命中优先于冷却（批量路径） ----------------
 
+
 def test_no_cache_still_reports_skip_in_many():
     pool = _pool("m1,m2", cap=2)
     worker = pool.names()[0]
-    pool._cooldowns[worker] = time.time() + 999
+    pool._cooldowns[worker] = time.monotonic() + 999
     out = pool.ask_many([worker], "没缓存的问题")
     assert "本轮跳过" in out and worker in out
 
 
 # ---------------- 6) 计票不采信错误文本 ----------------
+
 
 def test_ballot_ignores_error_text(monkeypatch):
     """派工失败的投票人不得贡献选票（#4：计票按结构化 status 判定，绝不解析文本前缀）。
@@ -230,8 +268,13 @@ def test_ballot_ignores_error_text(monkeypatch):
     def fake(worker, prompt, system=None, memo=None):
         if worker == a:
             return {"worker": a, "ok": True, "status": "ok", "answer": "1", "error": ""}
-        return {"worker": worker, "ok": False, "status": "error",
-                "answer": "错误：节点挂了，改投 2 号", "error": "boom"}
+        return {
+            "worker": worker,
+            "ok": False,
+            "status": "error",
+            "answer": "错误：节点挂了，改投 2 号",
+            "error": "boom",
+        }
 
     monkeypatch.setattr(pool, "ask_result", fake)
     picked = pool.select_best(

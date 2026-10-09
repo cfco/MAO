@@ -6,6 +6,7 @@
 - 工具调用通过 run_coroutine_threadsafe 提交到对应事件循环，包装成同步 Tool。
 - 工具名统一加 mcp__<server>__ 前缀，避免与内置/Skill 工具冲突。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -18,10 +19,12 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from ..core.redact import safe_error_text
 from .base import Tool, ToolRegistry, ToolResult
 
 try:
     from mcp.client.streamable_http import streamablehttp_client
+
     _HAS_HTTP = True
 except ImportError:  # 兼容旧版 mcp 包
     _HAS_HTTP = False
@@ -29,9 +32,9 @@ except ImportError:  # 兼容旧版 mcp 包
 HTTP_TRANSPORTS = {"http", "streamable_http", "streamable-http", "streamablehttp"}
 
 # 重连退避参数
-_RECONNECT_BASE = 1.0      # 首次重连等待 1s
-_RECONNECT_MAX = 30.0      # 封顶 30s
-_RECONNECT_JITTER = 0.5    # 每次加 0~0.5s 随机抖动，避免多连接同时重连雪崩
+_RECONNECT_BASE = 1.0  # 首次重连等待 1s
+_RECONNECT_MAX = 30.0  # 封顶 30s
+_RECONNECT_JITTER = 0.5  # 每次加 0~0.5s 随机抖动，避免多连接同时重连雪崩
 
 
 def _safe_name(s: str) -> str:
@@ -52,7 +55,9 @@ class McpTool(Tool):
     被注册表兜底吞掉后所有 mcp__* 工具永远"工具执行出错"（审计 P0）。
     """
 
-    def __init__(self, name: str, description: str, input_schema: dict, conn: McpConnection, remote_name: str):
+    def __init__(
+        self, name: str, description: str, input_schema: dict, conn: McpConnection, remote_name: str
+    ):
         self.name = name
         self.description = description
         self.input_schema = input_schema
@@ -90,9 +95,9 @@ class McpConnection:
         self.error: str | None = None
         self._thread: threading.Thread | None = None
         # 重连状态
-        self._stop = threading.Event()      # stop() 时置位，跳出重连循环
+        self._stop = threading.Event()  # stop() 时置位，跳出重连循环
         self._reconnect_count: int = 0
-        self._lock = threading.Lock()        # 保护 reconnect_count 和 session/error 的并发读写
+        self._lock = threading.Lock()  # 保护 reconnect_count 和 session/error 的并发读写
         # host 等待事件：仅在 _connect_and_host（loop 线程）内创建/清空，
         # 其它线程通过 _wake_host()（call_soon_threadsafe 投递）唤醒它。
         self._host_evt: asyncio.Event | None = None
@@ -101,7 +106,9 @@ class McpConnection:
 
     def start(self) -> None:
         ready = threading.Event()
-        self._thread = threading.Thread(target=self._run_connect_forever, args=(ready,), name=f"mcp-{self.name}", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run_connect_forever, args=(ready,), name=f"mcp-{self.name}", daemon=True
+        )
         self._thread.start()
         if not ready.wait(timeout=90):
             self.error = self.error or "连接超时（90s）"
@@ -127,7 +134,7 @@ class McpConnection:
                 self._reconnect_count += 1
                 self._backoff_wait()
         except Exception as e:  # noqa: BLE001 - 线程内兜底
-            self.error = self.error or f"{type(e).__name__}: {e}"
+            self.error = self.error or f"{type(e).__name__}: {safe_error_text(e)}"
             ready.set()
         finally:
             # 线程收尾：关闭事件循环（否则每次 stop/线程退出泄漏一个 loop 及其句柄）。
@@ -223,7 +230,7 @@ class McpConnection:
             self._session_cm = None
             self._transport_cm = None
             with self._lock:
-                self.error = f"{type(e).__name__}: {e}"
+                self.error = f"{type(e).__name__}: {safe_error_text(e)}"
             return False
 
     async def _shutdown_once(self) -> None:
@@ -281,11 +288,10 @@ class McpConnection:
                 rc = self._reconnect_count
             hint = f"（已连续重连 {rc} 次，后台自动重试中）" if rc > 0 else ""
             return ToolResult(
-                f"错误：MCP server '{self.name}' 未连接：{self.error}{hint}", ok=False)
-        try:
-            fut = asyncio.run_coroutine_threadsafe(
-                session.call_tool(remote_name, args or {}), loop
+                f"错误：MCP server '{self.name}' 未连接：{self.error}{hint}", ok=False
             )
+        try:
+            fut = asyncio.run_coroutine_threadsafe(session.call_tool(remote_name, args or {}), loop)
             result = fut.result(timeout=300)
         except Exception as e:  # noqa: BLE001
             # 调用时异常（session 断了）：作废当前 session 并唤醒 host，
@@ -299,7 +305,9 @@ class McpConnection:
                         loop.call_soon_threadsafe(self._wake_host)
                     except Exception:  # noqa: BLE001 - loop 恰好已退出等边缘情况
                         pass
-            return ToolResult(f"MCP 工具调用失败：{type(e).__name__}: {e}", ok=False)
+            return ToolResult(
+                f"MCP 工具调用失败：{type(e).__name__}: {safe_error_text(e)}", ok=False
+            )
         texts: list[str] = []
         for block in getattr(result, "content", []) or []:
             text = getattr(block, "text", None)
@@ -309,13 +317,14 @@ class McpConnection:
                 texts.append("（返回了一张图片，本工具暂以文本为主，图片已忽略）")
         joined = "\n".join(texts)
         if getattr(result, "isError", False):
-            return ToolResult(
-                "MCP 工具返回错误：" + (joined or "(无错误详情)"), ok=False)
+            return ToolResult("MCP 工具返回错误：" + (joined or "(无错误详情)"), ok=False)
         return joined or "(空结果)"
 
 
 def connect_and_register(
-    server_cfgs: list[dict], registry: ToolRegistry, out_conns: list | None = None,
+    server_cfgs: list[dict],
+    registry: ToolRegistry,
+    out_conns: list | None = None,
     out_tools: list | None = None,
 ) -> list[str]:
     """连接全部配置的 MCP server 并注册其工具。返回状态日志行。
@@ -336,7 +345,7 @@ def connect_and_register(
         try:
             tools = conn.list_tools()
         except Exception as e:  # noqa: BLE001
-            status.append(f"[MCP] {name}: 工具发现失败 - {e}")
+            status.append(f"[MCP] {name}: 工具发现失败 - {safe_error_text(e)}")
             continue
         prefix = _safe_name(name)
         for t in tools:

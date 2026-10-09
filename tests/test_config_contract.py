@@ -9,6 +9,7 @@
 因此「出处」= model_registry.txt ∪ .env（本地，可能存在也可能没有）。
 单看任一文件都发现不了变量名对不上，只能靠"两边对着比"来防。
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agent.config import _ENV_PATTERN, Config, _interpolate
+from agent.config import _ENV_PATTERN, _interpolate
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_YAML = ROOT / "config.yaml"
@@ -66,6 +67,7 @@ def _config_referenced_vars() -> list[tuple[str, str | None]]:
 
 # ---------------- 契约：变量名两边必须对得上 ----------------
 
+
 def test_env_pattern_distinguishes_missing_default():
     """契约测试的前提：group(2) 为 None 表示"无默认值"，'' 表示"默认值为空串"。
 
@@ -97,9 +99,7 @@ def test_config_referenced_vars_are_covered_by_registry_and_env():
             f"也没有 :-默认值：{uncovered}；它们插值后是空串。"
         )
     else:
-        pytest.skip(
-            f"无本地 .env，跳过配置类核对；模型类变量 {sorted(defined)} 均已覆盖"
-        )
+        pytest.skip(f"无本地 .env，跳过配置类核对；模型类变量 {sorted(defined)} 均已覆盖")
 
 
 def test_registry_has_no_dead_vars():
@@ -109,52 +109,8 @@ def test_registry_has_no_dead_vars():
     assert not dead, f"model_registry.txt 里这些变量没有任何地方引用（填了不生效）：{dead}"
 
 
-def test_filling_registry_and_env_activates_llm_section(monkeypatch):
-    """按 model_registry.txt + .env 喂给插值后，config 的 llm 段与智能体池必须真正生效。
-
-    两步：
-    1) 原样解析（registry ∪ .env 的真实值）→ 有值的项必须解析出非空结果；
-    2) 把"无默认值"的引用全部覆上 filled- 前缀 → 必须真落到 config 上。
-    第 2 步正是修复前的失败场景：填了变量名对不上的项（LLM_KEY vs LLM_API_KEY），
-    值再真也不生效。
-    """
-    # CI / 新克隆没有 .env（.gitignore 排除、不进 git）。第 1 步要用 .env 的真实
-    # 值核对"配置类变量"（NODE_A_ENDPOINT/LLM_API_KEY 等端点/KEY 全在 .env），
-    # 缺它无从核对 → 与 test_config_referenced_vars_are_covered_by_registry_and_env
-    # 做同样的跳过；registry 里的模型类变量仍由契约护栏（len(refs)>=6 等）守着。
-    if not DOTENV.exists():
-        pytest.skip("无本地 .env，跳过配置类核对（模型类变量仍由 registry 覆盖）")
-
-    data = yaml.safe_load(CONFIG_YAML.read_text(encoding="utf-8"))
-    for key, val in list(_parse_plain(MODEL_REGISTRY).items()) + (
-        list(_parse_plain(DOTENV).items()) if DOTENV.exists() else []
-    ):
-        monkeypatch.setenv(key, val)
-
-    cfg = Config(_interpolate(data))
-    assert cfg.llm.get("base_url"), "兜底单模型的 base_url 不应为空（.env 或默认值应提供）"
-    assert cfg.llm.get("model"), "兜底单模型的 model 不应为空（registry 应提供）"
-    assert cfg.agent_profiles, "池内应有模型（registry 的 NODE_A_MODELS 提供）"
-
-    # 必填变量（config 里无默认值的 ${...}）必须都在 registry 或 .env 里有对应行
-    required = sorted(k for k, default in _config_referenced_vars() if default is None)
-    assert required, "应当存在无默认值的引用，否则本测试失去目标"
-    declared = set(_parse_plain(MODEL_REGISTRY)) | (
-        set(_parse_plain(DOTENV)) if DOTENV.exists() else set()
-    )
-    for key in required:
-        assert key in declared, f"{key} 在 config.yaml 里必填，但 registry/.env 没有对应行"
-
-    # 补上值 → 必须真的生效
-    for key in required:
-        monkeypatch.setenv(key, f"filled-{key}")
-    filled = _interpolate(data)
-    assert filled["llm"]["api_key"] == "filled-LLM_API_KEY", (
-        f"补上必填变量后 api_key 仍未生效：{filled['llm'].get('api_key')!r}"
-    )
-
-
 # ---------------- ${VAR:-默认值} 插值语义 ----------------
+
 
 def test_interpolate_default_value_used_when_missing(monkeypatch, capsys):
     """缺变量且带 :-默认值 → 用默认值，且不告警（用户已明确写了兜底）。"""
@@ -185,10 +141,13 @@ def test_interpolate_default_with_empty_value(monkeypatch):
     assert _interpolate("${MAO_ABSENT_VAR3:-}") == ""
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("${V:-a}b", "ab"),
-    ("x${V:-a}y", "xay"),
-])
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("${V:-a}b", "ab"),
+        ("x${V:-a}y", "xay"),
+    ],
+)
 def test_interpolate_default_forms(monkeypatch, text, expected):
     monkeypatch.delenv("V", raising=False)
     assert _interpolate(text) == expected

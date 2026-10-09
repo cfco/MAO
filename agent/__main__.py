@@ -11,6 +11,7 @@ MCP / Skill）与「子 AI」（池内免费模型，经 ask / ask_many / ask_vo
 本项目不再自带「选主自己跑」的入口：chat / run / pipeline / web 已移除——
 主智能体统一由外部 AI 担任，MAO 只做被调用的执行器与工人池。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -20,6 +21,7 @@ import sys
 from .bridge import reconfigure_streams
 from .bridge import serve as bridge_serve
 from .config import load_config
+from .core.redact import safe_error_text
 
 
 def main() -> None:
@@ -29,14 +31,23 @@ def main() -> None:
     sub = parser.add_subparsers(dest="mode", required=True)
 
     sub.add_parser("bridge", help="外部智能体驱动模式（stdin/stdout JSON 行长驻进程）")
-    sub.add_parser("mcp", help="以标准 MCP server（stdio）接入宿主：Claude Desktop / Cursor / Qoder 等")
+    sub.add_parser(
+        "mcp", help="以标准 MCP server（stdio）接入宿主：Claude Desktop / Cursor / Qoder 等"
+    )
 
     p_call = sub.add_parser("call", help="单发一条指令即退出（脚本接入用）")
-    p_call.add_argument("cmd", help="指令名：ping/list_agents/health/latency/set_economy/"
-                                     "list_tools/call_tool/load_skill/run_skill_script/"
-                                     "ask/ask_many/ask_vote/run_review")
-    p_call.add_argument("payload", nargs="?", default="",
-                        help='JSON 参数（省略则从 stdin 读一行），如 \'{"prompt":"...","agent":"x"}\'')
+    p_call.add_argument(
+        "cmd",
+        help="指令名：ping/list_agents/health/latency/set_economy/"
+        "list_tools/call_tool/load_skill/run_skill_script/"
+        "ask/ask_many/ask_vote/run_review",
+    )
+    p_call.add_argument(
+        "payload",
+        nargs="?",
+        default="",
+        help='JSON 参数（省略则从 stdin 读一行），如 \'{"prompt":"...","agent":"x"}\'',
+    )
     args = parser.parse_args()
 
     # 契约：stdout 只放 JSON 行（含中文）。Windows 重定向流默认 GBK，
@@ -50,6 +61,7 @@ def main() -> None:
 
     if args.mode == "mcp":
         from .mcp_server import serve as mcp_serve
+
         mcp_serve(load_config())
         return
 
@@ -60,11 +72,18 @@ def main() -> None:
         if not isinstance(payload, dict):
             raise ValueError("参数必须是 JSON 对象")
     except (json.JSONDecodeError, ValueError) as e:
-        print(json.dumps({"ok": False, "error": f"参数 JSON 解析失败: {e}"}, ensure_ascii=False))
+        # 这一行同样进 stdout 的 JSON 协议：与 bridge 一个口径，先过脱敏
+        print(
+            json.dumps(
+                {"ok": False, "error": f"参数 JSON 解析失败: {safe_error_text(e)}"},
+                ensure_ascii=False,
+            )
+        )
         sys.exit(2)
     payload["cmd"] = args.cmd
 
     from .bridge import Bridge
+
     bridge = Bridge(load_config())
     try:
         resp = bridge.handle(payload)

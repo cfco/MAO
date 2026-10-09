@@ -1,10 +1,13 @@
 """工具基类与注册表：内置工具、MCP 工具、Skill 工具统一适配到同一接口。"""
+
 from __future__ import annotations
 
 import inspect
 import json
 from collections.abc import Callable
 from typing import Any
+
+from ..core.redact import safe_error_text
 
 
 class Tool:
@@ -63,8 +66,7 @@ def _accepts_ctx(func: Callable[..., Any]) -> bool:
     except (TypeError, ValueError):
         return False
     positional = [
-        p for p in sig.parameters.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        p for p in sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
     ]
     has_varargs = any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values())
     return has_varargs or len(positional) >= 2
@@ -89,10 +91,7 @@ class ToolRegistry:
 
     def info_list(self) -> list[dict]:
         """列出全部工具的 (name, description)，供对外展示（bridge list_tools 等）。"""
-        return [
-            {"name": t.name, "description": t.description}
-            for t in self._tools.values()
-        ]
+        return [{"name": t.name, "description": t.description} for t in self._tools.values()]
 
     def run(self, name: str, arguments: str | dict, ctx: Any | None = None) -> dict:
         """执行一次工具调用，返回结构化 {ok, result, error}（#3：让 ok 反映真实成败）。
@@ -118,7 +117,9 @@ class ToolRegistry:
         try:
             out = tool.execute(args, ctx)
         except Exception as e:  # noqa: BLE001 - 工具错误必须转成文本回给模型
-            msg = f"工具执行出错：{type(e).__name__}: {e}"
+            # 这段文本会原样回给模型（并可能再被转发给外部主/第三方上下文），
+            # 而底层异常常回显 URL/参数——先脱敏再截断（见 core/redact.py）
+            msg = f"工具执行出错：{type(e).__name__}: {safe_error_text(e)}"
             return {"ok": False, "result": msg, "error": msg}
         ok = bool(getattr(out, "ok", True))  # 裸 str → True；ToolResult → 自带标志
         text = str(out)

@@ -14,6 +14,7 @@
   不得被误拦，& 串接的危险命令仍须拦下）、-EncodedCommand 缩写、空 choices 归类为
   可重试错误、skill 脚本名的路径穿越、在飞接管不得清掉新发起者的 inflight
 """
+
 from __future__ import annotations
 
 import threading
@@ -33,13 +34,13 @@ from agent.core.llm import (
     ERR_RATE_LIMIT,
     LLMClient,
     LLMError,
-    _retryable_from_type,
 )
 from agent.core.orchestrator import WorkerPool
 from agent.core.parallelism import StationMemo
 from agent.tools.base import FunctionTool, ToolRegistry
 
 # ---------------- 工具注册表 ----------------
+
 
 def test_registry_duplicate_raises():
     reg = ToolRegistry()
@@ -61,6 +62,7 @@ def test_registry_execute_unknown_and_bad_json():
 
 
 # ---------------- 配置解析 ----------------
+
 
 def test_interpolate_env(monkeypatch):
     monkeypatch.setenv("MAO_TEST_TOKEN", "SECRET")
@@ -89,7 +91,9 @@ def test_config_multimodel_expansion_and_lookup():
     m1 = cfg.profile("st:m1")
     assert m1 is not None and m1.model == "m1" and m1.context_length == 0
     # 单模型保留站名
-    cfg2 = Config(_interpolate({"agents": [{"name": "solo", "base_url": "u", "api_key": "k", "model": "m"}]}))
+    cfg2 = Config(
+        _interpolate({"agents": [{"name": "solo", "base_url": "u", "api_key": "k", "model": "m"}]})
+    )
     assert cfg2.agent_profiles[0].name == "solo"
     # profile 查找
     assert cfg.profile("st:m1") is not None
@@ -99,6 +103,7 @@ def test_config_multimodel_expansion_and_lookup():
 
 
 # ---------------- LLMClient 重试 / 退避 ----------------
+
 
 def _fake_response(content: str):
     msg = SimpleNamespace(content=content)
@@ -168,12 +173,8 @@ def test_llm_auth_not_retried(monkeypatch):
     assert state["n"] == 1  # 认证失败立即判失败，不重试
 
 
-def test_retryable_from_type():
-    assert _retryable_from_type(ERR_RATE_LIMIT) is True
-    assert _retryable_from_type(ERR_AUTH) is False
-
-
 # ---------------- WorkerPool 编排逻辑 ----------------
+
 
 def test_worker_pool_cooldown_logic():
     cfg = Config(_interpolate({"agents": []}))
@@ -213,8 +214,13 @@ def test_vote_empty_pool():
 
 # ---------------- ask 并发去抖（同 key 只打一次网络） ----------------
 
+
 def test_ask_distinct_keys_each_call():
-    cfg = Config(_interpolate({"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}))
+    cfg = Config(
+        _interpolate(
+            {"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     assert pool.names(), "虚拟工人应已进入池中"
     worker = pool.names()[0]
@@ -255,10 +261,17 @@ def test_diagnostics_go_to_stderr_not_stdout(capsys):
 
 # ---------------- 修正回归：shell=False 引号剥离 / read_file 截断 ----------------
 
+
 def _two_worker_pool() -> WorkerPool:
-    cfg = Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "http://x", "api_key": "k", "models": ["m1", "m2"]}],
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "st", "base_url": "http://x", "api_key": "k", "models": ["m1", "m2"]}
+                ],
+            }
+        )
+    )
     return WorkerPool(cfg, exclude=None)
 
 
@@ -307,6 +320,7 @@ def test_read_file_truncates_large_file(tmp_path, monkeypatch):
 
 # ---------------- 并行派工确定性 / 整体限时 / 择优（本轮回归） ----------------
 
+
 def test_collect_and_vote_candidate_order_follows_input():
     """候选编号确定性：collect/vote 的候选顺序必须跟随入参工人顺序，
     不随线程完成先后漂移（第二次调用命中缓存、仅入参顺序不同，最能暴露乱序）。"""
@@ -322,7 +336,7 @@ def test_collect_and_vote_candidate_order_follows_input():
 
     orig = _install_fake_llm(FakeClient)
     try:
-        out_ab = pool.vote("题目")["report"]            # 默认池顺序 w1, w2
+        out_ab = pool.vote("题目")["report"]  # 默认池顺序 w1, w2
         out_ba = pool.vote("题目", workers=[w2, w1])["report"]  # 同题反序（阶段1命中缓存）
         got_ba = pool.collect([w2, w1], "另一题")
     finally:
@@ -341,7 +355,11 @@ def test_collect_and_vote_candidate_order_follows_input():
 def test_ask_many_timeout_bounds_total_wait():
     """ask_many 的 timeout 应约束收集阶段总时长：工人挂住时按超时放弃等待
     （原实现 executor 退出 join 全部线程，timeout 实际不约束总时长）。"""
-    cfg = Config(_interpolate({"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}))
+    cfg = Config(
+        _interpolate(
+            {"agents": [{"name": "dummy", "base_url": "http://x", "api_key": "k", "model": "m"}]}
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     worker = pool.names()[0]
     release = threading.Event()
@@ -388,6 +406,7 @@ def test_select_best_picks_voted_winner():
 
 # ---------------- 命令黑名单：按「命令首词」匹配（本轮修正） ----------------
 
+
 def test_cmd_blacklist_allows_same_word_in_argument_position():
     """format/clean/del 等词出现在参数位时不得拦截。
 
@@ -415,8 +434,8 @@ def test_cmd_blacklist_blocks_dangerous_as_head_word():
 
     for cmd in [
         "format D:",
-        "cmd /c format D:",                    # 剥 cmd /c 包装后判定首词
-        "C:/Windows/System32/format.com D:",   # 去路径前缀 + .com 后缀
+        "cmd /c format D:",  # 剥 cmd /c 包装后判定首词
+        "C:/Windows/System32/format.com D:",  # 去路径前缀 + .com 后缀
         "del.exe /s x",
         "del /f /q /s C:/tmp",
         "rd /s /q C:/x",
@@ -452,9 +471,7 @@ def test_cmd_blacklist_encoded_command_abbrev():
         msg = _check_command_safety(f"{ps}-NoProfile {flag} ZgBvAHIAbQBhAHQ=")
         assert msg and "EncodedCommand" in msg, f"{flag} 应判为编码命令，实际：{msg}"
     # 精确排除：命中原因是正文里的 format，不是编码命令
-    msg2 = _check_command_safety(
-        f'{ps}-NoProfile -ExecutionPolicy Bypass -Command "format D:"'
-    )
+    msg2 = _check_command_safety(f'{ps}-NoProfile -ExecutionPolicy Bypass -Command "format D:"')
     assert msg2 and "EncodedCommand" not in msg2, f"不应误判为编码命令：{msg2}"
     # 正文安全则放行
     assert _check_command_safety(f'{ps}-NoProfile -Command "Get-Date"') is None
@@ -465,11 +482,11 @@ def test_interpreter_inline_code_guard_blocks_bypass():
     from agent.tools.builtin import _check_command_safety
 
     for cmd in [
-        'python -c "import os; os.system(\'del /q x\')"',
-        'python -c "import shutil; shutil.rmtree(\'C:/proj\')"',
-        'python -c "import os; os.remove(\'C:/secret\')"',
-        'node -e "require(\'child_process\').execSync(\'rm -rf /\')"',
-        'python -c "print(\'删\'); __import__(\'os\').system(\'format C:\')"',
+        "python -c \"import os; os.system('del /q x')\"",
+        "python -c \"import shutil; shutil.rmtree('C:/proj')\"",
+        "python -c \"import os; os.remove('C:/secret')\"",
+        "node -e \"require('child_process').execSync('rm -rf /')\"",
+        "python -c \"print('删'); __import__('os').system('format C:')\"",
     ]:
         assert _check_command_safety(cmd), f"应拦截却放行了内联破坏：{cmd}"
 
@@ -480,16 +497,51 @@ def test_interpreter_inline_code_guard_keeps_legit():
 
     for cmd in [
         'python -c "print(1)"',
-        'python -c "import json; print(json.dumps({\'a\': 1}))"',
-        'python -c "import subprocess; subprocess.run([\'git\', \'status\'])"',
-        'node -e "console.log(\'hi\')"',
-        'python -m black --format json x.py',  # 解释器但无内联代码开关
-        'python -V',
+        "python -c \"import json; print(json.dumps({'a': 1}))\"",
+        "python -c \"import subprocess; subprocess.run(['git', 'status'])\"",
+        "node -e \"console.log('hi')\"",
+        "python -m black --format json x.py",  # 解释器但无内联代码开关
+        "python -V",
+    ]:
+        assert _check_command_safety(cmd) is None, f"应放行却被误拦：{cmd}"
+
+
+def test_posix_shell_inline_guard_blocks_bypass():
+    """POSIX shell 家族（sh/bash/zsh…）的 -c 正文要与 python -c 同等对待。
+
+    危险词表是 Windows 向的，`rm`/`dd`/`mkfs` 只在正文扫描里生效；sh/bash 不进
+    内联解释器集合时 `bash -c "rm -rf ~"` 三层防护一层都不触发（装了 Git-Bash 就能跑）。
+    """
+    from agent.tools.builtin import _check_command_safety
+
+    for cmd in [
+        'bash -c "rm -rf ~"',
+        'sh -c "rm -rf /tmp/x"',
+        'zsh -c "dd if=/dev/zero of=/dev/sda"',
+        'bash -lc "rm -rf ~"',  # 短选项簇 -lc 的正文位置与 -c 一致
+        'sh -c "echo x > /etc/passwd"',  # 重定向越界同样要在正文里查
+        'bash -c "del /s y"',  # POSIX shell 里嵌 Windows 危险词
+    ]:
+        assert _check_command_safety(cmd), f"应拦截却放行了内联破坏：{cmd}"
+
+
+def test_posix_shell_inline_guard_keeps_legit():
+    """反向：shell 家族的正常内联脚本、以及 --norc 这类双横线开关不得误伤。"""
+    from agent.tools.builtin import _check_command_safety
+
+    for cmd in [
+        'bash -c "npm test"',
+        'sh -c "git status"',
+        'bash -c "make clean && echo ok"',
+        'sh -c "echo a | wc -l"',
+        "bash --norc script.sh",  # --norc 不是内联代码开关
+        "bash script.sh",  # 无内联代码正文，静态扫不到，放行
     ]:
         assert _check_command_safety(cmd) is None, f"应放行却被误拦：{cmd}"
 
 
 # ---------------- 空 choices 归类为可重试错误（本轮修正） ----------------
+
 
 def test_llm_empty_choices_classified_retryable():
     """空 choices 必须转成可重试的 LLMError。
@@ -528,6 +580,7 @@ def test_llm_empty_choices_retried_then_succeeds(monkeypatch):
 
 # ---------------- skill 脚本名路径穿越（本轮修正） ----------------
 
+
 def test_skill_script_path_traversal_rejected(tmp_path):
     """run_skill_script 的 script 入参必须只是 scripts/ 下的裸 .py 文件名。"""
     from agent.skills_manager import SkillManager
@@ -535,15 +588,22 @@ def test_skill_script_path_traversal_rejected(tmp_path):
     skill_dir = tmp_path / "demo"
     (skill_dir / "scripts").mkdir(parents=True)
     (skill_dir / "scripts" / "ok.py").write_text("print('ok')", encoding="utf-8")
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: demo\ndescription: d\n---\n", encoding="utf-8"
-    )
+    (skill_dir / "SKILL.md").write_text("---\nname: demo\ndescription: d\n---\n", encoding="utf-8")
     mgr = SkillManager(skills_dir=tmp_path)
     mgr.scan()
     assert "demo" in mgr.skills
 
-    for bad in ["../../evil.py", "..\\..\\evil.py", "C:/evil.py", "/etc/passwd.py",
-                ".hidden.py", "sub/ok.py", "notpy.txt", "ok.py.bak", ""]:
+    for bad in [
+        "../../evil.py",
+        "..\\..\\evil.py",
+        "C:/evil.py",
+        "/etc/passwd.py",
+        ".hidden.py",
+        "sub/ok.py",
+        "notpy.txt",
+        "ok.py.bak",
+        "",
+    ]:
         out = mgr.run_script("demo", bad)
         assert out.startswith("错误：脚本名非法"), f"应拒绝 {bad!r}，实际：{out[:60]}"
 
@@ -552,7 +612,34 @@ def test_skill_script_path_traversal_rejected(tmp_path):
     assert "ok" in out_ok and "[exit code] 0" in out_ok
 
 
+def test_skill_scan_survives_bad_encoding(tmp_path):
+    """单个 SKILL.md 坏掉不得炸掉启动：UnicodeDecodeError 不是 OSError 子类。
+
+    scan() 只捕 OSError 时，一个 GBK 编码的 SKILL.md 会一路逃出 Bridge.__init__，
+    bridge 与 mcp 两个入口全起不来。这里必须跳过坏文件、其余技能照常注册。
+    """
+    from agent.skills_manager import SkillManager
+
+    good = tmp_path / "good"
+    good.mkdir()
+    (good / "SKILL.md").write_bytes(b"---\nname: good\ndescription: d\n---\n")
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    # 0xFF 0xFE 不是合法 UTF-8 起始序列 → read_text(encoding='utf-8') 抛 UnicodeDecodeError
+    (bad / "SKILL.md").write_bytes(b"---\nname: bad\ndescription: \xff\xfe\n---\n")
+
+    mgr = SkillManager(skills_dir=tmp_path)
+    mgr.scan()  # 不应抛异常
+    assert list(mgr.skills) == ["good"], f"应只注册可读技能，实际：{list(mgr.skills)}"
+
+    # load_full 走同一读路径，文件被改坏时要回到工具错误文案而不是裸异常
+    (good / "SKILL.md").write_bytes(b"\xff")
+    out = mgr.load_full("good")
+    assert str(out).startswith("错误："), f"应返回错误文案，实际：{str(out)[:60]}"
+
+
 # ---------------- 并行派工实时事件 + 提前采纳（方案A + 结束派工） ----------------
+
 
 def test_functiontool_injects_ctx_only_for_two_arg_funcs():
     """FunctionTool 按签名决定是否注入 ctx：双参收、单参不收；单参工具无 ctx 也照常跑。"""
@@ -571,14 +658,16 @@ def test_functiontool_injects_ctx_only_for_two_arg_funcs():
     sentinel = SimpleNamespace(emit=lambda e: None, cancel_event=None)
     assert reg.execute("n", {}, sentinel) == "yes"
     assert seen["ctx"] is sentinel, "双参工具必须收到 ctx"
-    assert reg.execute("s", {}) == "no"          # 无 ctx 路径（bridge call_tool/单测）
+    assert reg.execute("s", {}) == "no"  # 无 ctx 路径（bridge call_tool/单测）
     assert reg.execute("s", {}, sentinel) == "no"  # 传了 ctx 也不报错、忽略之
 
 
 # ---------------- 结构化派工 / 健康探针 / 能力标签 / 缓存与下线可关 ----------------
 
+
 def test_ask_many_structured_ordered_records(monkeypatch):
     """ask_many_structured 按入参顺序返回，每条含 worker/ok/status/answer/elapsed_ms。"""
+
     class Instant:
         def __init__(self, *_a, **_k):
             pass
@@ -587,10 +676,16 @@ def test_ask_many_structured_ordered_records(monkeypatch):
             return {"content": "hi"}
 
     monkeypatch.setattr(orch, "LLMClient", Instant)
-    cfg = Config(_interpolate({"agents": [
-        {"name": "w1", "base_url": "u", "api_key": "k", "model": "m"},
-        {"name": "w2", "base_url": "u", "api_key": "k", "model": "m"},
-    ]}))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "w1", "base_url": "u", "api_key": "k", "model": "m"},
+                    {"name": "w2", "base_url": "u", "api_key": "k", "model": "m"},
+                ]
+            }
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     recs = pool.ask_many_structured(["w1", "w2"], "任务")
     assert [r["worker"] for r in recs] == ["w1", "w2"]
@@ -605,6 +700,7 @@ def test_ask_many_structured_ordered_records(monkeypatch):
 def test_answer_starting_with_error_prefix_is_still_success(monkeypatch):
     """#4：工人正常回答若恰好以「错误：」开头，也不得被当成失败丢弃——
     成败只由结构化 status（是否抛异常/是否跳过）决定，绝不解析回答文本前缀。"""
+
     class Prefixy:
         def __init__(self, *_a, **_k):
             pass
@@ -613,9 +709,15 @@ def test_answer_starting_with_error_prefix_is_still_success(monkeypatch):
             return {"role": "assistant", "content": "错误：这里只是正文的开头，不是故障"}
 
     monkeypatch.setattr(orch, "LLMClient", Prefixy)
-    cfg = Config(_interpolate({"agents": [
-        {"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]},
-    ]}))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]},
+                ]
+            }
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     r = pool.ask_result("st:m1", "任务")
     assert r["status"] == "ok" and r["ok"] is True
@@ -639,9 +741,15 @@ def test_ask_result_error_leaves_answer_empty(monkeypatch):
             raise LLMError("api", "HTTP 429 错误码 1", retryable=True)
 
     monkeypatch.setattr(orch, "LLMClient", Boom)
-    cfg = Config(_interpolate({"agents": [
-        {"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]},
-    ]}))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]},
+                ]
+            }
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     r = pool.ask_result("st:m1", "任务")
     assert r["ok"] is False and r["status"] == "error"
@@ -664,12 +772,23 @@ def test_ask_many_structured_uses_stable_status_codes():
     orig = orch.LLMClient
     orch.LLMClient = lambda *a, **k: monkey()
     try:
-        cfg = Config(_interpolate({"agents": [
-            {"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2", "m3"]},
-        ]}))
+        cfg = Config(
+            _interpolate(
+                {
+                    "agents": [
+                        {
+                            "name": "st",
+                            "base_url": "u",
+                            "api_key": "k",
+                            "models": ["m1", "m2", "m3"],
+                        },
+                    ]
+                }
+            )
+        )
         pool = WorkerPool(cfg, exclude=None)
-        pool._cooldowns["st:m2"] = _t.time() + 999          # 冷却
-        pool.health.record_failure("st:m3", "m3", "")        # 当日隔离（终态）
+        pool._cooldowns["st:m2"] = _t.monotonic() + 999  # 冷却
+        pool.health.record_failure("st:m3", "m3", "")  # 当日隔离（终态）
         recs = pool.ask_many_structured(["st:m1", "st:m2", "st:m3"], "任务")
         by = {r["worker"]: r["status"] for r in recs}
         assert by == {"st:m1": "ok", "st:m2": "cooldown", "st:m3": "quarantined"}, by
@@ -681,10 +800,16 @@ def test_ask_many_structured_uses_stable_status_codes():
 
 def test_health_status_reflects_cooldown_and_quarantine():
     """**终态**失败后 health_status 标该工人不可用（冷却 + 当日隔离），其它照常可用。"""
-    cfg = Config(_interpolate({"agents": [
-        {"name": "d1", "base_url": "u", "api_key": "k", "model": "m"},
-        {"name": "d2", "base_url": "u", "api_key": "k", "model": "m"},
-    ]}))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "d1", "base_url": "u", "api_key": "k", "model": "m"},
+                    {"name": "d2", "base_url": "u", "api_key": "k", "model": "m"},
+                ]
+            }
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     hs = pool.health_status()
     assert all(x["available"] for x in hs), "初始应全部可用"
@@ -698,9 +823,21 @@ def test_health_status_reflects_cooldown_and_quarantine():
 
 
 def test_agentprofile_tags_in_brief_and_health():
-    cfg = Config(_interpolate({"agents": [
-        {"name": "a", "base_url": "u", "api_key": "k", "model": "m", "tags": "code,中文"},
-    ]}))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {
+                        "name": "a",
+                        "base_url": "u",
+                        "api_key": "k",
+                        "model": "m",
+                        "tags": "code,中文",
+                    },
+                ]
+            }
+        )
+    )
     p = cfg.agent_profiles[0]
     assert p.tags == "code,中文"
     assert p.brief()["tags"] == "code,中文"
@@ -711,19 +848,25 @@ def test_agentprofile_tags_in_brief_and_health():
 
 # ---------------- 同站模型回退（2026-09-23 新增） ----------------
 
+
 def _fallback_pool() -> WorkerPool:
     """一站多模型（st: m1/m2/m3）+ 一站单模型（other: x1），便于验证"只回退同站"。"""
-    cfg = Config(_interpolate({
-        "agents": [
-            {"name": "st", "base_url": "u1", "api_key": "k", "models": ["m1", "m2", "m3"]},
-            {"name": "other", "base_url": "u2", "api_key": "k2", "model": "x1"},
-        ],
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "st", "base_url": "u1", "api_key": "k", "models": ["m1", "m2", "m3"]},
+                    {"name": "other", "base_url": "u2", "api_key": "k2", "model": "x1"},
+                ],
+            }
+        )
+    )
     return WorkerPool(cfg, exclude=None)
 
 
 def test_fallback_to_peer_on_retryable_failure(monkeypatch):
     """同站某模型可重试失败 → 自动换同站其它可用模型，返回实际成功模型名。"""
+
     class PeerSwitch:
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
@@ -743,6 +886,7 @@ def test_fallback_to_peer_on_retryable_failure(monkeypatch):
 
 def test_fallback_respects_cooldown_skip(monkeypatch):
     """同站候选都在冷却/隔离 → 无可用回退，原模型记失败返回 error。"""
+
     class AlwaysBoom:
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
@@ -752,8 +896,8 @@ def test_fallback_respects_cooldown_skip(monkeypatch):
 
     monkeypatch.setattr(orch, "LLMClient", AlwaysBoom)
     pool = _fallback_pool()
-    pool._cooldowns["st:m2"] = time.time() + 999   # 同站候选冷却
-    pool._cooldowns["st:m3"] = time.time() + 999
+    pool._cooldowns["st:m2"] = time.monotonic() + 999  # 同站候选冷却
+    pool._cooldowns["st:m3"] = time.monotonic() + 999
     r = pool.ask_result("st:m1", "任务")
     assert r["ok"] is False and r["status"] == "error"
 
@@ -771,16 +915,20 @@ def test_fallback_not_cross_station(monkeypatch):
             raise LLMError("rate_limit", "429", retryable=True)  # 全站可重试失败
 
     monkeypatch.setattr(orch, "LLMClient", Recorder)
-    cfg = Config(_interpolate({
-        "agents": [
-            {"name": "st", "base_url": "u1", "api_key": "k", "models": ["m1", "m2", "m3"]},
-            {"name": "other", "base_url": "u2", "api_key": "k2", "model": "x1"},
-        ],
-        "collaboration": {"fallback_cross_station": False},
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "st", "base_url": "u1", "api_key": "k", "models": ["m1", "m2", "m3"]},
+                    {"name": "other", "base_url": "u2", "api_key": "k2", "model": "x1"},
+                ],
+                "collaboration": {"fallback_cross_station": False},
+            }
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
-    pool._cooldowns["st:m2"] = time.time() + 999   # 同站无可用回退
-    pool._cooldowns["st:m3"] = time.time() + 999
+    pool._cooldowns["st:m2"] = time.monotonic() + 999  # 同站无可用回退
+    pool._cooldowns["st:m3"] = time.monotonic() + 999
     r = pool.ask_result("st:m1", "任务")
     assert r["ok"] is False and r["status"] == "error"
     assert calls["models"] == ["m1"], f"关闭跨站后不得跨站，实际试过：{calls['models']}"
@@ -788,6 +936,7 @@ def test_fallback_not_cross_station(monkeypatch):
 
 def test_fallback_cross_station_recovers(monkeypatch):
     """默认允许跨站：同站候选全冷却时跨站到 other 站(x1) 恢复成功（异常停止自动换模型）。"""
+
     class OnlyM1Boom:
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
@@ -799,8 +948,8 @@ def test_fallback_cross_station_recovers(monkeypatch):
 
     monkeypatch.setattr(orch, "LLMClient", OnlyM1Boom)
     pool = _fallback_pool()
-    pool._cooldowns["st:m2"] = time.time() + 999   # 同站候选均不可用
-    pool._cooldowns["st:m3"] = time.time() + 999
+    pool._cooldowns["st:m2"] = time.monotonic() + 999  # 同站候选均不可用
+    pool._cooldowns["st:m3"] = time.monotonic() + 999
     r = pool.ask_result("st:m1", "任务")
     assert r["ok"] is True and r["status"] == "ok"
     assert r["worker"] == "other", f"应跨站恢复到 other 站，实际 worker={r['worker']}"
@@ -840,10 +989,14 @@ def test_fallback_disabled_when_zero(monkeypatch):
             raise LLMError("rate_limit", "429", retryable=True)
 
     monkeypatch.setattr(orch, "LLMClient", M1Boom)
-    cfg = Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]}],
-        "collaboration": {"fallback_models": 0},
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]}],
+                "collaboration": {"fallback_models": 0},
+            }
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     r = pool.ask_result("st:m1", "任务")
     assert r["ok"] is False and r["status"] == "error"
@@ -882,8 +1035,9 @@ def test_station_memo_suppresses_cross_worker_fallback(monkeypatch):
     r2 = pool.ask_result("st:m2", "任务", memo=memo)
     assert r2["ok"] is False and r2["status"] == "error"
     new_calls = calls["models"][before:]
-    assert "m1" not in new_calls and "m3" not in new_calls, \
+    assert "m1" not in new_calls and "m3" not in new_calls, (
         f"同站已被记忆为死站，不得再撞同站候选，实际={new_calls}"
+    )
     assert new_calls == ["m2", "x1"], f"应为「主调用 + 一次跨站兜底」，实际={new_calls}"
 
 
