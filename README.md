@@ -99,8 +99,7 @@ NODE_B_KEY=sk-你的kilo-key    # 不用 kilo 可不写
 
 **第 2 步：模型清单（写进 `model_registry.txt`，随仓库维护、进 git）**
 
-所有模型名集中在 `model_registry.txt`（`NODE_A_MODELS` / `NODE_B_MODELS` / `LLM_MODEL`
-三行），`git pull` 即更新；临时屏蔽某模型 = 在它名字前加 `#`，不用改代码。
+所有模型名集中在 `model_registry.txt`（`NODE_A_MODELS` / `NODE_B_MODELS` / `NODE_C_MODELS` / `NODE_D_MODELS` 等），`git pull` 即更新；临时屏蔽某模型 = 在它名字前加 `#`，不用改代码。
 
 加载优先级：shell 环境变量 > `.env` > `model_registry.txt`（config.yaml 只留结构骨架，
 全部用 `${VAR}` 或 `${VAR:-默认}` 引用，授权负责维护默认值）。变量名必须与
@@ -116,8 +115,7 @@ registry），启动时按 `[配置分层提醒]` 点名警告（只报变量名
 （当日隔离）；429/5xx/超时等瞬时失败耗尽重试只进短时冷却——免费 API 的限流抖动是常态，
 不该一次 429 就报废整天可用池。某模型**连续 7 个"运行日"都出现终态（不可重试）失败**（运行日 = 程序
 实际启动工作的天，没运行项目的日子不计入、也不打断连击；纯瞬时失败只冷却、不计入、永不触发下线），自动在 `model_registry.txt`
-给它标 `#` 下线（删掉 `#` 即恢复；阈值 `COLLAB_RETIRE_DAYS` 可调，`LLM_MODEL` 兜底行
-不自动动）。可用 `health` 指令查各节点当前是否可用。
+给它标 `#` 下线（删掉 `#` 即恢复；阈值 `COLLAB_RETIRE_DAYS` 可调）。可用 `health` 指令查各节点当前是否可用。
 
 多模型中转站的韧性：某模型出现**可重试瞬时失败**（429/5xx/超时/连接）时，会自动切换到**同一中转站**（`base_url`+`api_key` 相同）的其它当前可用模型重试——不跨站、不重复试已失败模型、终态认证错误不回退（那类错误整站级出现，回退既无用又浪费其它模型额度）。重试次数上限由 `collaboration.fallback_models`（默认 2）约束，避免整站故障时把同站几十个模型挨个试穿。每个模型的健康/冷却仍各自独立记账。
 
@@ -143,7 +141,7 @@ agents:
 echo '{"cmd":"list_agents"}' | uv run mao bridge
 ```
 
-免 key 方案：本地跑 Ollama（`base_url: http://localhost:11434/v1`，`api_key: ""`）。池为空时会用 `llm:` 段的兜底单模型跑 solo（`llm:` 段的 `base_url`/`model` 带默认值，只有 `LLM_API_KEY` 必填）。
+免 key 方案：本地跑 Ollama（`base_url: http://localhost:11434/v1`，`api_key: ""`），把它作为一个普通 node 加进 `config.yaml` 的 `agents` 即可；`ask` 不指定 agent 时从池中挑一个可用工人。
 
 ## 多智能体协作（核心玩法）
 

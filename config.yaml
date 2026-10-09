@@ -22,22 +22,31 @@ agents:
     api_key: ${NODE_B_KEY}
     models: ${NODE_B_MODELS}
     note: 中转站B免费token
+
+  - name: node-c                      # 站点 C：Google Gemini 免费档
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    api_key: ${GEMINI_API_KEY}
+    models: ${NODE_C_MODELS}
+    note: Gemini免费档 15RPM/1500RPD
+  - name: node-d                      # 站点 D：Cloudflare Workers AI 免费档
+    base_url: ${CF_BASE_URL}
+    api_key: ${CF_API_TOKEN}
+    models: ${NODE_D_MODELS}
+    note: Cloudflare Workers AI免费档 300RPM
 #  - name: local-qwen                 # 单模型站（models 不填、用 model，兼容旧写法）
 #    base_url: http://localhost:11434/v1
 #    api_key: ""
 #    model: qwen2.5:7b
 #    note: 完全本地免 key
 
-# 兜底单模型：ask 不带 agent 时用它（也可想直连官方 API 时用）。该路径也纳入
-# 健康体系（合成键 solo:<model>）：终态失败当天隔离、瞬时失败短时冷却。
-# 模型名在 model_registry.txt 的 LLM_MODEL 行（不自动下线，人工决定）。
+# LLM 调用参数（派工请求的通用超时/重试）。**不再是**"兜底单模型"段：ask 不带
+# agent 时从池里挑一个当前可用工人，池空就如实报错，不再私连一个 solo 模型。
+# 读法见 Config.llm_cfg —— 只有 timeout / max_retries 两项被代码读取。
 llm:
-  base_url: ${LLM_ENDPOINT}
-  api_key: ${LLM_API_KEY}          # 在 .env 里配 LLM_API_KEY
-  model: ${LLM_MODEL}
-  temperature: ${LLM_TEMPERATURE:-0.7}
-  # 免费节点友好：请求超时秒数 / 限流等可重试错误的最大重试次数(指数退避)
+  # 单请求超时秒数：ask_many/vote 的整体限时按它折算 = 批次数 × timeout + 30s。
+  # 重 prompt（如整库审计）要抬超时，改这里或设环境变量 LLM_TIMEOUT（env 优先）。
   timeout: ${LLM_TIMEOUT:-120}
+  # 限流(429)/超时/5xx/连接失败的最大重试次数（指数退避；认证与其余 4xx 不重试）
   max_retries: ${LLM_MAX_RETRIES:-2}
 
 collaboration:
