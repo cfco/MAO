@@ -11,6 +11,7 @@
 - P2c 批量派工线程非 daemon —— 解释器退出被在飞 LLM 请求拖住。
 - P2d read_file 的 limit 裸 int() —— 模型传坏值直接炸进兜底异常路径。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -25,10 +26,14 @@ from agent.tools.base import ToolRegistry, ToolResult
 
 
 def _pool(models: str, cap: int = 3) -> WorkerPool:
-    cfg = Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": models}],
-        "collaboration": {"max_participants": cap, "max_workers": 2},
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": models}],
+                "collaboration": {"max_participants": cap, "max_workers": 2},
+            }
+        )
+    )
     return WorkerPool(cfg, exclude=None)
 
 
@@ -45,6 +50,7 @@ class _InstantClient:
 
 # ---------------- P0：MCP 工具必须能经注册表执行 ----------------
 
+
 def test_mcp_tool_executes_through_registry():
     """P0 复现转正：注册表调用 McpTool 不再 TypeError，成功/失败契约如实透传。"""
 
@@ -57,8 +63,9 @@ def test_mcp_tool_executes_through_registry():
             return f"echo:{remote_name}:{args.get('msg', '')}"
 
     conn = FakeConn()
-    tool = mc.McpTool(name="mcp__fake__echo", description="d",
-                      input_schema={}, conn=conn, remote_name="echo")
+    tool = mc.McpTool(
+        name="mcp__fake__echo", description="d", input_schema={}, conn=conn, remote_name="echo"
+    )
     reg = ToolRegistry()
     reg.register(tool)
 
@@ -75,6 +82,7 @@ def test_mcp_tool_executes_through_registry():
 
 # ---------------- P1a：未知工人显式 missing ----------------
 
+
 def test_ask_many_structured_surfaces_missing_worker(monkeypatch):
     monkeypatch.setattr(orch, "LLMClient", _InstantClient)
     # 用两模型站：单模型站按命名规则就叫 "st"（不带 :模型 后缀），
@@ -83,7 +91,8 @@ def test_ask_many_structured_surfaces_missing_worker(monkeypatch):
     recs = pool.ask_many_structured(["st:m1", "ghost"], "任务")
     by = {r["worker"]: r["status"] for r in recs}
     assert by == {"st:m1": "ok", "ghost": "missing"}, (
-        "点名的未知工人必须逐条带回 missing（旧实现静默丢弃 → 外部主拿错名字无限重试）")
+        "点名的未知工人必须逐条带回 missing（旧实现静默丢弃 → 外部主拿错名字无限重试）"
+    )
     ghost = next(r for r in recs if r["worker"] == "ghost")
     assert ghost["ok"] is False and ghost["answer"] == ""
 
@@ -95,9 +104,15 @@ def test_bridge_ask_many_all_ghost_fails_with_hint():
     orig = orch.LLMClient
     orch.LLMClient = _InstantClient  # 离线：不真发请求
     try:
-        cfg = Config(_interpolate({"agents": [
-            {"name": "st", "base_url": "u", "api_key": "k", "model": "m"},
-        ]}))
+        cfg = Config(
+            _interpolate(
+                {
+                    "agents": [
+                        {"name": "st", "base_url": "u", "api_key": "k", "model": "m"},
+                    ]
+                }
+            )
+        )
         b = br.Bridge(cfg)
         try:
             out = b.handle({"cmd": "ask_many", "prompt": "p", "workers": ["typo-name"]})
@@ -110,6 +125,7 @@ def test_bridge_ask_many_all_ghost_fails_with_hint():
 
 
 # ---------------- P1b：MCP 重名跳过、不炸 Bridge ----------------
+
 
 def test_duplicate_mcp_tool_names_skipped_not_fatal(monkeypatch):
     class T:
@@ -144,6 +160,7 @@ def test_duplicate_mcp_tool_names_skipped_not_fatal(monkeypatch):
 
 # ---------------- P1c：threshold 类型归一 ----------------
 
+
 def test_vote_threshold_string_coerced(monkeypatch):
     pool = _pool("m1,m2")
 
@@ -155,12 +172,14 @@ def test_vote_threshold_string_coerced(monkeypatch):
     monkeypatch.setattr(pool, "ask_result", spy)
     v = pool.vote("选一个", workers=pool.names(), threshold="0.5")  # 字符串阈值
     assert v["ok"] is True and v["consensus"] is True, (
-        '"0.5" 应归一为 0.5 判过半共识（旧实现 ratio >= "0.5" 直接 TypeError）')
+        '"0.5" 应归一为 0.5 判过半共识（旧实现 ratio >= "0.5" 直接 TypeError）'
+    )
     v2 = pool.vote("选一个", workers=pool.names(), threshold="half")  # 非法值回退默认
     assert v2["ok"] is True and v2["consensus"] is True
 
 
 # ---------------- P2a：会话 CM 同 task 进入 / 退出 ----------------
+
 
 def test_mcp_session_cm_entered_and_exited_in_same_task(monkeypatch):
     seen: dict[str, object] = {}
@@ -194,31 +213,36 @@ def test_mcp_session_cm_entered_and_exited_in_same_task(monkeypatch):
     conn._thread.join(timeout=10)
     assert not conn._thread.is_alive(), "stop 后线程应干净退出"
     assert "enter" in seen and "exit" in seen, (
-        "会话 CM 必须被真正退出（旧跨 task 版本 __aexit__ 必抛错被吞，等于从不关闭）")
+        "会话 CM 必须被真正退出（旧跨 task 版本 __aexit__ 必抛错被吞，等于从不关闭）"
+    )
     assert seen["enter"] is seen["exit"], "enter/exit 必须同 task（anyio cancel scope 约束）"
 
 
 # ---------------- P2b：显式 path 不进全局缓存 ----------------
 
+
 def test_explicit_path_load_config_bypasses_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "ROOT", tmp_path)
     a = tmp_path / "a.yaml"
-    a.write_text('agents: [{name: sa, base_url: u, api_key: k, model: m1}]\n', encoding="utf-8")
+    a.write_text("agents: [{name: sa, base_url: u, api_key: k, model: m1}]\n", encoding="utf-8")
     b = tmp_path / "b.yaml"
-    b.write_text('agents: [{name: sb, base_url: u, api_key: k, model: m2}]\n', encoding="utf-8")
+    b.write_text("agents: [{name: sb, base_url: u, api_key: k, model: m2}]\n", encoding="utf-8")
     cfg_a = config_mod.load_config(a)
     cfg_b = config_mod.load_config(b)
     assert [p.name for p in cfg_a.agent_profiles] == ["sa"]
     assert [p.name for p in cfg_b.agent_profiles] == ["sb"], (
-        "显式 path 每次真实读盘：旧实现第二次拿到的是 a.yaml 的缓存")
+        "显式 path 每次真实读盘：旧实现第二次拿到的是 a.yaml 的缓存"
+    )
     # 默认路径的缓存行为不变
     (tmp_path / "config.yaml").write_text(
-        'agents: [{name: sd, base_url: u, api_key: k, model: m4}]\n', encoding="utf-8")
+        "agents: [{name: sd, base_url: u, api_key: k, model: m4}]\n", encoding="utf-8"
+    )
     c1 = config_mod.load_config()
     assert config_mod.load_config() is c1, "默认路径无变化仍应命中缓存"
 
 
 # ---------------- P2c：批量派工线程 daemon 化 ----------------
+
 
 def test_run_parallel_uses_daemon_threads(monkeypatch):
     pool = _pool("m1,m2")
@@ -232,10 +256,12 @@ def test_run_parallel_uses_daemon_threads(monkeypatch):
     pool.ask_many(["st:m1", "st:m2"], "q")
     assert flags and all(flags), (
         "派工线程必须是 daemon：ThreadPoolExecutor 的非 daemon 线程会被解释器 "
-        "atexit join，进程收尾被在飞 LLM 请求拖住")
+        "atexit join，进程收尾被在飞 LLM 请求拖住"
+    )
 
 
 # ---------------- P2d：read_file 的 limit 容错 ----------------
+
 
 def test_read_file_bad_limit_falls_back_not_crashes(tmp_path, monkeypatch):
     from agent.tools import builtin
@@ -248,6 +274,7 @@ def test_read_file_bad_limit_falls_back_not_crashes(tmp_path, monkeypatch):
 
     out = reg.run("read_file", {"path": "f.txt", "limit": "many"})
     assert out["ok"] is True and "第一行" in out["result"], (
-        f"limit 类型错应回退默认值继续读，实际：{out}")
+        f"limit 类型错应回退默认值继续读，实际：{out}"
+    )
     out0 = reg.run("read_file", {"path": "f.txt", "limit": -5})
     assert out0["ok"] is True and "第一行" in out0["result"], "负数 limit 钳到 ≥1，不得砍尾"

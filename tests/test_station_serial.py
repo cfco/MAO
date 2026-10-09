@@ -11,6 +11,7 @@
   5) 失败回退不得原站在门内递归（反向回退会 A 等 B、B 等 A 死锁）；
   6) 延迟探测遇站被占时让路而不是陪等。
 """
+
 from __future__ import annotations
 
 import threading
@@ -54,20 +55,32 @@ class _Tracker:
             self.inflight_total -= 1
 
 
-def _pool(station_specs, max_per_station: int = 1, max_workers: int = 3,
-          fallback_models: int = 2, cap: int = 0) -> WorkerPool:
+def _pool(
+    station_specs,
+    max_per_station: int = 1,
+    max_workers: int = 3,
+    fallback_models: int = 2,
+    cap: int = 0,
+) -> WorkerPool:
     """station_specs: [(站名, base_url, 模型清单串), ...] ⇒ 一站多模型的多站池。"""
-    cfg = Config(_interpolate({
-        "agents": [
-            {"name": nm, "base_url": url, "api_key": f"key-{nm}", "models": models}
-            for nm, url, models in station_specs
-        ],
-        "collaboration": {
-            "max_participants": cap, "max_workers": max_workers,
-            "max_per_station": max_per_station, "fallback_models": fallback_models,
-            "fallback_cross_station": True, "latency_probe": False,
-        },
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": nm, "base_url": url, "api_key": f"key-{nm}", "models": models}
+                    for nm, url, models in station_specs
+                ],
+                "collaboration": {
+                    "max_participants": cap,
+                    "max_workers": max_workers,
+                    "max_per_station": max_per_station,
+                    "fallback_models": fallback_models,
+                    "fallback_cross_station": True,
+                    "latency_probe": False,
+                },
+            }
+        )
+    )
     return WorkerPool(cfg, exclude=None)
 
 
@@ -97,6 +110,7 @@ def _fake_client(tracker: _Tracker, fail_once=()):
 
 # ---------------- 1) 同站串行 ----------------
 
+
 def test_same_station_batch_never_overlaps(monkeypatch):
     """同站 3 个模型一起派工：站内在飞峰值必须为 1（这就是本策略的全部内容）。"""
     tracker = _Tracker(hold=0.05)
@@ -113,6 +127,7 @@ def test_same_station_batch_never_overlaps(monkeypatch):
 
 
 # ---------------- 2) 跨站仍然并行 ----------------
+
 
 def test_cross_station_still_runs_in_parallel(monkeypatch):
     """两站各 2 模型：每站峰值 1，但整体峰值必须到 2（跨站真并行，没退化成串行）。"""
@@ -133,6 +148,7 @@ def test_cross_station_still_runs_in_parallel(monkeypatch):
 
 # ---------------- 3) 配置可退回旧行为 ----------------
 
+
 def test_max_per_station_relaxes_the_gate(monkeypatch):
     """max_per_station=2 时同站允许 2 路在飞：证明约束由配置把守，不是写死。"""
     tracker = _Tracker(hold=0.15)
@@ -146,6 +162,7 @@ def test_max_per_station_relaxes_the_gate(monkeypatch):
 
 
 # ---------------- 4) 整体限时按站数放宽 ----------------
+
 
 def test_effective_timeout_accounts_for_station_serialization():
     """6 名 / 2 站 / 每站 1 ⇒ 实际并行 2 路 = 3 批 ⇒ 3×120+30；旧口径只有 2 批会误杀尾部。"""
@@ -174,6 +191,7 @@ def test_single_station_batch_widens_timeout_the_most():
 
 
 # ---------------- 5) 回退不得在门内递归 ----------------
+
 
 def test_same_station_fallback_does_not_self_deadlock(monkeypatch):
     """同站回退必须跑得完：首个模型瞬时失败 ⇒ 换同站第二个模型成功续跑。
@@ -209,7 +227,8 @@ def test_reverse_cross_station_fallback_does_not_deadlock(monkeypatch):
     """
     tracker = _Tracker(hold=0.02)
     monkeypatch.setattr(
-        orch, "LLMClient",
+        orch,
+        "LLMClient",
         _fake_client(tracker, fail_once=[("http://a", "key-A"), ("http://b", "key-B")]),
     )
     pool = _pool([("A", "http://a", "m1"), ("B", "http://b", "m1")])
@@ -229,6 +248,7 @@ def test_reverse_cross_station_fallback_does_not_deadlock(monkeypatch):
 
 
 # ---------------- 6) 延迟探测让路 ----------------
+
 
 def test_probe_yields_when_station_is_busy(monkeypatch):
     """站被真实派工占着时，探测最多等 _PROBE_GATE_WAIT 就放弃（绝不陪等 120s）。"""
@@ -252,6 +272,7 @@ def test_probe_yields_when_station_is_busy(monkeypatch):
 
 # ---------------- 7) 真实并发口径回给外部主 ----------------
 
+
 def test_health_reports_effective_concurrency():
     """`health` 必须带出 effective：主靠它决定"一批点几个、要不要跨站"。
 
@@ -260,19 +281,26 @@ def test_health_reports_effective_concurrency():
     """
     from agent.bridge import Bridge
 
-    cfg = Config(_interpolate({
-        "agents": [
-            {"name": "A", "base_url": "http://a", "api_key": "ka", "models": "m1,m2"},
-            {"name": "B", "base_url": "http://b", "api_key": "kb", "models": "m1,m2"},
-        ],
-        "llm": {"base_url": "u", "api_key": "k", "model": "m"},
-        "collaboration": {"max_workers": 3, "max_per_station": 1, "latency_probe": False},
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [
+                    {"name": "A", "base_url": "http://a", "api_key": "ka", "models": "m1,m2"},
+                    {"name": "B", "base_url": "http://b", "api_key": "kb", "models": "m1,m2"},
+                ],
+                "llm": {"base_url": "u", "api_key": "k", "model": "m"},
+                "collaboration": {"max_workers": 3, "max_per_station": 1, "latency_probe": False},
+            }
+        )
+    )
     b = Bridge(cfg)
     try:
         out = b.handle({"cmd": "health"})
         assert out["concurrency"] == {
-            "stations": 2, "max_workers": 3, "max_per_station": 1, "effective": 2,
+            "stations": 2,
+            "max_workers": 3,
+            "max_per_station": 1,
+            "effective": 2,
         }, out.get("concurrency")
     finally:
         b.workers.close()
@@ -282,8 +310,12 @@ def test_health_reports_effective_concurrency():
 @pytest.mark.parametrize("bad", ["many", 0, -1, None])
 def test_bad_max_per_station_falls_back_to_one(bad):
     """max_per_station 写错/写 0 不能崩启动，也不能变成"无门"。"""
-    cfg = Config(_interpolate({
-        "agents": [{"name": "A", "base_url": "http://a", "api_key": "k", "models": "m1"}],
-        "collaboration": {"max_per_station": bad},
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [{"name": "A", "base_url": "http://a", "api_key": "k", "models": "m1"}],
+                "collaboration": {"max_per_station": bad},
+            }
+        )
+    )
     assert cfg.max_per_station == 1

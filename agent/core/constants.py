@@ -6,17 +6,18 @@
 这些状态码是对外稳定契约（ask_many_structured / ask_result 的 status 字段）：
 新增/修改必须同步改对应的 bridge/mcp 三外壳处理代码与测试。
 """
+
 from __future__ import annotations
 
 # ---------- 派工结果状态 ----------
 # 成败由**控制流**决定（是否跳过、chat 是否抛错），绝不从工人回答文本里猜：
 # 工人正常回答若以「错误：」开头也不会被误判成失败。
-ST_OK = "ok"                    # 成功拿到回答
-ST_ERROR = "error"              # 打了网络但失败（LLMError / 意外异常 / 取 client 失败）
-ST_COOLDOWN = "cooldown"        # 冷却中，本轮跳过
+ST_OK = "ok"  # 成功拿到回答
+ST_ERROR = "error"  # 打了网络但失败（LLMError / 意外异常 / 取 client 失败）
+ST_COOLDOWN = "cooldown"  # 冷却中，本轮跳过
 ST_QUARANTINED = "quarantined"  # 当日失败隔离，本轮跳过
-ST_MISSING = "missing"          # 指定工人不在池里
-ST_TIMEOUT = "timeout"          # 批量派工整体限时内未回来（由收集层标注）
+ST_MISSING = "missing"  # 指定工人不在池里
+ST_TIMEOUT = "timeout"  # 批量派工整体限时内未回来（由收集层标注）
 # 以上状态码即对外 status 词表（ask_result / ask_many_structured / 单 ask 统一使用），
 # 不再另设中文标签翻译层：外部主按稳定英文码程序化消费。
 

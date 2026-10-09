@@ -8,6 +8,7 @@
 不断言失败响应的具体字段形状（status/error 的契约正由另一批改动收敛），只断言
 "透传一致 + 退出码正确"——外壳测试不该把内核的演进细节焊死。
 """
+
 from __future__ import annotations
 
 import json
@@ -24,8 +25,19 @@ from agent.mcp_server import build_server
 ROOT = Path(__file__).resolve().parent.parent
 
 EXPECTED_TOOLS = {
-    "ping", "list_agents", "health", "latency", "set_economy", "list_tools", "call_tool",
-    "load_skill", "run_skill_script", "ask", "ask_many", "ask_vote", "run_review",
+    "ping",
+    "list_agents",
+    "health",
+    "latency",
+    "set_economy",
+    "list_tools",
+    "call_tool",
+    "load_skill",
+    "run_skill_script",
+    "ask",
+    "ask_many",
+    "ask_vote",
+    "run_review",
 }
 
 
@@ -40,9 +52,11 @@ def _with_session(go):
     async def _main():
         async with create_client_server_memory_streams() as (client, server):
             async with anyio.create_task_group() as tg:
+
                 async def _serve():
                     low = app._lowlevel_server  # noqa: SLF001 - SDK 测试惯用入口
                     await low.run(server[0], server[1], low.create_initialization_options())
+
                 tg.start_soon(_serve)
                 async with ClientSession(client[0], client[1]) as session:
                     await session.initialize()
@@ -87,8 +101,13 @@ def test_call_tool_reads_project_file():
     got: dict = {}
 
     async def go(s):
-        got.update(_payload(await s.call_tool(
-            "call_tool", {"name": "read_file", "args": {"path": "config.yaml"}})))
+        got.update(
+            _payload(
+                await s.call_tool(
+                    "call_tool", {"name": "read_file", "args": {"path": "config.yaml"}}
+                )
+            )
+        )
 
     _with_session(go)
     assert got["ok"] is True and "agents" in got["result"]
@@ -120,7 +139,11 @@ def test_latency_through_mcp_on_empty_pool():
 def _run_call(*argv: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "agent", "call", *argv],
-        capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT), timeout=120,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(ROOT),
+        timeout=120,
     )
 
 
@@ -136,7 +159,11 @@ def test_one_shot_reads_payload_from_stdin():
     proc = subprocess.run(
         [sys.executable, "-m", "agent", "call", "call_tool"],
         input=json.dumps({"name": "list_dir", "args": {"path": "."}}, ensure_ascii=False),
-        capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT), timeout=120,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(ROOT),
+        timeout=120,
     )
     assert proc.returncode == 0, proc.stderr[:400]
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]

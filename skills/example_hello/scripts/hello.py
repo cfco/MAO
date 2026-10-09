@@ -1,4 +1,5 @@
 """示例技能脚本：从 argv[1] 读取 JSON 参数，向对方问好。"""
+
 import json
 import sys
 

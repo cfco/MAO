@@ -10,6 +10,7 @@
 语义边界（方案 B 红线）：MAO 只负责透传/切换开关，**绝不**自行判断
 "分工还是重复验证"——模式判断全部留给外部主。本文件只字不碰模式判断。
 """
+
 from __future__ import annotations
 
 from agent.bridge import _parse_economy
@@ -28,6 +29,7 @@ def _cfg(**collab) -> Config:
 
 
 # ---------------- Config：economy 读取与容错 ----------------
+
 
 def test_economy_defaults_false_when_absent():
     """未配置 collaboration.economy → false（对外不省 token 的保守默认）。"""
@@ -55,6 +57,7 @@ def test_economy_bad_value_falls_back_to_default():
 
 # ---------------- Bridge：初始值 ----------------
 
+
 def test_bridge_economy_defaults_false():
     """未配置时 Bridge 初始 _economy=false。"""
     from agent import bridge as br
@@ -79,6 +82,7 @@ def test_bridge_economy_follows_config():
 
 # ---------------- ready 事件 ----------------
 
+
 def test_bridge_ready_event_carries_economy():
     """握手首行必须带出 economy，外部主不用额外问。"""
     import json
@@ -90,7 +94,11 @@ def test_bridge_ready_event_carries_economy():
     proc = subprocess.run(
         [sys.executable, "-m", "agent", "bridge"],
         input=json.dumps({"cmd": "ping"}, ensure_ascii=False) + "\n",
-        capture_output=True, text=True, encoding="utf-8", cwd=str(root), timeout=120,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(root),
+        timeout=120,
     )
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
     assert lines, f"bridge 无输出；stderr={proc.stderr[:400]}"
@@ -101,6 +109,7 @@ def test_bridge_ready_event_carries_economy():
 
 
 # ---------------- set_economy 指令 ----------------
+
 
 def test_set_economy_toggles_bool():
     """set_economy 接受 true/false 并返回新状态。"""
@@ -158,6 +167,7 @@ def test_set_economy_affects_health_echo():
 
 
 # ---------------- _parse_economy 单元 ----------------
+
 
 def test_parse_economy_unit():
     """解析器边界：None/异常结构返回 None（=非法），正反字面量各归其位。"""

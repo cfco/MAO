@@ -7,6 +7,7 @@
 
 （原「默认会话 id 防碰撞」「Agent.close 释放」用例已随内部 Agent / 会话持久化模块移除。）
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -16,6 +17,7 @@ from agent.core.llm import LLMClient
 from agent.core.orchestrator import WorkerPool
 
 # ---------------- 连接池必须显式释放 ----------------
+
 
 def test_llm_client_close_is_idempotent():
     """LLMClient.close 释放底层客户端，且重复调用不抛异常。"""
@@ -38,9 +40,13 @@ def test_llm_client_close_swallows_errors():
 
 def test_worker_pool_close_releases_all_clients():
     """WorkerPool.close 关闭并清空全部工人客户端，且幂等。"""
-    cfg = Config(_interpolate({
-        "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]}],
-    }))
+    cfg = Config(
+        _interpolate(
+            {
+                "agents": [{"name": "st", "base_url": "u", "api_key": "k", "models": ["m1", "m2"]}],
+            }
+        )
+    )
     pool = WorkerPool(cfg, exclude=None)
     c1, c2 = MagicMock(), MagicMock()
     pool._clients = {"st:m1": c1, "st:m2": c2}
@@ -53,6 +59,7 @@ def test_worker_pool_close_releases_all_clients():
 
 
 # ---------------- cmd 内置命令：参数模式失败必须退回 shell ----------------
+
 
 def test_run_shell_falls_back_to_shell_for_builtins(monkeypatch):
     """参数模式遇 FileNotFoundError（内置命令）时应回退 shell=True 重跑一次。"""

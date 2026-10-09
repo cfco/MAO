@@ -6,6 +6,7 @@
 1) 配了 workspace 后，外部目录可读、可列、可当 cwd；
 2) 没配（或配了之外）的路径，越界依然被拒 —— 安全边界不能因为这次放宽而消失。
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -35,9 +36,9 @@ def test_default_limits_to_project_root():
     """不配 workspace 时，只有项目根可访问。"""
     roots = builtin.set_workspace_roots([])
     assert roots == (builtin.ROOT_RESOLVED,)
-    assert builtin._resolve("config.yaml") is not None          # noqa: SLF001
+    assert builtin._resolve("config.yaml") is not None  # noqa: SLF001
     outside = builtin.ROOT_RESOLVED.parent / "definitely-outside.txt"
-    assert builtin._resolve(str(outside)) is None               # noqa: SLF001
+    assert builtin._resolve(str(outside)) is None  # noqa: SLF001
 
 
 def test_workspace_extends_reachable_roots(tmp_path):
@@ -49,7 +50,7 @@ def test_workspace_extends_reachable_roots(tmp_path):
 
     roots = builtin.set_workspace_roots([str(extra)])
     assert len(roots) == 2
-    assert builtin._resolve(str(target)) == target.resolve()    # noqa: SLF001
+    assert builtin._resolve(str(target)) == target.resolve()  # noqa: SLF001
 
 
 def test_path_outside_configured_workspace_still_blocked(tmp_path):
@@ -61,7 +62,7 @@ def test_path_outside_configured_workspace_still_blocked(tmp_path):
     (other / "x.txt").write_text("secret", encoding="utf-8")
 
     builtin.set_workspace_roots([str(allowed)])
-    assert builtin._resolve(str(other / "x.txt")) is None       # noqa: SLF001
+    assert builtin._resolve(str(other / "x.txt")) is None  # noqa: SLF001
 
 
 def test_nonexistent_workspace_entry_is_skipped(tmp_path):
@@ -87,7 +88,7 @@ def test_backup_of_external_file_is_prefixed(tmp_path):
     target.write_text("v1", encoding="utf-8")
     builtin.set_workspace_roots([str(extra)])
 
-    backup = builtin._backup_before_overwrite(target)           # noqa: SLF001
+    backup = builtin._backup_before_overwrite(target)  # noqa: SLF001
     assert backup is not None
     # 新前缀格式 =「根名_短哈希__相对路径」：extproj_<hash>__README.md...
     name = Path(backup).name
@@ -110,8 +111,8 @@ def test_backup_prefix_unique_for_same_named_roots(tmp_path):
     (b / "README.md").write_text("来自 b", encoding="utf-8")
     builtin.set_workspace_roots([str(a), str(b)])
 
-    bak_a = builtin._backup_before_overwrite(a / "README.md")    # noqa: SLF001
-    bak_b = builtin._backup_before_overwrite(b / "README.md")    # noqa: SLF001
+    bak_a = builtin._backup_before_overwrite(a / "README.md")  # noqa: SLF001
+    bak_b = builtin._backup_before_overwrite(b / "README.md")  # noqa: SLF001
     assert bak_a and bak_b
     assert Path(bak_a).name != Path(bak_b).name
     assert Path(bak_a).read_text(encoding="utf-8") == "来自 a"
@@ -123,7 +124,7 @@ def test_backup_prefix_unique_for_same_named_roots(tmp_path):
 def test_workspace_rejects_filesystem_root(tmp_path):
     """把盘符根/文件根配成工作区会交出整机，必须拒绝（防呆）。"""
     root = tmp_path
-    while root.parent != root:        # 逐级向上直到文件系统根（Win 上是 C:\，Linux 上是 /）
+    while root.parent != root:  # 逐级向上直到文件系统根（Win 上是 C:\，Linux 上是 /）
         root = root.parent
     roots = builtin.set_workspace_roots([str(root)])
     assert builtin.ROOT_RESOLVED in roots
