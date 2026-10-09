@@ -1,6 +1,6 @@
 """仓库卫生守卫：`.gitignore` 规则必须真的生效、lint 不得扫到隔离区、模板不得带值。
 
-三条背景都是本项目实际发生过的：
+前三条背景都是本项目实际发生过的，第四条是防漂移的守卫：
 1. `.gitignore` 不支持行内注释 —— `data/    # 会话历史` 会被当成一个字面 pattern，
    整条规则失效，于是 `data/` 从未被忽略、会话历史（含对话内容）会被提交。
 2. `[tool.ruff] exclude` 是**替换**语义，会顶掉 ruff 的默认排除表
@@ -9,6 +9,8 @@
 3. `.env` 是唯一承载端点/密钥的文件，此前没有 `.env.example`：新环境只能靠读代码
    猜变量名。模板一旦带了真实值就等于把密钥提交进公开仓库，故这里守"模板必须全注释、
    且列出的变量名都还有效"。
+4. 版本号手写两份（`pyproject.toml` 的 `version` / `agent/__init__.py` 的
+   `__version__`），改一处忘一处不会报错，只会让外部主 `ping` 到的版本与装包元数据不符。
 """
 
 from __future__ import annotations
@@ -147,3 +149,19 @@ def test_env_example_names_are_still_real_knobs():
     ]
     missing = [v for v in must if v not in listed]
     assert not missing, f"config.yaml 引用了这些端点/密钥变量但模板没列：{missing}"
+
+
+def test_version_is_declared_consistently():
+    """两份手写版本号必须一致：`ping`/`ready` 回给外部主的是 __version__，装包元数据是 pyproject。
+
+    漂移不会报错，只会让外部主看到的版本是假的。这里不用 tomllib（3.11+ 才有，
+    requires-python 的下限是 3.10，CI 的 3.10 腿会直接 ImportError），做行级正则就够。
+    """
+    pyproject_text = PYPROJECT.read_text(encoding="utf-8")
+    init_text = (ROOT / "agent" / "__init__.py").read_text(encoding="utf-8")
+    pkg = re.search(r'^version = "([^"]+)"', pyproject_text, re.M)
+    code = re.search(r'^__version__ = "([^"]+)"', init_text, re.M)
+    assert pkg and code, "找不到版本号声明处（写法变了就同步改这个守卫）"
+    assert pkg.group(1) == code.group(1), (
+        f"版本漂移：pyproject.toml={pkg.group(1)}，agent/__init__.py={code.group(1)}"
+    )
