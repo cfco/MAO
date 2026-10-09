@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -58,17 +59,55 @@ def test_sensitive_paths_have_rules(needed):
     )
 
 
-@pytest.mark.parametrize("path", ["data/sessions/xxx.jsonl", ".env", ".venv/lib/x.py"])
-def test_gitignore_actually_ignores_sensitive_paths(path):
-    """用 git 自己判定规则真的生效（只看规则文本会漏掉"写了但不匹配"的情况）。"""
+def _check_ignore_isolated(tmp_path: Path, path: str) -> bool:
+    """在**只装本项目 .gitignore 的空仓**里问 git：这个路径算不算被忽略。
+
+    为什么不直接在项目根跑 `git check-ignore`（本测试曾经就是这么写的，会假红）：
+    git 的 exclude 规则来自仓库内部，但判定结果却受"这个仓库放在哪儿"牵连——把仓库
+    解压/克隆到某个会被外层规则命中的目录时（最典型的就是本仓库根 .gitignore 自己带
+    `.tmp_*`，把工作区导出到 `.tmp_verify/` 再跑），`.env.example` 会被**外层目录规则**
+    判成"被忽略"而假红；反方向同样危险：`data/` 之类若被外层规则命中，即使我们这份
+    规则写坏了也照样判"已忽略"，那是假绿。
+
+    空仓里 repo 之外的 .gitignore / info/exclude 都不参与判定，结果只取决于我们这一份
+    规则文本；系统级与用户级 exclude 也一并隔离（GIT_CONFIG_NOSYSTEM + 把 HOME 指到
+    临时目录）。
+    """
     if shutil.which("git") is None:
         pytest.skip("环境无 git，跳过")
+    repo = tmp_path / "ignore-probe"
+    repo.mkdir(exist_ok=True)  # 一个用例里可能正反各问一次，探针仓复用
+    (repo / ".gitignore").write_text(GITIGNORE.read_text(encoding="utf-8"), encoding="utf-8")
+    env = {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": str(repo),
+        "USERPROFILE": str(repo),
+        "XDG_CONFIG_HOME": str(repo),
+    }
+    init = subprocess.run(
+        ["git", "init", "-q"], cwd=str(repo), env=env, capture_output=True, text=True
+    )
+    if init.returncode != 0:
+        pytest.skip(f"git init 不可用（rc={init.returncode}）：{init.stderr.strip()}")
     r = subprocess.run(
-        ["git", "check-ignore", "-q", path], cwd=str(ROOT), capture_output=True, text=True
+        ["git", "check-ignore", "-q", "--no-index", path],
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
     )
     if r.returncode not in (0, 1):
-        pytest.skip(f"git 不可用（rc={r.returncode}）")
-    assert r.returncode == 0, f"{path} 未被 .gitignore 忽略"
+        pytest.skip(f"git check-ignore 不可用（rc={r.returncode}）：{r.stderr.strip()}")
+    return r.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "path", ["data/sessions/xxx.jsonl", ".env", ".venv/lib/x.py", "data/model_health.json"]
+)
+def test_gitignore_actually_ignores_sensitive_paths(tmp_path, path):
+    """用 git 自己判定规则真的生效（只看规则文本会漏掉"写了但不匹配"的情况）。"""
+    assert _check_ignore_isolated(tmp_path, path), f"{path} 未被本项目的 .gitignore 忽略"
 
 
 def test_ruff_extends_default_excludes_instead_of_replacing():
@@ -96,16 +135,21 @@ def _env_example_lines() -> list[str]:
     return ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
 
 
-def test_env_example_is_committable_while_env_is_not():
-    """模板要能提交（它是文档），真实 .env 必须被忽略 —— 用 git 自己判定，不看规则文本。"""
-    if shutil.which("git") is None:
-        pytest.skip("环境无 git，跳过")
-    r = subprocess.run(
-        ["git", "check-ignore", "-q", ".env.example"], cwd=str(ROOT), capture_output=True, text=True
+def test_env_example_is_committable_while_env_is_not(tmp_path):
+    """模板要能提交（它是文档），真实 .env 必须被忽略 —— 两条方向都在空仓里判定。
+
+    正反都断言：只查 `.env.example` 不被忽略，`.env` 那行规则被人写坏（比如误删）时
+    这条守卫仍然绿；只查 `.env` 被忽略，则有人加了 `.env.*` 一刀切把模板也吃掉时不会报。
+    判定走 `_check_ignore_isolated`，因此把仓库解压到 `.tmp_*` 这类会被外层规则命中的
+    目录里也不会假红。
+    """
+    assert _check_ignore_isolated(tmp_path, ".env"), (
+        ".env 没被忽略：真实端点/密钥会被提交进公开仓库"
     )
-    if r.returncode not in (0, 1):
-        pytest.skip(f"git 不可用（rc={r.returncode}）")
-    assert r.returncode == 1, ".env.example 被 .gitignore 吃掉了（`.env.*` 规则没被 ! 取反）"
+    assert not _check_ignore_isolated(tmp_path, ".env.example"), (
+        ".env.example 被 .gitignore 吃掉了（`.env.*` 之类的规则没被 ! 取反）——"
+        "它是新环境照着填的模板，必须能提交"
+    )
 
 
 def test_env_example_injects_nothing(tmp_path, monkeypatch):
