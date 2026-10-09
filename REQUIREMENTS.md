@@ -2,7 +2,7 @@
 
 > 项目：MAO（agent/ 包，入口 `mao = "agent.__main__:main"`）
 > 目标：**三个臭皮匠顶个诸葛亮**——用多个免费、较慢、较弱的模型分工协作，产出比单模型更好的结果。
-> 本文档描述当前已实现的架构与行为基准（2026-09-23 更新，替代描述旧 `src/mao/multi_ai_orchestrator.py` 骨架的历史版本）。
+> 本文档描述当前已实现的架构与行为基准（2026-10-09 更新，替代描述旧 `src/mao/multi_ai_orchestrator.py` 骨架的历史版本）。
 
 ---
 
@@ -106,16 +106,22 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 ## 9. 质量门禁
 
 - `uv run ruff check .`：E/F/W/I/B/UP，line-length 100；用 `extend-exclude = ["data"]` 追加排除运行时产物与隔离区（**不要用 `exclude`**——那是替换语义，会顶掉 ruff 默认排除表把 `.venv`/`.git` 重新纳入扫描）。
-- 解释器版本以仓库根 `.python-version` 为唯一来源（CI 用不带参数的 `uv python install` 跟随它，不写死版本号）。
-- 质量门禁的守卫测试：`tests/test_config_contract.py`（`model_registry.txt` + `.env` ↔ `config.yaml` 变量名契约）、`tests/test_repo_hygiene.py`（`.gitignore` 规则真生效、ruff 用 extend-exclude）。
+- `uv run ruff format --check .`：格式门禁。全库已按 ruff format（同一套 line-length 100 口径）对齐，CI 把它排在 lint **之前**——"风格没统一"不该和真正的 lint 报错混在同一个红叉里。本地一行修：`uv run ruff format .`。
+- 支持的 Python 版本由 CI 矩阵**显式列出**（`python: ["3.10", "3.14"]`，`fail-fast: false` 两条腿都报全）。`.python-version` 只是开发机默认（3.14），不能当唯一来源：`requires-python >= 3.10` 的下限必须有一条腿真跑过，否则用了 3.11+ 才有的特性（`tomllib` / `TaskGroup` / `datetime.UTC`）会本地全绿、用户装 3.10 才崩。矩阵是版本号的唯一显式来源，步骤里不再另写死数字。注意 `tomllib` 正是这条腿目前守着的约束——仓库里的守卫测试用行级正则读 `pyproject.toml`，不用 `tomllib`。
+- 质量门禁的守卫测试：`tests/test_config_contract.py`（`model_registry.txt` + `.env` ↔ `config.yaml` 变量名契约，无本地 `.env` 时跳过配置类核对、模型类仍由 registry 覆盖）、`tests/test_repo_hygiene.py`（`.gitignore` 规则真生效、ruff 用 extend-exclude、`.env.example` 全注释且变量名未失效、两份手写版本号一致）。
 - `uv run pytest`：全部离线（无 API key/网络），覆盖工具注册表、配置解析、LLM 重试/退避/畸形响应归一、WorkerPool 冷却/当日隔离、ask_many 整体限时与确定性顺序、结构化派工结果（`ask_many_structured`）、`health` 可用性探针、能力标签 `tags`、`run_review` 评审团、路径防穿越（工具/技能脚本）、MCP 断线重连持续重试与连接回滚、bridge stderr UTF-8、配置分层（model_registry.txt 模型名基础层 / .env 全配置覆盖层 / shell 最高 / registry 与 .env 变更失效缓存 / 行内注释剥离 / 边界双向守卫：registry 绝不带 `*_KEY`、`.env` 混入 `*_MODEL(S)` 按名告警不回显值）、模型健康（当日隔离、进程内共享、幂等、跨进程持久化、连续运行日自动下线含"未运行的日子不计入也不打断"；`tests/conftest.py` 用 `MAO_HEALTH_FILE` / `MAO_MODEL_REGISTRY_FILE` / `MAO_LATENCY_FILE` / `MAO_LATENCY_PROBE=0` 给每用例独立档案、独立 registry 且关闭延迟自动探测，防跨用例污染与意外的后台网络）等。（内部 Agent 主循环、会话持久化、LRU 缓存、并发去抖、`run_pipeline` 的用例已随功能移除。）
 - 2026-09-22 审计修复的专项回归集中在 `tests/test_audit_fixes.py`：健康档案进程内共享（含"两个实例各自先读盘、再交错记账不得互相覆盖"的 lost update 场景）且直连构造仍独立、缺省派工规模上限（pick）与自适应限时、显式名单不被上限约束、批量路径跳过项如实带回、MCP 连接共享与引用计数、计票不采信错误文本。**配套变异测试**（撤销修复 → 对应用例必须失败）确认用例非恒真。
 - 2026-09-22 第二轮全链路审计的回归集中在 `tests/test_audit2_fixes.py`（27 例）：投票分母只算有效票、健康档案写盘不阻塞隔离查询与并发落盘不留垃圾、6 项数值配置的类型容错、流水线阶段间裁剪（含窗口伸缩与按份均分）、`write_file` 覆盖留档、注入检查不误拦引号内字面量且真实拼接照拦、408/425/429/5xx 与 4xx 的重试分类。变异校验扩到多项（`tests/mutation_check.py`）；本轮变异又抓出 2 个恒真用例并修正（假 `_last_active` 被清理线程连带清理、测试 monkeypatch 掉了被测方法本身）。
 - 2026-09-23 协作层专项（问题1 冷却指数退避 / 问题2 异常停止自动恢复 / 问题5 延迟维度）的回归：`tests/test_latency.py`（15 例）与 `tests/test_core.py` 的回退段、`tests/mutation_check.py` 的 M20–M29 锚点。覆盖——冷却指数退避且封顶；跨站回退恢复（`fallback_cross_station`）与"同站候选被批次死站记忆抑制、但仍保留一次跨站兜底"；延迟档案（样本中位数、只留最近 5 条、进程内按路径共享、落盘跨实例可读回）；探测覆盖**全部节点（含冷却与当日隔离的）**且失败只丢样本、不计冷却不当日隔离；懒式到期调度与"一轮不叠一轮"；`latency_probe=0` 时绝不自动探测（离线用例零网络）；pick 延迟裁剪（>5 用最低 60%、小池落在 2~3 个、证据不足不动刀、显式 limit 不裁剪）；真实成功派工回填延迟；回退候选优先低延迟；`health` 带 `latency_ms` 与 bridge `latency` 指令。**变异锚点扩到 24 项（M1–M29，本轮新增 M23–M29）**，全部通过（无恒真用例）。
-- GitHub Actions CI：ruff + pytest。
+- 2026-10-09 第四轮全库审计（明细见 `docs/2026-10-09-工作记录.md`）的回归集中在 `tests/test_audit4_fixes.py`（17 例）＋ CLI 子进程用例（`tests/test_smoke.py`）。覆盖——三类"静默失效"：POSIX shell 家族与 `-lc` 短选项簇的内联绕过、`_bare_model` 把不带 `@` 的模型名切成空串以致连续失败 7 天的模型永远标不上 `#`（自动下线形同不存在）、单个坏 `SKILL.md` 炸掉整轮技能扫描与启动；两处并发/结构：强制探测须经 `_round_lock` 且线程起不来时回滚名额、客户端缓存（httpx/SSL 握手）不再压在池记账锁内（拆出 `_clients_lock`）；一处泄漏：所有会进 stdout 行协议或模型上下文的错误文案统一经 `agent/core/redact.py` 脱敏（URL query / `sk-` / `Bearer` / `key=`，并截断）；一处收敛：原子落盘与"同路径＝同一本账"抽成 `agent/core/ledger.py`，健康与延迟档案共用同一不变式——**取快照与写盘同在 `_write_lock` 内串行、文件 IO 一律在记账锁 `_lock` 之外**；时钟域：冷却改用 `time.monotonic()`，墙上时钟跳变不能再提前解除冷却。关键不变式做成**确定性**探针而非计时断言：包一层 `_snapshot_locked`，进去后用非阻塞 `acquire` 探 `_write_lock`，Windows 与 CI 同样稳定。
+- 变异门禁 `uv run python tests/mutation_check.py`：逐处把修复改回缺陷写法，确认对应用例真失败（非恒真）。锚点是**字面源码片段**，重构或 format 重排后会失配，失配打印 SKIP 且**计入失败**（退出码非 0）——放任锚点等于这层保护悄悄没了。当前 37 项（本轮新增 M30–M43 并重指被 format 冲散的 M1/M2/M23/M30）。
+- GitHub Actions CI 两个 job：`lint-and-test`（版本矩阵 × `ruff format --check` → `ruff check` → `pytest`）与 `mutation-gate`（`needs: lint-and-test`）。变异门禁单开 job 是因为它要起的 pytest 次数＝变异条目数，串进主流水线会把 lint+test 的反馈拖慢几分钟，而且不需要跟版本矩阵耦合。
 
 ## 10. 安全边界
 
 - MAO 不再对外开任何网络端口（Web 入口已移除）；`run_shell` 等价于把本机命令权交给主智能体（黑名单+注入拦截兜底）。
 - bridge 通过本地 stdin/stdout 通信，等价于把本机工具权交给驱动它的外部智能体，只给你信任的智能体用。
 - `.env`、key、健康档案均在本地，不出本机（MAO 不持久化会话历史）。
+- **错误文案出口脱敏**（`agent/core/redact.py`）：任何会进 stdout JSON 行协议、工具结果或模型上下文的异常文本都先掩码（URL 的 query 段 → `?<query 已隐去>`、`sk-…`/`Bearer …`/`key|token|secret|password=…` → `****`，并截断长度）。协议循环里单条指令失败只回 `{ok:false,error:类型名+脱敏文案}`，绝不把带 endpoint/key 的原文透传出去——外部主那一侧通常是另一个模型，泄漏等于把 key 写进第三方上下文。
+- **解释器内联代码一律扫描**：首词是 `python/node/pwsh` 之外，`sh/bash/zsh/dash/ksh` 同样进内联检查，且认短选项簇（`bash -lc "..."` 与 `-c` 同口径）；`--norc` 这类双横线开关不误伤。免费池不控命令内容，这层是 `run_shell` 唯一的破坏性兜底。
+- **单文件失败不炸启动**：技能扫描逐条容错（坏编码/权限不足只 stderr 警告并跳过该技能），配置缺省层可缺（registry 文件缺失＝空清单），档案写不进去只损失持久化（内存账本照常工作）。

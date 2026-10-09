@@ -11,28 +11,44 @@
 ```
 MAO/
 ├── agent/
-│   ├── __main__.py         # CLI 入口（仅 bridge 一条路线）
-│   ├── bridge.py           # 外部智能体驱动协议（谁驱动谁当主）
-│   ├── config.py           # 智能体池 AgentProfile + 协作配置
-│   ├── skills_manager.py   # Skill 机制
+│   ├── __main__.py         # CLI 入口：bridge / mcp / call 三条外壳
+│   ├── bridge.py           # 外部智能体驱动协议（谁驱动谁当主，逐行 JSON 走 stdout）
+│   ├── mcp_server.py       # 标准 MCP server（stdio）外壳，宿主可并发发工具调用
+│   ├── config.py           # 配置分层加载（shell > .env > model_registry.txt）+ 数值容错
+│   ├── model_registry.py   # model_registry.txt 的读写层：清单解析 + 自动下线标 `#`（三态、幂等）
+│   ├── skills_manager.py   # Skill 机制（单个坏文件只跳过并警告，不炸启动）
 │   ├── core/
-│   │   ├── llm.py          # LLM 适配层（OpenAI 兼容协议）
-│   │   ├── orchestrator.py # 工人池：ask / ask_many(结构化) 并行派工 + ask_vote 投票验证 + health 预检
-│   │   └── health.py       # ModelHealth：当日失败隔离档案（data/model_health.json）
+│   │   ├── llm.py          # LLM 适配层（超时/错误分类/指数退避/畸形响应归一）
+│   │   ├── orchestrator.py # WorkerPool：ask / ask_many(结构化) / vote + 冷却与健康预检
+│   │   ├── parallelism.py  # 线程并行派工 + 按规模折算的整体限时
+│   │   ├── voting.py       # 两步投票（各出方案 → 编号表决），废票不进分母
+│   │   ├── latency.py      # 延迟档案 + 懒式探测轮（缺省派工的裁剪依据）
+│   │   ├── station_gate.py # 同站串行门（max_per_station）与真实并行度折算
+│   │   ├── health.py       # ModelHealth：当日失败隔离 + 连续运行日自动下线
+│   │   ├── ledger.py       # 原子落盘公共层：快照与写盘同在写锁内、IO 在记账锁外
+│   │   ├── redact.py       # 错误文案脱敏（进 stdout 协议行或模型上下文之前）
+│   │   └── constants.py    # 状态码等共享常量
 │   └── tools/
 │       ├── base.py         # 工具基类 + 注册表
-│       ├── builtin.py      # 内置工具（shell/文件）
-│       └── mcp_client.py   # MCP 接入层（stdio/HTTP）
+│       ├── builtin.py      # 内置工具（shell/文件；覆盖前留档可回滚）
+│       ├── shell_safety.py # 黑名单 + 注入拦截 + 解释器内联代码扫描（含 POSIX shell）
+│       └── mcp_client.py   # MCP 接入层（stdio/HTTP，进程内共享 + 引用计数）
 ├── skills/                 # 技能目录（example_hello 是示例）
-├── config.yaml             # 智能体池 / MCP / 工具配置
+├── tests/                  # 全离线测试（无 key/无网络）+ mutation_check.py 变异门禁
+├── config.yaml             # 只留结构骨架（值在 .env，模型名在 model_registry.txt）
+├── model_registry.txt      # 模型清单（进 git，随仓库更新，自动下线改写它）
+├── .env.example            # 配置模板（只列变量名、每行注释掉）
+├── .github/workflows/ci.yml# 双 Python 版本矩阵 + format/lint/pytest + 独立变异门禁
 └── docs/架构方案.md
 ```
 
 更多文档：
 | 文档 | 说明 |
 |------|------|
+| [REQUIREMENTS.md](REQUIREMENTS.md) | 当前已实现的行为基准（配置项、协作语义、质量门禁、安全边界） |
 | [docs/架构方案.md](docs/架构方案.md) | 系统整体架构设计 |
 | [docs/外部主接入指南.md](docs/外部主接入指南.md) | 外部智能体（TRAE 等）通过 bridge 协议当主智能体的接入教程 |
+| `docs/YYYY-MM-DD-工作记录.md` | 各轮审计/重构的过程记录（发现的问题、修法、回归用例编号） |
 
 ## 快速开始
 
@@ -90,6 +106,10 @@ MAO/
 全部配置值都写在 `.env`（端点 / KEY / LLM 与协作参数）。仓库已带一份可直接改的 `.env`
 (随时更新并保持进 git 之外)。只需要确认四行真实密钥：
 
+新环境没有 `.env` 时：`cp .env.example .env`，把要用的那几行的行首 `#` 去掉再填值。
+模板只列**变量名**、值一律留空（别留成 `KEY=` 空串——空串会顶掉 `config.yaml` 的 `:-默认值`）；
+模型清单不在模板里，那是 `model_registry.txt` 的事（写进 `.env` 会盖住 git 更新与自动下线）。
+
 ```ini
 NODE_A_ENDPOINT=https://router.bynara.id/v1
 NODE_A_KEY=sk-你的bynara-key
@@ -142,6 +162,20 @@ echo '{"cmd":"list_agents"}' | uv run mao bridge
 ```
 
 免 key 方案：本地跑 Ollama（`base_url: http://localhost:11434/v1`，`api_key: ""`），把它作为一个普通 node 加进 `config.yaml` 的 `agents` 即可；`ask` 不指定 agent 时从池中挑一个可用工人。
+
+### 跑测试与门禁（改代码前后）
+
+```bash
+uv run pytest                          # 全离线：不碰网络、不需要任何 key
+uv run ruff format --check .           # 格式门禁（改完写法先 `uv run ruff format .` 写回）
+uv run ruff check .                    # lint（E,F,W,I,B,UP，line-length 100）
+uv run python tests/mutation_check.py  # 变异门禁：把修复改回缺陷写法，对应用例必须失败
+```
+
+四条与 `.github/workflows/ci.yml` 同源；CI 还会在 Python 3.10 与 3.14 两条腿上各跑一遍
+（`requires-python >= 3.10` 的下限必须有腿真验证过，否则用了 3.11+ 的特性会本地绿、用户装 3.10 才崩）。
+变异门禁的锚点是字面源码片段，重构/格式化后失配会打 SKIP **并计为失败**——锚点飘了等于这层保护悄悄没了，
+去 `tests/mutation_check.py` 把锚点改指新位置即可。
 
 ## 多智能体协作（核心玩法）
 
