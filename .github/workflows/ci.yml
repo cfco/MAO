@@ -8,23 +8,53 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    strategy:
+      # requires-python 写的是 >=3.10，但过去只用 .python-version（3.14）跑过：
+      # 下限从未被验证，用 3.11+ 才有的特性（tomllib / TaskGroup / datetime.UTC…）
+      # 本地全绿、用户装 3.10 才崩。两条腿都跑，出问题在 PR 上就看得见。
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
-      - name: Set up Python
-        # 解释器版本以仓库根的 .python-version 为唯一来源（不带参数时 uv 就读它）。
-        # 别在这里写死版本号：写死会与 .python-version 打架——uv 实际按后者取解释器，
-        # 写死的那个步骤变成误导性的死步骤（曾经写 3.12 而 .python-version 是 3.14）。
-        run: uv python install
+      - name: Set up Python ${{ matrix.python }}
+        # 版本号只来自上面的 matrix（矩阵是唯一显式来源）；要改支持的版本就改 matrix，
+        # 不要在某个步骤里另写死一个数字——那样会与 .python-version 打架变成死步骤。
+        run: uv python install ${{ matrix.python }}
 
       - name: Sync dependencies (incl. dev)
-        run: uv sync
+        run: uv sync --python ${{ matrix.python }}
+
+      # 格式门禁放在 lint 之前：它失败是"风格没统一"，不该和真正的 lint 报错混在一起
+      # 让人猜。本地对应命令：uv run ruff format .（写回）/ --check（只看）。
+      - name: Ruff format check
+        run: uv run --python ${{ matrix.python }} ruff format --check .
 
       - name: Ruff lint
-        run: uv run ruff check .
+        run: uv run --python ${{ matrix.python }} ruff check .
 
       - name: Pytest
-        run: uv run pytest
+        run: uv run --python ${{ matrix.python }} pytest
+
+  # 回归门禁的第二半：确认那些"防回归"的用例不是恒真断言。
+  # 单开一个 job（而不是挂在某条矩阵腿上）：这里要跑的 pytest 次数 = 变异条目数（几十次
+  # 子进程启动），和主流水线串起来会把 lint+test 的反馈拖慢好几分钟；也不需要跟版本矩阵耦合。
+  mutation-gate:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies (incl. dev)
+        # 版本仍由 .python-version 决定（不在这里重复写死版本号）
+        run: uv sync
+
+      - name: Mutation check
+        run: uv run python tests/mutation_check.py
