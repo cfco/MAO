@@ -4,8 +4,8 @@
 - 当时 WorkerPool 单文件 543 行，超 500 行约定；投票相关方法（vote / select_best /
   _run_ballot / render_answer）约 130 行，独立后 orchestrator.py 专注派工与并行，
   voting.py 专注"从候选中挑出最好"的决策逻辑，职责更清晰。
-- 后续（2026-09-23）并行派工段（_wait_gather / _effective_timeout / _spawn /
-  _run_parallel）进一步拆到 parallelism.py，orchestrator.py 已回到 ≤500 行约束。
+- 后续（2026-09-23）并行派工段（_wait_gather / _effective_timeout / _run_parallel）
+  进一步拆到 parallelism.py，orchestrator.py 已回到 ≤500 行约束。
 - 投票逻辑的复用面（将来外部主 AI 也可能直接调用 select_best 做评审候选）
   比派工更广，独立模块后 import 路径更直观。
 
@@ -194,8 +194,15 @@ class VotingMixin:
         """
         th = self._vote_threshold(threshold)
         pool = self._voter_pool(workers)
+        # 点名的投票人里有池子不存在的名字：`collect()` 会静默把它们丢掉（与 `_gather_many`
+        # 如实带回 status=missing 的行为不一致），外部主只看到"投票人变少了"、不知道名字写错了。
+        unknown = [
+            w for w in dict.fromkeys(str(x) for x in (workers or [])) if w not in self.profiles
+        ]
+        note = f"（已忽略不存在的投票人：{', '.join(unknown)}）\n" if unknown else ""
         if not pool:
-            return {"ok": False, "consensus": False, "report": "错误：没有可投票的子智能体。"}
+            why = "错误：没有可投票的子智能体。"
+            return {"ok": False, "consensus": False, "report": note + why if note else why}
 
         # 显式 timeout = 总预算：两阶段各分一半（None 时各自自适应，不折半）。
         # 收集阶段产出长方案、投票阶段只回一个数字，量级不对称，但对半分是
@@ -216,7 +223,7 @@ class VotingMixin:
             return {
                 "ok": False,
                 "consensus": False,
-                "report": "错误：所有工人均未给出可用方案，无法投票。",
+                "report": note + "错误：所有工人均未给出可用方案，无法投票。",
             }
         # 全败兜底：工人一个方案都没有、只有主方案时，主方案即唯一答案，直接宣布
         # 胜出（不再发起投票——无工人候选时投票没意义，只会报"结果无法解析"）。
@@ -243,6 +250,8 @@ class VotingMixin:
             "## 候选方案",
             *[f"[{i}] {w}：{ans[:96]}…" for i, (w, ans) in enumerate(candidates, 1)],
         ]
+        if note:
+            body.insert(0, note.rstrip("\n"))
         body.append("## 投票结果")
         for i in range(1, len(candidates) + 1):
             body.append(f"方案[{i}]: {tally.get(i, 0)}/{total} 票")

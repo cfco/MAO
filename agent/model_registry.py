@@ -31,10 +31,23 @@ RETIRE_MISSING = "missing"
 _SIZE_SUFFIX = re.compile(r"\d+[kK]?")
 
 
+def _split_value_comment(value: str) -> tuple[str, str]:
+    """把一行配置值拆成「条目串」与「行内注释」，规则与 config._load_dotenv 一致。
+
+    为什么必须一致：同一个文件有两条读取路径——`_load_dotenv` 注入 env（会剥 ` #` 注释）
+    和 `load_model_registry`/`retire_model` 直读（原先不剥）。注释粘在最后一个条目上时，
+    `m2@256k # 备注` 成为一个条目，`_bare_model` 取不出裸名 `m2`，于是**该行最后一个模型
+    永远匹配不上、自动下线对它静默失效**；同一份清单在自动发现的对账里还会被同时算成
+    added 和 retired。两侧口径必须收敛到这一个函数。
+    """
+    head, sep, tail = value.partition(" #")
+    return head.strip(), (sep + tail) if sep else ""
+
+
 def load_model_registry(path: Path) -> dict[str, str]:
     """读取模型清单文件，返回 {变量名: 值}（忽略注释行与空行）。
 
-    与 _load_dotenv 的解析规则对齐：KEY=VALUE、注释行独占、值去首尾空白。
+    与 _load_dotenv 的解析规则对齐：KEY=VALUE、注释行独占、值去首尾空白、行内注释剥离。
     文件不存在返回空 dict（不抛异常，配置分层里它是可缺省的基础层）。
     """
     out: dict[str, str] = {}
@@ -47,7 +60,7 @@ def load_model_registry(path: Path) -> dict[str, str]:
             key = key.strip()
             if not key:
                 continue
-            out[key] = val.strip()
+            out[key] = _split_value_comment(val.strip())[0]
     except OSError:
         pass  # 文件缺失/读取失败：当作空清单，不拖垮启动
     return out
@@ -95,7 +108,9 @@ def retire_model(path: Path, env_var: str, model: str) -> str:
         for i, line in enumerate(lines):
             if not line.strip().startswith(f"{env_var}="):
                 continue
-            value = line.partition("=")[2].strip()
+            # 行内注释先剥出来再拆条目：否则 `m2@256k # 备注` 会成为一个条目，
+            # 该行最后一个模型永远匹配不上、自动下线对它静默失效（见 _split_value_comment）。
+            value, comment = _split_value_comment(line.partition("=")[2].strip())
             items = _split_items(value)
             target = model.strip()
             for j, item in enumerate(items):
@@ -106,7 +121,7 @@ def retire_model(path: Path, env_var: str, model: str) -> str:
                     items[j] = "#" + item  # 加 # = 下线标记
                     changed = True
             if changed:
-                lines[i] = f"{env_var}={','.join(items)}"
+                lines[i] = f"{env_var}={','.join(items)}{comment}"
             break  # 变量名唯一，处理第一处匹配即可
         if not changed:
             return RETIRE_ALREADY if found else RETIRE_MISSING

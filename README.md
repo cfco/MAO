@@ -23,6 +23,7 @@ MAO/
 │   │   ├── parallelism.py  # 线程并行派工 + 按规模折算的整体限时
 │   │   ├── voting.py       # 两步投票（各出方案 → 编号表决），废票不进分母
 │   │   ├── latency.py      # 延迟档案 + 懒式探测轮（缺省派工的裁剪依据）
+│   │   ├── node_discovery.py # 免费节点自动发现：拉各站在线免费清单、与 registry 对账、增量写叠加层
 │   │   ├── station_gate.py # 同站串行门（max_per_station）与真实并行度折算
 │   │   ├── health.py       # ModelHealth：当日失败隔离 + 连续运行日自动下线
 │   │   ├── ledger.py       # 原子落盘公共层：快照与写盘同在写锁内、IO 在记账锁外
@@ -191,7 +192,7 @@ uv run python tests/mutation_check.py  # 变异门禁：把修复改回缺陷写
 
 ### 外部智能体驱动（谁启动谁当主）：一条内核，三种外壳
 
-任何能起子进程、能读写文本行的智能体都能当主。`bridge` 是唯一内核（13 条无状态指令，
+任何能起子进程、能读写文本行的智能体都能当主。`bridge` 是唯一内核（14 条无状态指令，
 下表），外面有两种更省事的壳：
 
 | 接入方式 | 适合谁 | 上手成本 |
@@ -200,7 +201,7 @@ uv run python tests/mutation_check.py  # 变异门禁：把修复改回缺陷写
 | **`uv run mao call <指令> '<JSON>'`** | 只有 shell/技能机制、每次调用起新进程的宿主（脚本、SKILL.md） | 一行命令拿一行 JSON，退出码表成败 |
 | **`uv run mao bridge`（裸协议）** | 要长驻、批量、自己管进出的深度集成驱动方 | 自写子进程驱动（逐行 JSON） |
 
-**MCP 接入**（宿主配置里加一段即可，13 条指令逐一映射为 MCP 工具）：
+**MCP 接入**（宿主配置里加一段即可，14 条指令逐一映射为 MCP 工具）：
 
 ```json
 {
@@ -239,14 +240,18 @@ stderr 也已在 bridge 启动时归一为 UTF-8：Windows 重定向流默认本
 | `{"cmd":"latency"}` | 延迟档案（各工人往返耗时中位数）+ 探测调度状态 |
 | `{"cmd":"latency","probe":true}` | 先同步探测一轮**全部节点**（含不可用节点）再返回 |
 | `{"cmd":"set_economy","value":true}` | 省 token 开关（二元）：运行期切换，响应回显 `economy`；非法值 `ok:false` 并保持原值 |
+| `{"cmd":"refresh_nodes"}` | 强制跑一轮免费节点自动发现：与 `model_registry.txt` 对账、增量写 `data/free_nodes.json`，并热同步进**当前运行中的池**（新增入池 / 在线消失的移出 / 人工 `#` 屏蔽的永不复活） |
 | `{"cmd":"list_tools"}` | 本地工具清单（内置+MCP+Skill） |
 | `{"cmd":"call_tool","name":"run_shell","args":{...}}` | 执行本地工具 |
 | `{"cmd":"load_skill","name":"example_hello"}` | 读技能全文 |
 | `{"cmd":"run_skill_script","skill":"...","script":"...","args":{}}` | 跑技能脚本 |
-| `{"cmd":"ask","agent":"glm-flash","prompt":"..."}` | 把池内模型当纯文本大脑用 |
-| `{"cmd":"ask_many","workers":["a","b"],"prompt":"..."}` | 同一任务并行派多个工人；返回 `workers`（结构化逐工人 ok/status/answer/elapsed_ms）+ `results`（文本） |
-| `{"cmd":"ask_vote","prompt":"...","threshold":0.5}` | 两步投票取共识 |
-| `{"cmd":"run_review","draft":"...","context":"可选"}` | 外部主给初稿，子 AI 只当评审团挑错（返回结构化 `reviews`） |
+| `{"cmd":"ask","agent":"glm-flash","prompt":"..."}` | 把池内模型当纯文本大脑用；不点名 `agent` 时可带 `tags` 选路 |
+| `{"cmd":"ask_many","workers":["a","b"],"prompt":"..."}` | 同一任务并行派多个工人；返回 `workers`（结构化逐工人 ok/status/answer/elapsed_ms）+ `results`（文本）。可选 `tags`（未点名 workers 时按能力标签选路）、`timeout`（本轮总预算秒；`0`/非法值警告后回退自适应） |
+| `{"cmd":"ask_vote","prompt":"...","threshold":0.5}` | 两步投票取共识。可选 `timeout`、`master_contribution` |
+| `{"cmd":"run_review","draft":"...","context":"可选"}` | 外部主给初稿，子 AI 只当评审团挑错（返回结构化 `reviews`）。可选 `tags`、`timeout` |
+
+> 派工指令的 `tags` / `timeout` 由协议层**透传**给内核（第五轮审计前内核一直支持、外壳从不传，文档却写了 tags）。
+> 点名 `workers` 时 `tags` 不生效——人已经由你指定。`health` 与 `list_agents` 报的都是**当前活池**。
 
 外部智能体自己的大脑在它那边；本项目给它"手"（工具/技能）和"工人"（池内模型）。
 
@@ -304,3 +309,4 @@ mcp_servers:
 - `bridge` 模式等价于把本机工具权交给驱动它的外部智能体，只给你信任的智能体用
 - ⚠ **`mao mcp` 把接入门槛降到"宿主配置里加一行"**：任何连上它的 MCP 宿主（Claude Desktop / Cursor 等）都能经 `call_tool → run_shell` 在你这台机器执行命令，而 `run_shell` 是命令卫生黑名单、**并非沙箱**（`python -c` 之类可绕，见 `builtin.py` 说明）。接入前确认信任该宿主；生产环境建议用容器 / 独立账户隔离，`tools.workspace` 只配必要目录、默认为空。
 - `config.yaml` 里若直接填 API key，注意不要外传该文件
+- **工具层不再往外送凭据**（2026-10-16 起）：`run_shell` 与技能脚本的子进程环境按名字末段剔除 `*_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD` 形态的变量（保留 PATH 等功能变量）。此前一条 `set` 就能把 `.env` 注入 `os.environ` 的全部池 key 打印进工具结果，而工具输出不过脱敏层。`read_file` 也拒绝读出 `.env` 与 `.env.*`（`.env.example` 模板仍可），覆盖留档同样跳过密钥文件。**代价**：技能脚本确实需要这类变量时必须显式传参，不再能从环境继承。

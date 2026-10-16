@@ -33,6 +33,8 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}")
 _missing_logged: set[str] = set()
 # 已警告过的"类型写错"配置项，避免同一 key 每次读取都刷屏
 _bad_value_logged: set[str] = set()
+# 免费节点叠加层默认路径（自动发现的增量写这里，绝不碰 git 跟踪的 model_registry.txt）
+_DEFAULT_OVERLAY = "data/free_nodes.json"
 
 
 def _warn_bad_value(key: str, value: Any, default: Any) -> None:
@@ -158,6 +160,9 @@ class AgentProfile:
     # 便于诊断"这批模型挂在哪一站"，也是自动下线改写（加 #）的目标行定位用。
     # 值写死在 config.yaml（非 ${VAR}）时为空。
     models_env: str = ""
+    # 免费节点发现适配器名（"kilo"/"bynara"/""=不自动发现）。由 config.yaml 各 agent
+    # 的 `discovery:` 字面量指定；发现器据此拉该站在线免费清单并与 registry 对账。
+    discovery: str = ""
 
     def brief(self) -> dict:
         """对外展示用（不含 key）。"""
@@ -210,6 +215,7 @@ class Config:
             raw_models = str(raw_item.get("models") or raw_item.get("model") or "")
             m = _ENV_PATTERN.search(raw_models)
             models_env = m.group(1) if m else ""
+            discovery = str(raw_item.get("discovery") or "").strip()
             for mi, ctx_len in model_list:
                 # 一站单模型保留站名（简洁），多模型加模型后缀保证可识别
                 pname = station if len(model_list) == 1 else f"{station}:{mi}"
@@ -226,6 +232,7 @@ class Config:
                         note=str(item.get("note", "")),
                         tags=str(item.get("tags", "")),
                         models_env=models_env,
+                        discovery=discovery,
                     )
                 )
 
@@ -509,6 +516,45 @@ class Config:
             minimum=1,
         )
 
+    # ---------- 免费节点自动发现（collaboration.*） ----------
+
+    @property
+    def free_node_discovery(self) -> bool:
+        """是否启用免费节点自动发现（默认 true）。false=完全关闭，registry 原样生效。"""
+        return self.as_bool(
+            self.collab_cfg.get("free_node_discovery", True),
+            "collaboration.free_node_discovery",
+            True,
+        )
+
+    @property
+    def free_node_interval(self) -> float:
+        """自动发现周期（秒，默认 86400=每天；<=0 关闭定时，仅手动 refresh_nodes 可触发）。"""
+        return self.as_float(
+            self.collab_cfg.get("free_node_interval", 86400),
+            "collaboration.free_node_interval",
+            86400.0,
+            minimum=0.0,
+        )
+
+    @property
+    def free_node_timeout(self) -> float:
+        """单站发现请求的超时（秒，默认 10；下限 1s）——不能沿用派工 llm.timeout，
+        否则一个卡住的站会把发现轮拖成分钟级。抓取失败只跳过该站、不动叠加层。"""
+        return self.as_float(
+            self.collab_cfg.get("free_node_timeout", 10),
+            "collaboration.free_node_timeout",
+            10.0,
+            minimum=1.0,
+        )
+
+    @property
+    def free_nodes_path(self) -> Path:
+        """免费节点叠加层（data/free_nodes.json）路径：自动发现的增量只写这里，
+        绝不改 git 跟踪的 model_registry.txt。优先级：环境变量 MAO_FREE_NODES_FILE >
+        collaboration.free_nodes_file > 默认 data/free_nodes.json。"""
+        return _free_nodes_path(self.collab_cfg)
+
     # ---------- 常规 ----------
 
     @property
@@ -609,6 +655,22 @@ def _safe_mtime(p: Path) -> float:
         return 0.0
 
 
+def _free_nodes_path(collab_cfg: dict) -> Path:
+    """免费节点叠加层（data/free_nodes.json）路径的唯一口径。
+
+    优先级：环境变量 `MAO_FREE_NODES_FILE`（测试隔离/临时指定）>
+    `collaboration.free_nodes_file`（可对模型清单与密钥无感地改路径）> `_DEFAULT_OVERLAY`。
+    写侧（`Config.free_nodes_path`，发现器落盘处）与读侧（`load_config` 套叠加层处）
+    必须共用本函数：两处各写一份时曾出现"发现写到 A、启动读 B"，自动发现结果永不生效。
+    值本身可能写成 `${COLLAB_FREE_NODES_FILE:-data/free_nodes.json}`，故先插值再判定绝对路径。
+    """
+    rel = os.environ.get("MAO_FREE_NODES_FILE") or str(
+        _interpolate(collab_cfg.get("free_nodes_file", _DEFAULT_OVERLAY))
+    )
+    p = Path(rel)
+    return p if p.is_absolute() else ROOT / p
+
+
 def load_config(path: Path | None = None, force: bool = False) -> Config:
     """加载 config.yaml 并做环境变量插值。
 
@@ -627,7 +689,12 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
 
     调用方可频繁调用本函数，只有配置真正变化时才解析。
     """
-    global _cfg_cache, _cfg_cache_mtime, _cfg_cache_dotenv_mtime, _cfg_cache_registry_mtime
+    global \
+        _cfg_cache, \
+        _cfg_cache_mtime, \
+        _cfg_cache_dotenv_mtime, \
+        _cfg_cache_registry_mtime, \
+        _cfg_cache_overlay_mtime
     global _dotenv_keys
     p = path or (ROOT / "config.yaml")
     cacheable = path is None
@@ -641,9 +708,30 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     _load_dotenv(registry_path, injected)  # 基础层：模型清单
     env_names = _load_dotenv(dotenv_path, injected)  # 配置层：端点/KEY/参数
 
+    # config.yaml 先读出来：叠加层路径要取 collaboration.free_nodes_file（下面插值也用同一份）。
+    data: dict = {}
+    if p.exists():
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+
+    # 免费节点叠加层：在插值前把"自动发现"的增量（added/retired）叠加到对应
+    # NODE_*_MODELS 变量上。registry 仍是唯一真源，叠加层只做增量修正；
+    # 抓取失败/MAO_FREE_NODE_PROBE=0 时 apply_overlay 整段跳过，离线安全。
+    # 路径必须走 _free_nodes_path（与 Config.free_nodes_path 同一函数）：旧写法在这里只认
+    # MAO_FREE_NODES_FILE 和硬编码默认，而写侧认 collaboration.free_nodes_file —— 配了该值的
+    # 用户"发现写到 A、启动读 B"，发现结果永不生效。路径也不能只在 try 里赋值：import 一旦
+    # 失败，下面 `_safe_mtime(overlay_path)` 就是 UnboundLocalError，启动直接崩。
+    overlay_path = _free_nodes_path(data.get("collaboration") or {})
+    try:
+        from .core.node_discovery import apply_overlay as _apply_free_node_overlay
+
+        _apply_free_node_overlay(overlay_path)
+    except Exception:  # noqa: BLE001 - 叠加层读写异常绝不影响启动
+        pass
+
     cfg_mtime = _safe_mtime(p)
     dotenv_mtime = _safe_mtime(dotenv_path)
     registry_mtime = _safe_mtime(registry_path)
+    overlay_mtime = _safe_mtime(overlay_path)
     if (
         cacheable
         and not force
@@ -651,6 +739,7 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
         and _cfg_cache_mtime == cfg_mtime
         and _cfg_cache_dotenv_mtime == dotenv_mtime
         and _cfg_cache_registry_mtime == registry_mtime
+        and _cfg_cache_overlay_mtime == overlay_mtime
     ):
         return _cfg_cache
     # mtime 变化 / 强制重载 / 首次加载：读磁盘 → 构建 Config → 更新缓存
@@ -676,9 +765,6 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
             "导致模型新增/下线看似失效——建议删掉这几行。",
             file=sys.stderr,
         )
-    data: dict = {}
-    if p.exists():
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     cfg = Config(_interpolate(data), raw=data)
     if not cacheable:
         return cfg  # 显式路径：不进全局缓存，避免污染/错拿默认配置的缓存
@@ -686,6 +772,7 @@ def load_config(path: Path | None = None, force: bool = False) -> Config:
     _cfg_cache_mtime = cfg_mtime
     _cfg_cache_dotenv_mtime = dotenv_mtime
     _cfg_cache_registry_mtime = registry_mtime
+    _cfg_cache_overlay_mtime = overlay_mtime
     return _cfg_cache
 
 
@@ -694,4 +781,5 @@ _cfg_cache: Config | None = None
 _cfg_cache_mtime: float = 0.0  # config.yaml 的 mtime，变化即重载
 _cfg_cache_dotenv_mtime: float = 0.0  # .env 的 mtime，变化即重载
 _cfg_cache_registry_mtime: float = 0.0  # model_registry.txt 的 mtime，变化即重载
+_cfg_cache_overlay_mtime: float = 0.0  # data/free_nodes.json 的 mtime，变化即重载
 _dotenv_keys: set[str] = set()  # 由 dotenv 文件注入的变量名（热加载时需更新）

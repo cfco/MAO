@@ -209,3 +209,28 @@ def test_version_is_declared_consistently():
     assert pkg.group(1) == code.group(1), (
         f"版本漂移：pyproject.toml={pkg.group(1)}，agent/__init__.py={code.group(1)}"
     )
+
+
+def test_test_harness_keeps_all_runtime_stores_outside_repo():
+    """ "全离线、不弄脏仓库"这两条承诺的可执行守卫（审计 P0）。
+
+    WorkerPool 建池会起两个后台线程（延迟探测、免费节点发现），并按 config 落三份档案 +
+    改写模型清单。conftest 少设一个隔离变量，后果不是测试变红而是**静默真打外网、写进仓库内
+    文件**：实测过 `data/free_nodes.json` 被一次 pytest 写脏，而它又经 `apply_overlay` 反过来
+    改变下一次真实运行的池子。故这里守住"任何由测试构造出来的落盘目标都在仓库之外"。
+    """
+    from agent.config import ROOT, load_config
+
+    cfg = load_config()
+    targets = {
+        "健康档案": cfg.model_health_path,
+        "延迟档案": cfg.model_latency_path,
+        "免费节点叠加层": cfg.free_nodes_path,
+        "自动下线改写目标": cfg.model_registry_path,
+    }
+    for label, p in targets.items():
+        assert ROOT not in p.parents, f"{label} 指向仓库内 {p}：测试隔离失效，会写脏真实文件"
+    assert os.environ.get("MAO_LATENCY_PROBE") == "0", "延迟自动探测必须关，否则首个派工就真打网络"
+    assert os.environ.get("MAO_FREE_NODE_PROBE") == "0", (
+        "免费节点发现必须关，否则建池就真打 api.kilo.ai"
+    )

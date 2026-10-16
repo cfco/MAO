@@ -55,7 +55,7 @@ def test_ballot_denominator_excludes_invalid_votes(monkeypatch):
     it = iter(answers)
 
     class FakeClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             if messages[-1]["content"].startswith("候选方案"):
                 with lock:
                     v = next(it, "1")
@@ -76,7 +76,7 @@ def test_ballot_all_invalid_returns_none(monkeypatch):
     pool = _pool("m1,m2")
 
     class FakeClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             return {"role": "assistant", "content": "99 号"}
 
     monkeypatch.setattr(orch, "LLMClient", lambda *a, **k: FakeClient())

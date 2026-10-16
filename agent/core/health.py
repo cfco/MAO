@@ -207,6 +207,42 @@ class ModelHealth(AtomicJsonLedger):
         payload = {"version": 2, "active_dates": list(self._active), "models": self._data}
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
+    def _disk_for_merge(self):
+        """写盘前重读档案，供 `_merge_disk_locked` 并上别的进程写的记录。"""
+        try:
+            raw = json.loads(self.store_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    def _merge_disk_locked(self, disk: dict) -> None:  # 调用方持 _lock
+        """把对端进程已落盘的记录并进内存账本（并集，不做时间仲裁）。
+
+        为什么必须并：`get_health` 的进程内共享护不住多进程场景——外部主经常同时开几个
+        `mao call`，各进程各持一份内存账本、`write()` 又整篇覆盖，实测两轮并发记账
+        6/6 只剩后写那一份。被抹掉的可能是"某模型今天终态失败"的隔离记录，也可能是别人
+        刚登记的运行日（→ 下线连击窗口被悄悄改写）。
+        合并口径保持单调：`fail_dates`/`active_dates` 取并集后各自仍受 `_MAX_*` 裁剪，
+        `disabled` 取两者中更早的那天（下线日期不该被后写者推后）。
+        """
+        self._ensure_loaded()
+        d_models = disk.get("models")
+        if isinstance(d_models, dict):
+            for name, entry in d_models.items():
+                if not isinstance(entry, dict):
+                    continue
+                mine = self._data.setdefault(name, {})
+                dates = sorted(
+                    set(mine.get("fail_dates") or []) | set(entry.get("fail_dates") or [])
+                )
+                mine["fail_dates"] = dates[-_MAX_DATES_KEPT:]
+                days = [d for d in (entry.get("disabled"), mine.get("disabled")) if d]
+                if days:
+                    mine["disabled"] = min(days)
+        d_active = [d for d in (disk.get("active_dates") or []) if isinstance(d, str)]
+        if d_active:
+            self._active = sorted(set(self._active) | set(d_active))[-_MAX_ACTIVE_KEPT:]
+
     def snapshot(self) -> dict[str, dict]:
         """当前档案的浅拷贝（诊断/测试用，不含任何密钥）。"""
         with self._lock:

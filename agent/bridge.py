@@ -18,6 +18,7 @@
   {"cmd":"latency"}                                       （延迟档案 + 探测调度状态）
   {"cmd":"latency","probe":true}                          （先同步探测一轮全部节点再回包）
   {"cmd":"set_economy","value":true}                      （运行期切"省 token"开关，返回新状态）
+  {"cmd":"refresh_nodes"}                                 （强制跑一轮免费节点发现：新增/下架自动适配，热同步进池）
   {"cmd":"list_tools"}
   {"cmd":"call_tool","name":"run_shell","args":{"command":"dir"}}
   {"cmd":"load_skill","name":"example_hello"}
@@ -78,6 +79,22 @@ def _parse_economy(raw) -> bool | None:
     return None
 
 
+def _norm_timeout(raw) -> float | None:
+    """把请求里的 timeout 规范成秒数；缺省/非法 → None（让内核按规模自适应）。
+
+    必须过一遍再传：内核把它当"总预算"直接 `float(timeout)`，外部主传 `"120"` 还能蒙对，
+    传 `0`/`"很多"` 就分别是"限时 0 秒（全员判未完成）"与 TypeError。与数值配置同一态度：
+    非法值警告一次并回退自适应，不阻塞派工。
+    """
+    if raw is None or raw == "":
+        return None
+    val = Config.as_float(raw, "request.timeout", 0.0, minimum=0.0)
+    if val <= 0:
+        print(f"[bridge] timeout={raw!r} 不是正秒数，已回退自适应限时", file=sys.stderr)
+        return None
+    return val
+
+
 class Bridge:
     """一个 bridge 连接：共享的注册表 + 技能 + MCP 连接组 + 工人池。"""
 
@@ -111,10 +128,12 @@ class Bridge:
             return {
                 "ok": True,
                 "version": __version__,
-                "agents": [p.name for p in self.cfg.agent_profiles],
+                # 读**活池**而不是 cfg.agent_profiles：热同步（refresh_nodes）只改工人池，
+                # 静态配置不会跟着变，主若按这份清单点名就会撞到"不存在"的工人。
+                "agents": list(self.workers.profiles),
             }
         if cmd == "list_agents":
-            return {"ok": True, "agents": [p.brief() for p in self.cfg.agent_profiles]}
+            return {"ok": True, "agents": [p.brief() for p in self.workers.profiles.values()]}
         if cmd == "list_tools":
             return {"ok": True, "tools": self.registry.info_list()}
         if cmd == "health":
@@ -152,6 +171,11 @@ class Bridge:
                 }
             self._economy = val
             return {"ok": True, "economy": self._economy}
+        if cmd == "refresh_nodes":
+            # 手动强制跑一轮免费节点发现：拉各站在线免费清单 → 对账 → 写叠加层
+            # data/free_nodes.json，并热同步进当前运行中的工人池（不重启即生效）。
+            # 增量语义：新增免费模型进池、在线消失的移出池、人工 # 屏蔽的永不自动复活。
+            return {"ok": True, **self.workers.refresh_free_nodes_now()}
         if cmd == "call_tool":
             name = str(req.get("name", ""))
             res = self.registry.run(name, req.get("args") or {})
@@ -188,7 +212,8 @@ class Bridge:
                 return {"ok": False, "answer": "", "status": r["status"], "error": r["error"]}
             # 未指定 agent：从池中挑一个当前可用工人（即"主模型"充当兜底），
             # 复用工人池的健康/冷却/回退链，不再需要单独的兜底单模型配置。
-            pool = self.workers.pick(limit=1)
+            # tags：内核一直支持按能力标签选路，但协议层原先从不透传（文档却写了这个参数）。
+            pool = self.workers.pick(limit=1, tags=req.get("tags"))
             if not pool:
                 return {
                     "ok": False,
@@ -205,9 +230,10 @@ class Bridge:
                 return {"ok": False, "error": "prompt 不能为空"}
             # 一次收集，同时回结构化（外部主程序化消费）与文本（人读）
             recs = self.workers.ask_many_structured(
-                _norm_workers(req.get("workers")) or self.workers.pick(),
+                _norm_workers(req.get("workers")) or self.workers.pick(tags=req.get("tags")),
                 prompt,
                 req.get("system"),
+                timeout=_norm_timeout(req.get("timeout")),
             )
             text = "\n\n".join(
                 f"### 工人 {r['worker']} 的结果\n"
@@ -226,8 +252,9 @@ class Bridge:
                 return {"ok": False, "error": "prompt 不能为空"}
             v = self.workers.vote(
                 prompt,
-                _norm_workers(req.get("workers")),
+                _norm_workers(req.get("workers")) or None,
                 req.get("threshold"),
+                timeout=_norm_timeout(req.get("timeout")),
                 master_contribution=req.get("master_contribution"),
             )
             # #2：vote 返回结构化 {ok, consensus, report}——ok=投票是否真正产出结果，
@@ -241,14 +268,16 @@ class Bridge:
             if not draft:
                 return {"ok": False, "error": "draft 不能为空（外部主给出初稿，子 AI 只当评审团）"}
             context = str(req.get("context", "")).strip()
-            reviewers = _norm_workers(req.get("workers")) or self.workers.pick()
+            reviewers = _norm_workers(req.get("workers")) or self.workers.pick(tags=req.get("tags"))
             prompt = (
                 "请作为独立评审，针对下面的稿件给出问题清单与**编号**改进建议，"
                 "直接挑错、给方向，不要客套、不要整段复述原文。\n"
                 + (f"【背景 / 验收标准】{context}\n" if context else "")
                 + f"【待评审稿件】\n{draft}"
             )
-            recs = self.workers.ask_many_structured(reviewers, prompt, REVIEW_SYSTEM)
+            recs = self.workers.ask_many_structured(
+                reviewers, prompt, REVIEW_SYSTEM, timeout=_norm_timeout(req.get("timeout"))
+            )
             usable = any(r["ok"] for r in recs)
             out = {"ok": usable, "reviews": recs}
             if not usable:
@@ -304,7 +333,7 @@ def serve(cfg: Config) -> None:
         "ok": True,
         "event": "ready",
         "version": __version__,
-        "agents": [p.name for p in bridge.cfg.agent_profiles],
+        "agents": list(bridge.workers.profiles),
         "mcp": bridge.mcp_status,
         "economy": bridge._economy,  # 省 token 开关初始值，外部主握手即可知当前模式
     }

@@ -81,25 +81,35 @@ def test_env_pattern_distinguishes_missing_default():
 def test_config_referenced_vars_are_covered_by_registry_and_env():
     """config.yaml 引用的每个 ${VAR}，要么有 :-默认值，要么在 model_registry.txt 或 .env 里有定义。
 
-    本地没有 .env（如 CI / 新克隆未配置）时跳过：该测试防的是"变量无处可填"，
-    无 .env 便无从核对配置类变量，而模型类变量仍由 registry 覆盖（见下一测试的护栏）。
-    只要有一个"引用了但没定义也没默认"的变量，程序启动就会空配置。
+    拆成两半（审计 P1：旧写法无 .env 就整条 skip，而 CI 的干净克隆**永远**没有 .env，
+    于是"变量名两边对得上"这条核心契约在 CI 上一次都没执行过）：
+    - 模型清单类变量（`*_MODELS`/`*_MODEL`）的真源是**进 git 的** model_registry.txt，
+      CI 与新克隆同样能核、也必须核 → 恒断言，不 skip；
+    - 端点 / KEY / 协作参数这类只可能出现在本地 .env 的变量 → 缺 .env 时才跳过。
+    只要有一个"引用了但没定义也没默认"的变量，程序启动就会拿到空配置。
     """
     refs = _config_referenced_vars()
     # 护栏：解析出足够多的引用，避免 pattern/解析失效后测试变成空转
     assert len(refs) >= 6, f"只解析到 {len(refs)} 个引用，解析逻辑可能已失效：{refs}"
-    defined = set(_parse_plain(MODEL_REGISTRY))
-    if DOTENV.exists():
-        defined |= set(_parse_plain(DOTENV))
+    registry_defined = set(_parse_plain(MODEL_REGISTRY))
 
+    model_refs = [k for k, default in refs if default is None and k.endswith(("_MODELS", "_MODEL"))]
+    assert model_refs, "config.yaml 里应当有模型清单类引用，解析可能变了"
+    missing = sorted(k for k in model_refs if k not in registry_defined)
+    assert not missing, (
+        f"这些模型清单变量被 config.yaml 引用、却没有 :-默认值，"
+        f"而进 git 的 model_registry.txt 里也没有：{missing}"
+    )
+
+    if not DOTENV.exists():
+        pytest.skip("无本地 .env：配置类变量（端点/KEY/参数）留待本地核对，模型清单已恒断言覆盖")
+
+    defined = registry_defined | set(_parse_plain(DOTENV))
     uncovered = sorted(k for k, default in refs if default is None and k not in defined)
-    if DOTENV.exists():
-        assert not uncovered, (
-            f"这些变量 config.yaml 引用了，但 .env / model_registry.txt 都没提供、"
-            f"也没有 :-默认值：{uncovered}；它们插值后是空串。"
-        )
-    else:
-        pytest.skip(f"无本地 .env，跳过配置类核对；模型类变量 {sorted(defined)} 均已覆盖")
+    assert not uncovered, (
+        f"这些变量 config.yaml 引用了，但 .env / model_registry.txt 都没提供、"
+        f"也没有 :-默认值：{uncovered}；它们插值后是空串。"
+    )
 
 
 def test_registry_has_no_dead_vars():

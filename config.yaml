@@ -16,11 +16,14 @@ agents:
     base_url: ${NODE_A_ENDPOINT}
     api_key: ${NODE_A_KEY}
     models: ${NODE_A_MODELS}          # 模型清单变量（model_registry.txt 维护）
+    # 注：bynara 站**未接入**自动发现（其 /v1/models 只认 API Key 且免费档字段样本拿不到），
+    # 退回静态站——免费模型变化沿用 model_registry.txt 手写 + 连续失败 7 天自动下线。
     note: 中转站A免费token
   - name: node-b                      # 中转站 B
     base_url: ${NODE_B_ENDPOINT}
     api_key: ${NODE_B_KEY}
     models: ${NODE_B_MODELS}
+    discovery: kilo                  # 自动发现适配器：公开网关 api.kilo.ai/api/gateway/models（无需登录）
     note: 中转站B免费token
 
   - name: node-c                      # 站点 C：Google Gemini 免费档
@@ -87,6 +90,19 @@ collaboration:
   latency_keep_ratio: ${COLLAB_LATENCY_KEEP_RATIO:-0.6}
   # 已知延迟的候选少于该数则不裁剪（冷启动保护：没数据就不动刀）
   latency_min_samples: ${COLLAB_LATENCY_MIN_SAMPLES:-2}
+
+  # ---- 免费节点自动发现（见 agent/core/node_discovery.py）----
+  # 免费档模型清单会随时间变化（新增/下架），本机制按"站"挂适配器拉在线清单、与
+  # model_registry.txt 对账、把增量写进 data/free_nodes.json 叠加层（绝不改 git 文件）：
+  # 新增免费模型自动入池、在线消失的自动移出、人工 # 屏蔽的永不自动复活。
+  free_node_discovery: ${COLLAB_FREE_NODE_DISCOVERY:-true}  # 总开关：false=完全关闭
+  # 自动发现周期（秒）：默认 86400=每天探一轮（<=0 关闭定时，仅 manual refresh_nodes 可触发）。
+  # MAO_FREE_NODE_PROBE=0 也可整段关闭（离线/测试用，与 MAO_LATENCY_PROBE 同款开关）。
+  free_node_interval: ${COLLAB_FREE_NODE_INTERVAL:-86400}
+  # 单站发现请求超时（秒）：不能沿用派工 llm.timeout，否则卡住的站会把发现轮拖成分钟级。
+  free_node_timeout: ${COLLAB_FREE_NODE_TIMEOUT:-10}
+  # 叠加层落盘位置：增量（added/retired）只写这里，registry 仍是唯一真源、git pull 不冲突。
+  free_nodes_file: ${COLLAB_FREE_NODES_FILE:-data/free_nodes.json}
 
 tools:
   shell_timeout: ${TOOLS_SHELL_TIMEOUT:-120}  # 单条命令最长执行秒数

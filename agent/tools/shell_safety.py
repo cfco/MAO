@@ -54,8 +54,10 @@ _CMD_DANGEROUS_SET = frozenset(_CMD_DANGEROUS)
 _CMD_WRAPPER = re.compile(r"^\s*cmd(?:\.exe)?\s*/[ck]\s+", re.IGNORECASE)
 # Windows 可执行后缀：format.com / del.exe 等真实二进制要归一到命令词再比对
 _EXE_SUFFIXES = (".exe", ".com")
-# 命令分隔符：一次请求里可能串多条命令（echo x & del /s y），每段的首词都要查
-_CMD_SEPARATOR = re.compile(r"&&|\|\||[&|;]")
+# 命令分隔符：一次请求里可能串多条命令（echo x & del /s y），每段的首词都要查。
+# 必须含换行：cmd.exe 也把换行当命令分隔符执行，而含 `>` 的命令一律走 shell=True，
+# 于是 `echo a>nul` + 换行 + `del /f /q x` 的首词只会是 echo，整条黑名单被绕过（实测放行）。
+_CMD_SEPARATOR = re.compile(r"&&|\|\||[&|;\r\n]")
 
 # PowerShell 危险命令（带破坏性参数才拦）
 _PS_DANGEROUS = [
@@ -146,6 +148,12 @@ def _check_redirect_targets(command: str) -> str | None:
         if target.startswith("&"):
             continue
         low = target.lower()
+        # 环境变量/家目录写法（%USERPROFILE%\\x、$env:TEMP\\x、~/x）要展开后才决定落点，
+        # 静态检查看不到展开结果 → 一律当作可能写出项目根拒绝（实测旧写法直接放行）。
+        if "%" in target or target.startswith(("$", "~")):
+            return (
+                f"命令拦截：重定向目标 `{target}` 含环境变量/家目录展开，落点无法静态确认，已拒绝"
+            )
         # 设备名放行（NUL/CON/PRN/AUX/COMx/LPTx 等）
         if re.match(r"^(nul|con|prn|aux|com[1-9]|lpt[1-9])(\.|$)", low):
             continue
@@ -180,11 +188,34 @@ def _head_word(segment: str) -> str:
     parts = _strip_wrapping_quotes(tokens[0]).strip().split()
     if not parts:
         return ""
-    low = parts[0].replace("\\", "/").rsplit("/", 1)[-1].lower()  # 去路径前缀
+    # 剥 cmd 的 `^` 转义符：cmd 执行时 `de^l` 会还原成 del，而原先首词按 `de^l` 比对，黑名单形同虚设
+    low = parts[0].replace("^", "").replace("\\", "/").rsplit("/", 1)[-1].lower()  # 去路径前缀
     for suf in _EXE_SUFFIXES:
         if low.endswith(suf):
             return low[: -len(suf)]
     return low
+
+
+_UNQUOTE_CHARS = re.compile(r'["\']')
+
+
+def _check_powershell_encoding(command: str) -> str | None:
+    """整条命令（含被引号包裹的正文）里出现 powershell + -EncodedCommand 一律拒。
+
+    为什么不能只按首词判定：`echo hi & powershell -enc AAAA=` 的首词是 echo，
+    `cmd /c "powershell -enc AAAA="` 的正文藏在引号里（shlex 拆出来是一整串）——
+    两种写法都绕过原先"首词是 powershell 才检查"的分支。base64 编码的命令正文静态扫不动，
+    只能整类拒绝。`-executionpolicy` 不会被误伤：前缀判定只认 encodedcommand 的缩写。
+    """
+    flat = _UNQUOTE_CHARS.sub(" ", command)
+    for seg in _CMD_SEPARATOR.split(flat):
+        toks = [t.lower() for t in seg.split()]
+        if not any(t in ("powershell", "powershell.exe", "pwsh", "pwsh.exe") for t in toks):
+            continue
+        for t in toks:
+            if t.startswith("-") and _is_encoded_cmd_flag(t):
+                return "命令拦截：PowerShell -EncodedCommand 可能掩盖危险操作，拒绝执行"
+    return None
 
 
 def _command_heads(command: str) -> list[str]:
@@ -336,6 +367,10 @@ def _check_command_safety(command: str) -> str | None:
     stripped = command.strip()
     if not stripped:
         return None
+    if "\r" in command or "\n" in command:
+        # 与上面的切段是双保险：一条工具调用就该是一条命令，直接拦在入口，
+        # 免得后续任何"按整串处理"的环节把第二行当参数放过。
+        return "命令拦截：一条命令里不能含换行（cmd 会把换行当分隔符执行后面的内容），已拒绝"
 
     # ---- 1. 注入模式扫描 ----
     # 先屏蔽引号内的字面量：`echo "a|b|c"` 的管道不是命令拼接，不该拦。屏蔽后
@@ -353,6 +388,11 @@ def _check_command_safety(command: str) -> str | None:
     redirect_danger = _check_redirect_targets(stripped)
     if redirect_danger:
         return redirect_danger
+
+    # ---- 1.6 PowerShell -EncodedCommand：按内容查、不按首词查（见函数文档的两个绕过点）----
+    ps_enc = _check_powershell_encoding(stripped)
+    if ps_enc:
+        return ps_enc
 
     # ---- 2. 危险命令匹配 ----
     heads = _command_heads(stripped)

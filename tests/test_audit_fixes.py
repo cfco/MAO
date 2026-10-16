@@ -144,12 +144,24 @@ def test_pick_filters_by_tags():
     assert sorted(pool.pick()) == ["coder", "reader"], "不带 tags 则全给"
 
 
+def _worst(pool) -> float:
+    """一次派工的最坏墙钟（重试+退避都算）：断言与实现同源，不写死 magic number。"""
+    from agent.core.llm import worst_case_per_request
+
+    return worst_case_per_request(
+        float(pool.cfg.llm_cfg.get("timeout", 120) or 120),
+        int(pool.cfg.llm_cfg.get("max_retries", 2) or 0),
+    )
+
+
 def test_effective_timeout_scales_with_batches_and_respects_explicit():
     pool = _pool("m1,m2,m3,m4,m5", cap=5, max_workers=3)
-    assert pool._effective_timeout(1, None) == 150.0, "1 批 = 120 + 30 余量"
-    assert pool._effective_timeout(3, None) == 150.0, "3 名刚好 1 批"
-    assert pool._effective_timeout(5, None) == 270.0, "5 名 = 2 批"
-    assert pool._effective_timeout(25, None) == 1110.0, "25 名 = 9 批（固定 300s 会截断尾部）"
+    w = _worst(pool)
+    assert w == 3 * 120 + 2 * 61.0, "默认 120s x 3 次尝试 + 2 次退避（封顶 60s + 1s jitter）"
+    assert pool._effective_timeout(1, None) == w + 30.0, "1 批 = 一次派工的最坏墙钟 + 30 余量"
+    assert pool._effective_timeout(3, None) == w + 30.0, "3 名刚好 1 批"
+    assert pool._effective_timeout(5, None) == 2 * w + 30.0, "5 名 = 2 批"
+    assert pool._effective_timeout(25, None) == 9 * w + 30.0, "25 名 = 9 批（固定 300s 会截断尾部）"
     assert pool._effective_timeout(25, 0.3) == 0.3, "调用方显式指定优先"
 
 
@@ -290,7 +302,7 @@ def test_ballot_still_parses_normal_vote(monkeypatch):
     worker = pool.names()[0]
 
     class OkClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             return {"role": "assistant", "content": "我选第 2 个"}
 
     monkeypatch.setattr(orch, "LLMClient", lambda *a, **k: OkClient())

@@ -3,7 +3,7 @@
 为什么要有这一层：bridge 的裸 JSON 行协议要求每个接入方自己写子进程驱动
 （握手、逐行读写、UTF-8 归一），接一次麻烦一次。而主流宿主（Claude Desktop /
 Cursor / Qoder / 千问办公等）几乎都内置了 MCP client——本模块把 Bridge 的
-13 条指令逐一映射为 MCP 工具，接入退化为在宿主配置里加一段
+14 条指令逐一映射为 MCP 工具，接入退化为在宿主配置里加一段
 `{"command": "uv", "args": ["run", "mao", "mcp"]}`，协议细节全部由 MCP 消化。
 
 实现取向：不复制任何业务逻辑，每个工具都只是把入参拼成 bridge 请求、原样调
@@ -76,6 +76,14 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
     def set_economy(value: bool) -> dict:
         return _h({"cmd": "set_economy", "value": value})
 
+    @app.tool(
+        name="refresh_nodes",
+        description="强制跑一轮免费节点自动发现：拉各站在线免费清单、与 model_registry.txt 对账、"
+        "把增量写进叠加层并热同步进当前工人池（新增入池/下架出池/人工 # 屏蔽的永不复活）",
+    )
+    def refresh_nodes() -> dict:
+        return _h({"cmd": "refresh_nodes"})
+
     @app.tool(name="list_tools", description="可用本地工具清单（内置 + MCP + Skill）")
     def list_tools() -> dict:
         return _h({"cmd": "list_tools"})
@@ -96,8 +104,16 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
         name="ask",
         description="把池内某个模型当纯文本子 AI 用；不指定 agent 时自动从池中挑一个可用工人",
     )
-    def ask(prompt: str, agent: str = "", system: str = "") -> dict:
-        return _h({"cmd": "ask", "prompt": prompt, "agent": agent, "system": system or None})
+    def ask(prompt: str, agent: str = "", system: str = "", tags: str = "") -> dict:
+        return _h(
+            {
+                "cmd": "ask",
+                "prompt": prompt,
+                "agent": agent,
+                "system": system or None,
+                "tags": tags or None,
+            }
+        )
 
     @app.tool(
         name="ask_many",
@@ -105,26 +121,67 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
         "返回 workers 结构化逐工人结果（顺序与入参一致）+ results 文本；"
         "workers 缺省取前 N 个可派工人（collaboration.max_participants）",
     )
-    def ask_many(prompt: str, workers: list[str] | None = None, system: str = "") -> dict:
+    def ask_many(
+        prompt: str,
+        workers: list[str] | None = None,
+        system: str = "",
+        tags: str = "",
+        timeout: float | None = None,
+    ) -> dict:
         return _h(
-            {"cmd": "ask_many", "prompt": prompt, "workers": workers, "system": system or None}
+            {
+                "cmd": "ask_many",
+                "prompt": prompt,
+                "workers": workers,
+                "system": system or None,
+                "tags": tags or None,
+                "timeout": timeout,
+            }
         )
 
     @app.tool(
         name="ask_vote", description="两步投票取共识：各出方案→对编号投票→超阈值给出胜出方案全文"
     )
     def ask_vote(
-        prompt: str, workers: list[str] | None = None, threshold: float | None = None
+        prompt: str,
+        workers: list[str] | None = None,
+        threshold: float | None = None,
+        timeout: float | None = None,
+        master_contribution: str | None = None,
     ) -> dict:
-        return _h({"cmd": "ask_vote", "prompt": prompt, "workers": workers, "threshold": threshold})
+        return _h(
+            {
+                "cmd": "ask_vote",
+                "prompt": prompt,
+                "workers": workers,
+                "threshold": threshold,
+                "timeout": timeout,
+                "master_contribution": master_contribution,
+            }
+        )
 
     @app.tool(
         name="run_review",
         description="调用方给初稿（draft）+可选背景（context），多个工人只当评审团挑错；"
         "返回结构化 reviews",
     )
-    def run_review(draft: str, context: str = "", workers: list[str] | None = None) -> dict:
-        return _h({"cmd": "run_review", "draft": draft, "context": context, "workers": workers})
+    def run_review(
+        draft: str,
+        context: str = "",
+        workers: list[str] | None = None,
+        tags: str = "",
+        timeout: float | None = None,
+    ) -> dict:
+        return _h(
+            {
+                "cmd": "run_review",
+                "draft": draft,
+                "context": context,
+                "workers": workers,
+                "tags": tags or None,
+                "timeout": timeout,
+            }
+        )
 
     return app, bridge
 

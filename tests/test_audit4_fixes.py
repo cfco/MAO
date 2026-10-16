@@ -150,7 +150,7 @@ def test_llm_fallback_error_does_not_leak_key(monkeypatch):
         def __init__(self, *a, **k):
             pass
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             raise RuntimeError(f"400 Bad Request: https://gw.test/v1?api_key={secret}")
 
     pool = _pool("m1")
@@ -275,7 +275,7 @@ def test_chat_gated_releases_station_gate_on_failure():
     gate = pool._station_gate(station)
 
     class Boom:
-        def chat(self, messages):
+        def chat_once(self, messages):
             raise RuntimeError("boom")
 
     resp, err, ms = pool._chat_gated(Boom(), station, [{"role": "user", "content": "x"}])

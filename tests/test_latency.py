@@ -286,7 +286,7 @@ def test_probe_uses_short_timeout_and_no_retry(tmp_path, monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             captured.append({"model": model, **kw})
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             return {"role": "assistant", "content": "pong"}
 
         def close(self):
@@ -396,7 +396,7 @@ def test_successful_dispatch_backfills_latency(tmp_path, monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             time.sleep(0.02)
             return {"role": "assistant", "content": "ok"}
 
@@ -416,7 +416,7 @@ def test_fallback_prefers_low_latency_peer(tmp_path, monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             if self.model == "m1":
                 raise LLMError("rate_limit", "429", retryable=True)  # 仅 m1 瞬时失败
             return {"role": "assistant", "content": f"ok-from-{self.model}"}

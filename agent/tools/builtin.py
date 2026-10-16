@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess  # 顶层 import：测试里会 monkeypatch bi.subprocess.run，必须让外部模块能看到
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -44,6 +46,49 @@ MAX_WRITE_BYTES = 1024 * 1024  # write_file / append_file 单次最多写 1MB，
 BACKUP_DIR = ROOT / "data" / "backup"  # 覆盖写前的自动留档目录（可回滚）
 BACKUP_KEEP_DAYS = 30  # 留档保留天数，超期惰性清理
 MAX_BACKUP_BYTES = 1024 * 1024  # 超过该大小不做留档（避免大文件反复整份复制）
+
+
+# 子进程 env 里要剔除的名字后缀：见 _child_env
+_SECRET_ENV_SUFFIXES = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+# 明确拒绝读取的密钥文件名：`.env` 与其派生（`.env.local`）；模板 `.env.example` 仍可读写
+_SECRET_BASENAMES = (".env",)
+_ENV_EXAMPLE_OK = ".env.example"
+
+
+def _child_env() -> dict[str, str]:
+    """给子进程一份**剔掉密钥形态变量**的环境副本。
+
+    为什么需要：`config._load_dotenv` 把 `.env` 的全部值注入 `os.environ`（含
+    `NODE_*_KEY` / `*_API_TOKEN`），而 `run_shell` 会把命令 stdout 原样带回给外部主 /
+    任意 MCP 宿主，且工具输出根本不过 `redact.py` —— 一条 `set` 就能把这台机器的全部
+    API key 打包带走（实测子进程确实能看到 `NODE_A_KEY`）。命令黑名单声明过"不是沙箱"，
+    但"能执行命令"和"能顺手抄走凭据"是两回事。
+    只按名字后缀剔除，保留 PATH/SystemRoot/ComSpec/TEMP 等功能变量：宁可少拦，也别把
+    cmd 跑坏。名字按 `_` 分段判断，`MONKEY` 这类同尾词不会被误剔。
+    """
+    out: dict[str, str] = {}
+    for k, v in os.environ.items():
+        head = k.rsplit("_", 1)[-1].upper() if "_" in k else k.upper()
+        if k.upper().endswith(tuple(f"_{s}" for s in _SECRET_ENV_SUFFIXES)) or head in (
+            "KEY",
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "CREDENTIAL",
+            "APIKEY",
+        ):
+            continue
+        out[k] = v
+    return out
+
+
+def _is_secret_file(p: Path) -> bool:
+    """该路径是否是本工具应当拒绝读出的密钥文件（`.env` 及其派生，模板除外）。"""
+    name = p.name.lower()
+    if name == _ENV_EXAMPLE_OK:
+        return False
+    return any(name == b or name.startswith(b + ".") for b in _SECRET_BASENAMES)
 
 
 def _decode(b: bytes) -> str:
@@ -138,6 +183,8 @@ def _backup_before_overwrite(path: Path) -> str | None:
 
         if not path.is_file():
             return None
+        if _is_secret_file(path):
+            return None  # 密钥文件不留档：否则 .env 的明文 key 会长期躺在 data/backup/ 里
         if path.stat().st_size > MAX_BACKUP_BYTES:
             return None
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -163,8 +210,12 @@ def _backup_before_overwrite(path: Path) -> str | None:
             break
         if rel is None:
             return None
+        # 路径本身再压一个短哈希：`a/b.md` 与根下真实存在的 `a__b.md` 会被上面的替换
+        # 归一成同一个留档名而互相覆盖（回滚时拿错版本）；时间戳只到毫秒，MCP 宿主
+        # 并发写同一文件也可能撞同一秒同名，故一并带上 pid/线程号。
+        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
-        dest = BACKUP_DIR / f"{rel}.{stamp}.bak"
+        dest = BACKUP_DIR / f"{rel}.{digest}.{stamp}.{os.getpid()}-{threading.get_ident()}.bak"
         shutil.copy2(path, dest)
         return str(dest)
     except (OSError, ValueError):
@@ -220,6 +271,7 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
                         cwd=cwd,
                         timeout=timeout,
                         capture_output=True,
+                        env=_child_env(),
                     )
                 except FileNotFoundError:
                     # 首词不是真实可执行文件 → 多半是 cmd 的**内置命令**（echo/dir/type/copy…）。
@@ -233,6 +285,7 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
                         cwd=cwd,
                         timeout=timeout,
                         capture_output=True,
+                        env=_child_env(),
                     )
             else:
                 # 有 shell 专有语法（管道/重定向等），直接用 shell=True
@@ -242,6 +295,7 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
                     cwd=cwd,
                     timeout=timeout,
                     capture_output=True,
+                    env=_child_env(),
                 )
         except subprocess.TimeoutExpired:
             return ToolResult(f"错误：命令超过 {timeout} 秒未完成，已终止", ok=False)
@@ -264,6 +318,12 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         p = _resolve(str(args.get("path", "")))
         if p is None:
             return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '')}", ok=False)
+        if _is_secret_file(p):
+            # 允许根之内不等于可以外发：`.env` 就躺在项目根里，read_file 原先把它整份读出，
+            # 等于任何 MCP 宿主一行配置就能把全部 key 取走（实测 2473 字符、含 3 行 KEY=）。
+            return ToolResult(
+                f"错误：{p.name} 是密钥文件，工具层不读出内容（要核对配置请在终端自己看）", ok=False
+            )
         if not p.exists():
             return ToolResult(f"错误：文件不存在：{p}", ok=False)
         if p.is_dir():
@@ -335,8 +395,15 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         try:
             entries = []
             for item in sorted(p.iterdir()):
-                kind = "dir " if item.is_dir() else "file"
-                size = "" if item.is_dir() else f"  {item.stat().st_size}B"
+                try:
+                    kind = "dir " if item.is_dir() else "file"
+                    size = "" if item.is_dir() else f"  {item.stat().st_size}B"
+                except OSError:
+                    # 遍历中途条目被删/移动/无权限：跳过这一条继续列，别把整个 list_dir
+                    # 打成一个异常（原先只有 PermissionError 被外层接住，stat 的
+                    # FileNotFoundError 会一路逃到注册表兜底，外部主看到的是看不懂的栈）。
+                    entries.append(f"?     {item.name}（读取失败）")
+                    continue
                 entries.append(f"{kind}  {item.name}{size}")
         except PermissionError:
             return ToolResult(f"错误：无权限访问 {p}", ok=False)

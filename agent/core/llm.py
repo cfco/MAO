@@ -54,6 +54,29 @@ ERR_API = "api"
 ERR_OTHER = "other"
 
 
+def worst_case_per_request(timeout: float, max_retries: int) -> float:
+    """一次 `chat()` 调用的最坏墙钟耗时上界（秒）：所有尝试 + 尝试之间的退避。
+
+    编排层的整体限时必须按这个数折算，而不是按 `timeout` 单次：429/超时/5xx 会在
+    `chat()` 内部退避重试，一次派工实际可能占用 `timeout x (retries+1)` 再加退避秒数。
+    按单次 timeout 折算会把批次时间算短，尾部批次被判"未完成"丢弃 —— 额度已经烧掉、
+    结果却拿不到（与 2026-09-22 那条「池大 + 并发低 + 固定限时」的 P0 同一族）。
+    """
+    attempts = 1 + max(0, int(max_retries))
+    return attempts * timeout + (attempts - 1) * (_MAX_BACKOFF + 1.0)  # +1.0 = jitter 上界
+
+
+def backoff_seconds(attempt: int, error_type: str) -> float:
+    """指数退避秒数：2^attempt x 基数 + jitter，**总时长封顶 `_MAX_BACKOFF`**。
+
+    jitter 加在 `min()` 之内（旧写法 `min(cap, x) + uniform(0,1)` 会让"封顶"多出 1 秒，
+    把上界当硬约束的调用方（如整体限时折算）算错）。限流类基数更大，给免费节点的
+    速率限制让路。
+    """
+    base = _BASE_BACKOFF_RATE_LIMIT if error_type == ERR_RATE_LIMIT else _BASE_BACKOFF_OTHER
+    return min(_MAX_BACKOFF, (2**attempt) * base + random.uniform(0, 1.0))
+
+
 class LLMError(Exception):
     """LLM 调用失败（已分类）。
 
@@ -101,12 +124,23 @@ class LLMClient:
 
     # ---------- 对外接口 ----------
 
+    def chat_once(self, messages: list[dict]) -> dict:
+        """**一次**网络尝试：不重试、不睡眠。
+
+        派工路径要的是这个粒度：同站串行门只该包住真实的一次往返，退避睡眠绝不能
+        占着门（见 station_gate 与 `WorkerPool._call_result`）——否则一个坏模型会把整站
+        锁住 `timeout x (retries+1) + 退避` 量级，同站其它可用模型全排在后面。
+        """
+        return self._once(messages)
+
     def chat(self, messages: list[dict]) -> dict:
-        """发起一轮对话补全，返回标准化的 assistant 消息 dict。
+        """发起一轮对话补全（内部按 `max_retries` 退避重试），返回 assistant 消息 dict。
 
         返回 {"role": "assistant", "content": "..."}。工人池是纯文本执行器，本适配层
         不启用 function calling（无工具入参、不解析 tool_calls）。
         失败：抛 LLMError（可重试错误已在此自动退避重试）。
+        用途：不经站点门的调用方（延迟探测客户端本来就是 `max_retries=0`，一次就回）。
+        真实派工不走这里，走 `chat_once` + 编排层的门外重试环。
         """
         last: LLMError | None = None
         for attempt in range(self.max_retries + 1):
@@ -116,7 +150,7 @@ class LLMClient:
                 last = e
                 if not e.retryable or attempt >= self.max_retries:
                     raise
-                time.sleep(self._backoff(attempt, e.error_type))
+                time.sleep(self._backoff(attempt, e.error_type))  # 经实例钩子：可被测试替换
         raise last  # 理论不可达（上面必 raise），占位保险
 
     def close(self) -> None:
@@ -171,6 +205,5 @@ class LLMClient:
 
     @staticmethod
     def _backoff(attempt: int, error_type: str) -> float:
-        """指数退避：2^attempt × 基数 + 随机 jitter，封顶 _MAX_BACKOFF。"""
-        base = _BASE_BACKOFF_RATE_LIMIT if error_type == ERR_RATE_LIMIT else _BASE_BACKOFF_OTHER
-        return min(_MAX_BACKOFF, (2**attempt) * base) + random.uniform(0, 1.0)
+        """兼容旧调用点的别名：真正的退避函数是模块级 `backoff_seconds`。"""
+        return backoff_seconds(attempt, error_type)

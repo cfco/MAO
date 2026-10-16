@@ -41,7 +41,7 @@ class _InstantClient:
     def __init__(self, *_a, **_k):
         pass
 
-    def chat(self, messages):
+    def chat_once(self, messages):
         return {"role": "assistant", "content": "hi"}
 
     def close(self):

@@ -12,10 +12,29 @@
 # 新增模型 = 按 "模型名@窗口" 逗号追加。
 # 自动下线机制：某模型连续 7 个"运行日"（程序实际启动过的天，周末没开机不计入也不
 # 打断）每天请求都失败，会自动在本文件对应行的模型名前加 # 屏蔽（删掉 # 即恢复）。
+#
+# 【免费节点自动发现】（2026-10-14 新增，见 agent/core/node_discovery.py）：
+#   提供方免费模型清单会变（新增/下架）。node-b(kilo) 在 config.yaml 里标了
+#   `discovery: kilo` 适配器，程序定期拉在线免费清单、与本文档对账，把**增量**写进
+#   data/free_nodes.json 叠加层（绝不改本文件，git pull 不冲突）：
+#     - 在线新增的免费模型 → 自动入池；
+#     - 在线消失的活跃模型 → 自动移出（不删本文件里的行）；
+#     - 你在这里手动加的 # 屏蔽 → **永久保留**，发现器不会自动复活它。
+#   （node-a/bynara 未接入自动发现，退回静态站，免费模型变化沿用手写 + 7 天自动下线。）
+#   立即刷新：发 bridge 命令 {"cmd":"refresh_nodes"}。关闭自动发现：config.yaml 里
+#   collaboration.free_node_discovery=false 或 free_node_interval=0，或设环境变量
+#   MAO_FREE_NODE_PROBE=0（离线/测试用）。
 # ============================================
 
 # ---------- 站点 A：router.bynara 免费中转（主站） ----------
-NODE_A_MODELS=agnes-2.5-flash@512k,laguna-s-2.1@256k,ling-3.0-flash-fin-free@256k,ling-3.0-flash-sante-free@256k,ling-3.0-flash-vl-free@256k,nemotron-3-super-free@256k,nemotron-3-ultra-free@1024k,nemotron-3.5-lightning-free@1024k,nex-n2.5-pro@256k
+# 2026-10-14 对齐线上免费档（共 5 个）：agnes-2.5-flash(Vision)、jev、laguna-s-2.1、
+# nemotron-3-ultra-free、nemotron-3.5-lightning-free。其余原本挂的（ling-3.0-flash-*
+# 三项 / nemotron-3-super-free / nex-n2.5-pro）已不在 bynara 免费档，先行 # 屏蔽下线
+# （删掉 # 即恢复）。node-a 未接自动发现，此处需人工跟线上变化。
+# 注：窗口取自 bynara 免费档页面 MAX CONTEXT 列（2026-10-14 截图）：agnes 512K、jev 32K、
+# laguna 262K、两个 nemotron 各 1M。laguna 线上显示 262K，即 262144=256k，按本项目 k=×1024
+# 约定写作 @256k（数值等价，不虚高预算）。
+NODE_A_MODELS=agnes-2.5-flash@512k,jev@32k,laguna-s-2.1@256k,nemotron-3-ultra-free@1024k,nemotron-3.5-lightning-free@1024k,#ling-3.0-flash-fin-free@256k,#ling-3.0-flash-sante-free@256k,#ling-3.0-flash-vl-free@256k,#nemotron-3-super-free@256k,#nex-n2.5-pro@256k
 
 # ---------- 站点 B：kilo.ai 网关（免费模型 id 都带 :free 后缀） ----------
 # 区分方法：kilo 的模型列表是公开接口，浏览器/curl 打开

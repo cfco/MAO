@@ -410,11 +410,18 @@ class McpGroup:
             self.server_cfgs, collector, self.conns, out_tools=self.tools
         )
 
-    def acquire(self) -> None:
+    def try_acquire(self) -> bool:
+        """登记一个使用者；组已关闭则返回 False，由调用方重建（不抛）。
+
+        为什么不再抛 RuntimeError：唯一调用点在 `Bridge.__init__`，而 `Bridge(cfg)` 在
+        `serve()` 的 try 之外 —— 一个"刚被别人用完并关闭"的组让 bridge 在发出 ready 行之前就
+        崩掉，外部驱动方看到的是空 stdout。关组与登记本来就是两条锁上的竞争，该由取组方兜住。
+        """
         with self._lock:
             if self._closed:
-                raise RuntimeError("MCP 连接组已关闭")
+                return False
             self._refs += 1
+            return True
 
     def release(self) -> None:
         """释放一个使用者；引用归零时关闭全部连接。"""
@@ -446,20 +453,23 @@ def acquire_group(server_cfgs: list[dict]) -> McpGroup:
     建连在全局锁外完成：单个 server 首连最长 90s，占着锁会把别的会话一起堵住。
     """
     key = _group_key(server_cfgs)
-    with _groups_lock:
-        group = _groups.get(key)
-    if group is None:
-        fresh = McpGroup(list(server_cfgs))
-        fresh.start()  # 锁外建连（可能耗时）
+    while True:
         with _groups_lock:
-            group = _groups.get(key)  # 并发下别人可能已建好，用先到的那个
-            if group is None:
-                group = fresh
-                _groups[key] = group
-        if group is not fresh:
-            stop_all(fresh.conns)  # 自己建的这份多余，释放掉
-    group.acquire()
-    return group
+            group = _groups.get(key)
+            if group is not None:
+                # 复用判定与引用登记必须在同一把表锁内完成：旧写法先取组、再到锁外 acquire()，
+                # 这中间另一个会话把引用降到 0 并关组，就会出现"拿到一个已关闭的组"。
+                if group.try_acquire():
+                    return group
+                _groups.pop(key, None)  # 已关闭的组不能复用，摘掉后重建
+        fresh = McpGroup(list(server_cfgs))
+        fresh.start()  # 锁外建连（首连可能耗时 90s，绝不占着全局锁）
+        with _groups_lock:
+            if key not in _groups:  # 并发下别人已建好就用先到的那份
+                _groups[key] = fresh
+                fresh.try_acquire()
+                return fresh
+        stop_all(fresh.conns)
 
 
 def release_group(group: McpGroup) -> None:

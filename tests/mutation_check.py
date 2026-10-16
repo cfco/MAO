@@ -61,15 +61,15 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M4 限时改回固定 300s",
         "agent/core/parallelism.py",
-        "        return batches * per_call + 30.0",
+        "        return batches * worst + 30.0",
         "        return 300.0",
         f"{TESTFILE}::test_effective_timeout_scales_with_batches_and_respects_explicit",
     ),
     (
         "M5 MCP 连接不再共享",
         "agent/tools/mcp_client.py",
-        "                _groups[key] = group",
-        "                _groups[key + '!'] = group",
+        "                _groups[key] = fresh",
+        "                _groups[key + '!'] = fresh",
         f"{TESTFILE}::test_mcp_group_shared_and_refcounted",
     ),
     (
@@ -127,19 +127,16 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M17 档案落盘 IO 拉回锁内",
         "agent/core/ledger.py",
-        """        with self._write_lock:
-            with self._lock:
-                text = self._snapshot_locked()
+        """                text = self._snapshot_locked()
             try:
                 atomic_write_text(self.store_path, text)
             except OSError:
                 pass  # 档案写不进去只损失持久化，内存账本照常工作""",
-        """        with self._write_lock, self._lock:  # mutated: 落盘 IO 回到记账锁内
-            text = self._snapshot_locked()
-            try:
-                atomic_write_text(self.store_path, text)
-            except OSError:
-                pass""",
+        """                text = self._snapshot_locked()
+                try:  # mutated: 落盘 IO 回到记账锁内
+                    atomic_write_text(self.store_path, text)
+                except OSError:
+                    pass""",
         "tests/test_audit2_fixes.py::test_persist_does_not_block_quarantine_queries",
     ),
     (
@@ -260,9 +257,15 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "M33 取快照挪到写锁之外",
         "agent/core/ledger.py",
         """        with self._write_lock:
+            disk = self._disk_for_merge()  # IO 留在 _lock 之外
             with self._lock:
+                if disk is not None:
+                    self._merge_disk_locked(disk)
                 text = self._snapshot_locked()""",
-        """        with self._lock:  # mutated: 快照在写锁外取，写盘顺序可能反于快照顺序
+        """        disk = self._disk_for_merge()  # mutated: 快照在写锁外取，写盘顺序可能反于快照顺序
+        with self._lock:
+            if disk is not None:
+                self._merge_disk_locked(disk)
             text = self._snapshot_locked()
         with self._write_lock:""",
         "tests/test_audit4_fixes.py::test_snapshot_is_taken_inside_the_write_lock[health]",
@@ -341,6 +344,198 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "        return cap  # mutated: 同站串行不再影响批次口径",
         "tests/test_audit4_fixes.py::test_station_parallel_cap_is_one_formula",
     ),
+    (
+        "M44 发现对账保留 # 前缀（屏蔽模型被复活）",
+        "agent/core/node_discovery.py",
+        '    registry_active = {_bare(i).lstrip("#") for i in items if not i.startswith("#")}\n'
+        '    registry_all = {_bare(i).lstrip("#") for i in items}',
+        '    registry_active = {_bare(i) for i in items if not i.startswith("#")}\n'
+        "    registry_all = {_bare(i) for i in items}",
+        "tests/test_node_discovery.py::test_reconcile_ignores_manually_blocked_names",
+    ),
+    (
+        "M45 registry 行内注释不剥离（末个模型不可下线）",
+        "agent/model_registry.py",
+        '            value, comment = _split_value_comment(line.partition("=")[2].strip())',
+        '            value, comment = (line.partition("=")[2].strip(), "")',
+        "tests/test_core.py::test_registry_inline_comment_does_not_block_last_model_retire",
+    ),
+    (
+        "M46 账本写盘不并对方进程记录（互相覆盖）",
+        "agent/core/ledger.py",
+        "            disk = self._disk_for_merge()  # IO 留在 _lock 之外\n"
+        "            with self._lock:\n"
+        "                if disk is not None:\n"
+        "                    self._merge_disk_locked(disk)\n",
+        "            with self._lock:\n",
+        "tests/test_health.py::test_write_merges_records_from_another_process",
+    ),
+    (
+        "M47 成功派工不登记运行日",
+        "agent/core/orchestrator.py",
+        "        if succeeded:\n"
+        "            self._note_run_day()  # 登记运行日同样是落盘 IO，放在池锁外\n"
+        "            return",
+        "        if succeeded:\n            return  # mutated: 成功日不进 active_dates",
+        "tests/test_core.py::test_successful_dispatch_registers_run_day",
+    ),
+    (
+        "M48 子进程继承全量 env（key 可被 set 抄走）",
+        "agent/tools/builtin.py",
+        "                    capture_output=True,\n                    env=_child_env(),\n                )",
+        "                    capture_output=True,\n                )",
+        "tests/test_core.py::test_run_shell_child_env_has_no_secret_vars",
+    ),
+    (
+        "M49 read_file 不拒绝密钥文件",
+        "agent/tools/builtin.py",
+        "        if _is_secret_file(p):",
+        "        if False:  # mutated: 允许根之内即可读出 .env",
+        "tests/test_core.py::test_read_file_refuses_env_secret",
+    ),
+    (
+        "M50 脱敏漏掉下划线后缀的 key 名",
+        "agent/core/redact.py",
+        "    (_SECRET_KV, _mask_secret_kv),",
+        "    (_SECRET_KV, lambda m: m.group(0)),  # mutated: KV 一律不抹",
+        "tests/test_core.py::test_redact_masks_underscore_suffixed_secret_names",
+    ),
+    (
+        "M51 对外池清单读静态配置（热同步后失真）",
+        "agent/bridge.py",
+        '            return {"ok": True, "agents": [p.brief() for p in self.workers.profiles.values()]}',
+        '            return {"ok": True, "agents": [p.brief() for p in self.cfg.agent_profiles]}',
+        "tests/test_audit5_fixes.py::test_list_agents_and_ping_report_the_live_pool",
+    ),
+    (
+        "M52 协议层不透传 timeout",
+        "agent/bridge.py",
+        '                req.get("system"),\n                timeout=_norm_timeout(req.get("timeout")),',
+        '                req.get("system"),',
+        "tests/test_audit5_fixes.py::test_ask_many_passes_timeout_and_tags_to_the_kernel",
+    ),
+    (
+        "M53 interval=0 连手动发现一起废掉",
+        "agent/core/node_discovery.py",
+        "        return bool(self.cfg.free_node_discovery)",
+        "        return bool(self.cfg.free_node_discovery) and self._interval > 0",
+        "tests/test_node_discovery.py::test_manual_refresh_still_works_when_interval_is_zero",
+    ),
+    (
+        "M54 起线程失败不回滚周期起算点",
+        "agent/core/node_discovery.py",
+        "                self._running = False\n                self._last_start = self._last_finish",
+        "                self._running = False",
+        "tests/test_node_discovery.py::test_maybe_start_rolls_back_the_schedule_when_thread_fails",
+    ),
+    (
+        "M55 已关闭的 MCP 组被直接复用",
+        "agent/tools/mcp_client.py",
+        "        with self._lock:\n"
+        "            if self._closed:\n"
+        "                return False\n"
+        "            self._refs += 1\n"
+        "            return True",
+        "        with self._lock:\n            self._refs += 1\n            return True",
+        "tests/test_audit5_fixes.py::test_acquire_group_rebuilds_a_closed_group_instead_of_raising",
+    ),
+    (
+        "M56 叠加层读取忽略 collaboration.free_nodes_file",
+        "agent/config.py",
+        '    overlay_path = _free_nodes_path(data.get("collaboration") or {})',
+        "    overlay_path = _free_nodes_path({})",
+        "tests/test_node_discovery.py::test_load_config_applies_overlay_from_the_configured_path",
+    ),
+    (
+        # 注：换行防御是"入口拦截 + 切段正则"两层，单点变异另一层仍然拦得住，
+        # 所以这里不给它单独条目（否则只能记成 TAUTOLOGY 误报恒真）；
+        # 该 parametrize 用例的载荷性由 M58 / M59 / M60 指向同一节点来证明。
+        "M57 首词不剥 cmd 的 ^ 转义",
+        "agent/tools/shell_safety.py",
+        r'    low = parts[0].replace("^", "").replace("\\", "/").rsplit("/", 1)[-1].lower()'
+        "  # 去路径前缀",
+        '    low = parts[0].replace("\\\\", "/").rsplit("/", 1)[-1].lower()  # mutated: de^l 放行',
+        "tests/test_audit5_fixes.py::test_shell_safety_blocks_the_six_bypasses",
+    ),
+    (
+        "M58 EncodedCommand 检查未接入",
+        "agent/tools/shell_safety.py",
+        "    ps_enc = _check_powershell_encoding(stripped)",
+        "    ps_enc = None  # mutated: 只按首词判 powershell，串联/引号包裹都绕过",
+        "tests/test_audit5_fixes.py::test_shell_safety_blocks_the_six_bypasses",
+    ),
+    (
+        "M59 重定向目标不拦环境变量展开",
+        "agent/tools/shell_safety.py",
+        '        if "%" in target or target.startswith(("$", "~")):',
+        "        if False:  # mutated: %USERPROFILE% 之类直接放行",
+        "tests/test_audit5_fixes.py::test_shell_safety_blocks_the_six_bypasses",
+    ),
+    (
+        "M60 技能脚本不看退出码",
+        "agent/skills_manager.py",
+        "        if proc.returncode != 0:",
+        "        if False:  # mutated: 非 0 退出也当成功",
+        "tests/test_audit5_fixes.py::test_run_script_marks_nonzero_exit_as_failure",
+    ),
+    (
+        "M61 被丢掉的陌生投票人不点名",
+        "agent/core/voting.py",
+        """        unknown = [
+            w for w in dict.fromkeys(str(x) for x in (workers or [])) if w not in self.profiles
+        ]""",
+        "        unknown = []  # mutated: 静默丢掉不存在的名字",
+        "tests/test_audit5_fixes.py::test_vote_names_the_workers_it_had_to_drop",
+    ),
+    (
+        "M62 整体限时不算重试与退避",
+        "agent/core/parallelism.py",
+        "        worst = worst_case_per_request(per_call, max_retries)",
+        "        worst = per_call  # mutated: 只按单次 timeout 折算，尾部批次被误判未完成",
+        "tests/test_audit_fixes.py::test_effective_timeout_scales_with_batches_and_respects_explicit",
+    ),
+    (
+        "M63 派工线程数随点名人头数线性创建",
+        "agent/core/parallelism.py",
+        "        slots = min(len(workers), max(1, self.cfg.max_workers))",
+        "        slots = len(workers)  # mutated: 回退到一人一线程",
+        "tests/test_audit5_fixes.py::test_dispatch_thread_count_follows_concurrency_not_fanout",
+    ),
+    (
+        "M64 门又包住整条重试链（退避在门内睡）",
+        "agent/core/station_gate.py",
+        "                return client.chat_once(messages), None, (time.monotonic() - t0) * 1000.0",
+        "                return client.chat(messages), None, (time.monotonic() - t0) * 1000.0",
+        "tests/test_audit5_fixes.py::test_backoff_sleep_happens_outside_the_station_gate",
+    ),
+    (
+        "M65 门外重试环不再重试",
+        "agent/core/orchestrator.py",
+        "            if attempt >= attempts - 1:",
+        "            if True:  # mutated: 一次就交回上层，等于派工侧关掉重试",
+        "tests/test_audit5_fixes.py::test_backoff_sleep_happens_outside_the_station_gate",
+    ),
+    (
+        "M66 list_dir 条目中途 stat 失败仍炸整次",
+        "agent/tools/builtin.py",
+        '                    entries.append(f"?     {item.name}（读取失败）")\n                    continue',
+        "                    raise  # mutated: 逃到注册表兜底，整次列目录失败",
+        "tests/test_audit5_fixes.py::test_list_dir_survives_an_entry_vanishing_mid_scan",
+    ),
+    (
+        "M67 留档名不带路径哈希（深层与平铺撞名）",
+        "agent/tools/builtin.py",
+        '        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]',
+        '        digest = "00000000"  # mutated: 回到 a/b.md 与 a__b.md 同名的旧行为',
+        "tests/test_audit5_fixes.py::test_backup_names_do_not_collide_across_shapes",
+    ),
+    (
+        "M68 显式 timeout=0 又当成限时 0 秒",
+        "agent/core/parallelism.py",
+        "        if timeout is not None and float(timeout) > 0:",
+        "        if timeout is not None:",
+        "tests/test_audit5_fixes.py::test_nonpositive_explicit_timeout_falls_back_to_adaptive",
+    ),
 ]
 
 
@@ -356,12 +551,46 @@ def run_pytest(node: str) -> bool:
     return proc.returncode == 0
 
 
+def node_collects(node: str) -> bool:
+    """该用例节点是否真的存在、能收到用例。
+
+    为什么必须先查（审计 P1，假安全的根源）：`run_pytest` 只以 `returncode != 0` 认定
+    "变异后失败 = 用例有效"，而 pytest 在节点不存在/被改名时返回 4、收集到 0 条时返回 5，
+    两者都 !=0 → 变异条目会被记成 OK。也就是说**用例一旦消失，这条变异门禁会立刻变成
+    永不再失败的绿项**，保护层悄悄没了却没人报警。先 collect-only 确认节点还在。
+    """
+    proc = subprocess.run(
+        [PY, "-m", "pytest", "-q", "--collect-only", node],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return proc.returncode == 0
+
+
+# 上一轮被硬杀时可能把源码留在变异态（本项目真发生过，`.tmp_prestore/` 就是那种残留）：
+# 开跑前先扫一遍目标文件，带着 `# mutated:` 标记就拒绝在坏态上继续改。
+stale = sorted(
+    {
+        rel
+        for rel in (m[1] for m in MUTATIONS)
+        if "# mutated:" in (ROOT / rel).read_text(encoding="utf-8")
+    }
+)
+if stale:
+    print(f"[中止] 这些文件仍带着上次变异留下的 `# mutated:` 标记，先从 git 还原再跑：{stale}")
+    raise SystemExit(1)
+
 rows: list[tuple[str, str, str]] = []
 for label, rel, old, new, node in MUTATIONS:
     path = ROOT / rel
     original = path.read_text(encoding="utf-8")
     if old not in original:
         rows.append((label, "SKIP", "锚点未找到（源码已变）"))
+        continue
+    if not node_collects(node):
+        rows.append((label, "FAIL", "用例节点不存在（被改名/删除，这条变异已失去守卫）"))
         continue
     try:
         path.write_text(original.replace(old, new, 1), encoding="utf-8")

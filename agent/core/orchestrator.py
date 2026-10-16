@@ -13,7 +13,7 @@
 文件结构（2026-09-22 拆分、2026-09-23 二次拆分并行段后）：
   orchestrator.py —— WorkerPool 类：派工 + 健康 + pick 轮转
   station_gate.py —— StationGateMixin：同站串行门（一站同时只跑一个模型）+ 并发口径
-  parallelism.py  —— ParallelMixin：并行派工（_wait_gather / _effective_timeout / _spawn / _run_parallel）
+  parallelism.py  —— ParallelMixin：并行派工（_wait_gather / _effective_timeout / _run_parallel）
   voting.py       —— VotingMixin：投票两步（收集 + 编号投票）、择优
   constants.py    —— 派工结果状态码（ST_OK/ST_ERROR 等）
   health.py       —— 模型健康档案（当日失败隔离）
@@ -39,7 +39,13 @@ from .constants import (
 )
 from .health import ModelHealth, get_health
 from .latency import LatencyMixin, LatencyStore
-from .llm import LLMClient, LLMError
+from .llm import LLMClient, LLMError, backoff_seconds
+from .node_discovery import (
+    FreeNodeDiscoverer,
+    _bare,
+    _parse_one,
+    load_overlay,
+)
 from .parallelism import ParallelMixin, StationMemo
 from .redact import safe_error_text
 from .station_gate import StationGateMixin
@@ -102,6 +108,8 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         # 空转（正向跳变则提前放行坏节点）。本表不进持久化，跨进程/重启无需可比性。
         self._cooldowns: dict[str, float] = {}
         self._fail_streak: dict[str, int] = {}  # name -> 连续失败次数
+        # 本池已登记为"运行日"的那天（每天只登记一次，见 _note_run_day）
+        self._active_day: str | None = None
         self._cooldown_threshold = self.cfg.as_int(
             self.cfg.collab_cfg.get("cooldown_fails", 2),
             "collaboration.cooldown_fails",
@@ -125,6 +133,13 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         # 并发安全：ask_many/vote 用线程池并发调用 ask，健康状态与客户端缓存
         # （_clients）都需加锁保护。（历史上此处还有 LRU 答案缓存与并发在飞去重，
         # 已随「单一 bridge 路线」简化移除——外部主按需发话，命中率极低。）
+        # 派工的单请求时长与重试次数：客户端构造与门外重试环共用同一份，别两处各解析各的
+        self._llm_timeout = self.cfg.as_float(
+            self.cfg.llm_cfg.get("timeout", 120), "llm.timeout", 120.0, minimum=1.0
+        )
+        self._max_retries = self.cfg.as_int(
+            self.cfg.llm_cfg.get("max_retries", 2), "llm.max_retries", 2, minimum=0
+        )
         self._lock = threading.Lock()
         # 按 profile.name 缓存 LLMClient，避免每次派工都重建连接池
         self._clients: dict[str, LLMClient] = {}
@@ -162,6 +177,16 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         # 回退是否允许跨站（默认 true）：同站无可用候选时从整池恢复——"异常停止自动换模型"。
         self._fallback_cross_station = self.cfg.fallback_cross_station
 
+        # 免费节点自动发现（叠加层 data/free_nodes.json）：建池时 best-effort 探一次
+        # （守护线程、不阻塞建池、失败静默跳过），并按 free_node_interval 后台周期刷新
+        # （懒式调度：挂在派工/预检入口顺带检查是否到期）。MAO_FREE_NODE_PROBE=0 或
+        # free_node_discovery=false 或 interval<=0 → 不调度，registry 原样生效。
+        self._free_node = FreeNodeDiscoverer(cfg, cfg.free_nodes_path)
+        try:
+            self._free_node.maybe_start()
+        except Exception:  # noqa: BLE001 - 发现调度绝不影响建池
+            pass
+
     # ---------- 基础派工 ----------
 
     def names(self) -> list[str]:
@@ -189,6 +214,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         （标签见 list_agents / health 快照）。缺省 None 不过滤。
         """
         self._touch_latency()  # 到期就起一轮后台探测刷新延迟档案，不阻塞本次调用
+        self._touch_free_nodes()  # 免费节点发现：到期就起一轮后台发现，不阻塞本次调用
         cap = self.cfg.max_participants if limit is None else limit
         live = [w for w in self.profiles if self._skip_reason(w) is None]
         if tags:
@@ -224,6 +250,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         字段语义上，available 是"能不能用"，latency_ms 是"快不快用"——两者独立：
         一个可用但很慢的节点仍然 available=True，只是默认派工会把它排在后面/裁掉。
         """
+        self._touch_free_nodes()  # 派工/预检入口顺带触发免费节点发现（懒式，不阻塞）
         now = time.monotonic()
         lat = self.latency.snapshot()
         # 冷却表一次取全：逐工人取锁拼出来的"快照"，同一轮里各条目的时点会不一致
@@ -246,6 +273,102 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                 }
             )
         return out
+
+    # ---------- 免费节点自动发现 ----------
+
+    def _touch_free_nodes(self) -> None:
+        """派工/预检入口的顺带动作：发现到期就起一轮后台发现（不阻塞、不抛异常）。
+
+        与 _touch_latency 同理：挂在入口而非常驻线程，避免无人派工时空转烧额度；
+        free_node_discovery=false / interval<=0 / MAO_FREE_NODE_PROBE=0 时整段跳过。
+        """
+        if not self._free_node.enabled():
+            return
+        try:
+            self._free_node.maybe_start()
+        except Exception:  # noqa: BLE001 - 发现调度绝不拖累派工
+            pass
+
+    def refresh_free_nodes_now(self) -> dict:
+        """同步强制跑一轮免费节点发现，并把增量热同步进当前工人池（不重启即生效）。
+
+        供 bridge `refresh_nodes` 命令调用。返回 {stations, updated, applied} 摘要（不含密钥）；
+        发现失败/被禁用的站不计入变动。applied 是本次对运行中池子实际增/删的工人名。
+        """
+        report = self._free_node.refresh_now()
+        try:
+            overlay = load_overlay(self.cfg.free_nodes_path)
+            report["applied"] = self.sync_free_nodes(overlay)
+        except Exception:  # noqa: BLE001 - 热同步失败不炸命令
+            report["applied"] = {"error": "sync_failed"}
+        return report
+
+    def sync_free_nodes(self, overlay: dict) -> dict:
+        """把叠加层增量热同步进当前运行中的工人池：新增的进池、消失的移出池。
+
+        不改 registry、不重启。手动 `#` 屏蔽的模型不在 added 里（发现阶段已排除），
+        故不会因同步被重新启用。返回本次实际变动的工人名（不含密钥）。
+        """
+        with self._lock:
+            profiles = dict(self.profiles)
+            # 先按 env 抓一个模板（base_url/api_key/discovery 来源），即便该站活跃模型全被
+            # retired 移除也能据此把新增模型建出来——否则模板随 retired 一起被删就没法加了。
+            templates: dict[str, AgentProfile] = {}
+            for p in profiles.values():
+                templates.setdefault(p.models_env, p)
+            removed: list[str] = []
+            for env_var, delta in overlay.items():
+                if env_var.startswith("_") or not isinstance(delta, dict):
+                    continue
+                retired = {_bare(r).lstrip("#") for r in (delta.get("retired") or [])}
+                if not retired:
+                    continue
+                for name, p in list(profiles.items()):
+                    if p.models_env == env_var and _bare(p.model).lstrip("#") in retired:
+                        profiles.pop(name, None)
+                        removed.append(name)
+            added: list[str] = []
+            for env_var, delta in overlay.items():
+                if env_var.startswith("_") or not isinstance(delta, dict):
+                    continue
+                tmpl = templates.get(env_var)
+                if tmpl is None:
+                    continue
+                existing = {
+                    _bare(p.model).lstrip("#") for p in profiles.values() if p.models_env == env_var
+                }
+                station = tmpl.name.split(":")[0]
+                for entry in delta.get("added") or []:
+                    model, ctx = _parse_one(entry)
+                    if not model or model in existing:
+                        continue
+                    # 新增模型统一用 "站名:模型名"（与 config 多模型站命名一致）
+                    name = f"{station}:{model}"
+                    np = AgentProfile(
+                        name=name,
+                        base_url=tmpl.base_url,
+                        api_key=tmpl.api_key,
+                        model=model,
+                        context_length=ctx,
+                        note=tmpl.note,
+                        models_env=env_var,
+                        discovery=tmpl.discovery,
+                    )
+                    profiles[name] = np
+                    existing.add(model)
+                    added.append(name)
+            if removed or added:
+                self.profiles = profiles
+                self._model_of = {n: p.model for n, p in profiles.items()}
+                self._env_of = {n: p.models_env for n, p in profiles.items()}
+                self._station_models = {}
+                for nm, p in profiles.items():
+                    self._station_models.setdefault((p.base_url, p.api_key), []).append(nm)
+            return {"added": added, "removed": removed}
+
+    def free_node_status(self) -> dict:
+        """免费节点发现维度诊断快照（不含密钥）。"""
+        return {"discovery": self._free_node.status()}
 
     def _is_in_cooldown(self, name: str) -> bool:
         """该节点是否处于冷却期（冷却期跳过，避免反复打一个坏节点）。"""
@@ -280,30 +403,55 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         档案落盘在池锁外做，失败路径不在热路径上，多一次小文件写无碍。
         """
         now = time.monotonic()
+        succeeded = False
+        pair = ("", "")
         with self._lock:
             if ok:
                 self._cooldowns.pop(name, None)
                 self._fail_streak[name] = 0
-                return
-            streak = self._fail_streak.get(name, 0) + 1
-            self._fail_streak[name] = streak
-            if streak >= self._cooldown_threshold:
-                # 连续失败越多，冷却越久：指数退避 base × 2^(超出阈值的次数)，封顶 cooldown_max。
-                # 例（base=10, threshold=2）：第2次失败 10s、第3次 20s、第4次 40s……到顶后恒定。
-                # exponent 先封到 20：极端连击下避免计算 2^n 大整数（2^20×base 已远超合理封顶）。
-                exponent = min(streak - self._cooldown_threshold, 20)
-                duration = min(self._cooldown_base * (2**exponent), self._cooldown_max)
-                self._cooldowns[name] = now + duration
+                succeeded = True
+            else:
+                streak = self._fail_streak.get(name, 0) + 1
+                self._fail_streak[name] = streak
+                if streak >= self._cooldown_threshold:
+                    # 连续失败越多，冷却越久：指数退避 base × 2^(超出阈值的次数)，封顶 cooldown_max。
+                    # 例（base=10, threshold=2）：第2次失败 10s、第3次 20s、第4次 40s……到顶后恒定。
+                    # exponent 先封到 20：极端连击下避免计算 2^n 大整数（2^20×base 已远超合理封顶）。
+                    exponent = min(streak - self._cooldown_threshold, 20)
+                    duration = min(self._cooldown_base * (2**exponent), self._cooldown_max)
+                    self._cooldowns[name] = now + duration
+                pair = (self._model_of.get(name, ""), self._env_of.get(name, ""))
+        if succeeded:
+            self._note_run_day()  # 登记运行日同样是落盘 IO，放在池锁外
+            return
         if not fatal:
             return  # 可重试的瞬时失败：只进冷却，不做当日隔离
         try:
-            notice = self.health.record_failure(
-                name, self._model_of.get(name, ""), self._env_of.get(name, "")
-            )
+            # 模型名与清单变量名要在池锁内取：`sync_free_nodes` 会整本换掉这两张表，
+            # 锁外读可能拿到"记账时的名字 + 改写后的映射"这种错配，把 # 标到别的模型上。
+            notice = self.health.record_failure(name, *pair)
         except Exception:  # noqa: BLE001 - 健康档案异常绝不影响派工主流程
             notice = None
         if notice:
             print(notice, file=sys.stderr)  # stderr：bridge/--stream 的 stdout 必须纯净
+
+    def _note_run_day(self) -> None:
+        """把今天登记为"运行日"（进程内每天一次，幂等）。
+
+        为什么必须由成功派工来登记：health 的下线判定是"最近 retire_days 个**运行日**里
+        每天都失败过"，而原先只有 `record_failure` 会往 active_dates 加日子 —— 模型**成功**
+        的日子不进窗口，也就打断不了连击：相隔两个月各失败一天，攒够 3 天就被标 `#` 下线
+        （实测复现）。登记制补上"这天程序确实跑过、而且这个模型干成了活"这一侧的事实。
+        闸门放在内存里，避免每次成功派工都多写一次盘；登记失败不置闸门，下次成功派工重试。
+        """
+        today = time.strftime("%Y-%m-%d")
+        if self._active_day == today:
+            return
+        try:
+            self.health.note_active(today)
+        except Exception:  # noqa: BLE001 - 记账失败绝不影响派工主流程
+            return
+        self._active_day = today
 
     def ask_result(
         self, worker: str, prompt: str, system: str | None = None, memo: StationMemo | None = None
@@ -442,7 +590,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                 {"role": "system", "content": system or WORKER_SYSTEM},
                 {"role": "user", "content": prompt},
             ]
-            resp, err, elapsed_ms = self._chat_gated(client, station, messages)
+            resp, err, elapsed_ms = self._attempt_with_retry(client, station, messages)
             if err is not None:
                 # 分类与记账逐字沿用旧实现：LLMError 按 retryable 分级，其它意外异常按可重试
                 # 处理（别全天拉黑）。回退递归发生在**站点门之外**（见 _chat_gated 文档）。
@@ -515,6 +663,33 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                 "error": f"调用子智能体 '{p.name}' 异常：{type(e).__name__}: {safe_error_text(e)}",
             }
 
+    def _attempt_with_retry(
+        self, client: LLMClient, station: tuple[str, str], messages: list[dict]
+    ) -> tuple[dict | None, Exception | None, float]:
+        """按 `llm.max_retries` 重试，但**每次尝试单独过一次站点门、退避睡眠留在门外**。
+
+        为什么不再把 `LLMClient.chat()` 整段交给门：chat 自带退避 `sleep`，包在门里就等于
+        让"等待"也占用"一站同时只跑一个模型"的配额 —— 一个坏模型会把整站锁住
+        `timeout x (1+retries) + 退避` 量级，同站其它本来可用的模型全排在后面（实测第二个
+        工人白等 1.55s，等的基本都是别人的 sleep）。
+        重试次数与退避序列和旧实现逐字一致（`backoff_seconds` 同一个函数），只是挪到了门外。
+        返回最后一次尝试的 (resp, 错误, 门内毫秒)。
+        """
+        attempts = 1 + self._max_retries
+        resp: dict | None = None
+        err: Exception | None = None
+        elapsed_ms = 0.0
+        for attempt in range(attempts):
+            resp, err, elapsed_ms = self._chat_gated(client, station, messages)
+            if err is None:
+                return resp, None, elapsed_ms
+            if not isinstance(err, LLMError) or not err.retryable:
+                return resp, err, elapsed_ms  # 终态错误：重试也没用，直接交回上层按终态记账
+            if attempt >= attempts - 1:
+                return resp, err, elapsed_ms
+            time.sleep(backoff_seconds(attempt, err.error_type))  # 门已释放，退避不占站配额
+        return resp, err, elapsed_ms
+
     def _client_for(self, p: AgentProfile) -> LLMClient:
         """按 profile.name 复用 LLMClient；首次访问时按工人配置创建并缓存。
         timeout / max_retries 从全局配置读取，保持与主智能体一致的重试策略。
@@ -530,18 +705,12 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
             client = self._clients.get(p.name)
             if client is not None:
                 return client
-            timeout = self.cfg.as_float(
-                self.cfg.llm_cfg.get("timeout", 120), "llm.timeout", 120.0, minimum=1.0
-            )
-            max_retries = self.cfg.as_int(
-                self.cfg.llm_cfg.get("max_retries", 2), "llm.max_retries", 2, minimum=0
-            )
             client = LLMClient(
                 p.base_url,
                 p.api_key,
                 p.model,
-                timeout=timeout,
-                max_retries=max_retries,
+                timeout=self._llm_timeout,
+                max_retries=self._max_retries,
             )
             self._clients[p.name] = client
             return client

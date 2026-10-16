@@ -357,7 +357,7 @@ class LatencyMixin:
             return None  # 该站正在跑真实请求 ⇒ 本轮让路，不污染样本也不挂住探测轮
         try:
             t0 = time.monotonic()
-            resp = self._probe_client_for(p).chat([{"role": "user", "content": _PROBE_PROMPT}])
+            resp = self._probe_client_for(p).chat_once([{"role": "user", "content": _PROBE_PROMPT}])
             if not str(resp.get("content") or "").strip():
                 return None  # 空回复不算有效往返，避免污染样本
             return (time.monotonic() - t0) * 1000.0

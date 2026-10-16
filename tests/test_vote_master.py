@@ -44,7 +44,7 @@ def test_master_contribution_appended_and_worker_order_stable():
     w1, w2 = pool.names()
 
     class FakeClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             user = messages[-1]["content"]
             if user.startswith("候选方案"):
                 return {"role": "assistant", "content": "1"}
@@ -70,7 +70,7 @@ def test_master_contribution_can_win_ballot():
     pool = _two_worker_pool()
 
     class FakeClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             user = messages[-1]["content"]
             if user.startswith("候选方案"):
                 return {"role": "assistant", "content": "3"}  # 全部投主方案
@@ -93,7 +93,7 @@ def test_master_contribution_empty_and_falsy_ignored():
     w1 = pool.names()[0]
 
     class FakeClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             user = messages[-1]["content"]
             if user.startswith("候选方案"):
                 return {"role": "assistant", "content": "1"}
@@ -123,7 +123,7 @@ def test_master_contribution_backstops_when_all_workers_fail():
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             raise RuntimeError("worker 崩溃")
 
         def close(self):
@@ -151,7 +151,7 @@ def test_bridge_ask_vote_passes_master_contribution(monkeypatch):
         def __init__(self, *_a, **_k):
             pass  # 本用例只验证透传，vote 已被 spy 替换，不会真调 chat
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             return {"role": "assistant", "content": "1"}
 
         def close(self):

@@ -56,7 +56,7 @@ def test_worker_pool_concurrent_ask_no_crash():
     import agent.core.orchestrator as orch
 
     fake = MagicMock()
-    fake.chat.return_value = {"role": "assistant", "content": "ok"}
+    fake.chat_once.return_value = {"role": "assistant", "content": "ok"}
 
     def make_fake_client(*_args, **_kwargs):
         return fake

@@ -123,11 +123,14 @@ class SkillManager:
             return ToolResult(f"错误：脚本不存在：{path}", ok=False)
         payload = json.dumps(args or {}, ensure_ascii=False)
         try:
+            from .tools.builtin import _child_env
+
             proc = subprocess.run(
                 [sys.executable, str(path), payload],
                 capture_output=True,
                 cwd=str(info["dir"]),
                 timeout=SCRIPT_TIMEOUT,
+                env=_child_env(),  # 技能脚本（含第三方 SKILL.md 里的）也不该拿到整池 key
             )
         except subprocess.TimeoutExpired:
             return ToolResult(f"错误：脚本超过 {SCRIPT_TIMEOUT} 秒未完成，已终止", ok=False)
@@ -139,7 +142,12 @@ class SkillManager:
         if proc.stderr:
             parts.append("[stderr] " + _decode(proc.stderr)[-2000:])
         parts.append(f"[exit code] {proc.returncode}")
-        return "\n".join(parts)
+        text = "\n".join(parts)
+        if proc.returncode != 0:
+            # 与 run_shell 同一口径：非 0 退出就是失败。旧写法只看 stdout 不看退出码，
+            # 脚本崩溃/参数错也被当成功返回给外部主（exit code 只躺在文本里）。
+            return ToolResult(text, ok=False)
+        return text
 
 
 def register_skill_tools(registry: ToolRegistry, manager: SkillManager) -> None:

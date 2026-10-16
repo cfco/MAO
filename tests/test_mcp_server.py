@@ -30,6 +30,7 @@ EXPECTED_TOOLS = {
     "health",
     "latency",
     "set_economy",
+    "refresh_nodes",
     "list_tools",
     "call_tool",
     "load_skill",

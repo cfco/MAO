@@ -15,14 +15,32 @@ import re
 _URL_QUERY = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+?\?[^\s'\"<>]*")
 # 密钥形态：OpenAI 风格 sk-…、Authorization: Bearer …、以及 key/token=… 参数
 # （替换值统一用函数，避免组引用与字面量两种写法混用）
+# 成对的「变量名 = 值」形态：名字必须以密钥词结尾（KEY/TOKEN/SECRET/PASSWORD/…），
+# 且只在该词是**独立一段**时才算密钥 —— 旧写法用 `\b(key|token|...)=` 匹配，
+# `NODE_A_KEY=sk-xxx`、`CF_API_TOKEN=yyy` 这类下划线后缀名一个都不命中（`_` 与 `K`
+# 之间没有词边界），而本项目的池 key 恰恰全是这种命名。`MONKEY=3` 不该被误抹。
+_SECRET_KV = re.compile(
+    r"(?i)\b([A-Za-z0-9_\-]*(?:api[ _\-]?key|key|token|secret|password|passwd|credential))"
+    r"(\s*[=:]\s*)([^\s&'\",;]+)"
+)
+_SECRET_NAME_TAILS = frozenset(
+    {"KEY", "APIKEY", "TOKEN", "APITOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"}
+)
+
+
+def _mask_secret_kv(m: re.Match) -> str:
+    """命中"名字末段是密钥词"的 KV 才抹值，否则原样返回。"""
+    name = m.group(1).upper().replace("-", "_").replace(" ", "_")
+    if name.rsplit("_", 1)[-1] in _SECRET_NAME_TAILS:
+        return f"{m.group(1)}{m.group(2)}****"
+    return m.group(0)
+
+
 _SECRET_PATTERNS: list[tuple[re.Pattern, object]] = [
     (_URL_QUERY, lambda m: m.group(0).split("?", 1)[0] + "?<query 已隐去>"),
     (re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}"), lambda m: "sk-****"),
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{6,}"), lambda m: m.group(1) + "****"),
-    (
-        re.compile(r"(?i)\b((?:api[_-]?key|secret|token|password|key)\s*[=:]\s*)[^\s&'\",;]+"),
-        lambda m: m.group(1) + "****",
-    ),
+    (_SECRET_KV, _mask_secret_kv),
 ]
 _LIMIT = 200
 

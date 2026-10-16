@@ -228,7 +228,7 @@ def test_ask_distinct_keys_each_call():
     calls = {"n": 0}
 
     class FakeClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             calls["n"] += 1
             return {"role": "assistant", "content": "ok"}
 
@@ -328,7 +328,7 @@ def test_collect_and_vote_candidate_order_follows_input():
     w1, w2 = pool.names()
 
     class FakeClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             user = messages[-1]["content"]
             if user.startswith("候选方案"):
                 return {"role": "assistant", "content": "1"}
@@ -365,7 +365,7 @@ def test_ask_many_timeout_bounds_total_wait():
     release = threading.Event()
 
     class HangClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             release.wait(timeout=5)  # 挂住直到测试放行
             return {"role": "assistant", "content": "ok"}
 
@@ -386,7 +386,7 @@ def test_select_best_picks_voted_winner():
     pool = _two_worker_pool()
 
     class FakeClient:
-        def chat(self, messages):
+        def chat_once(self, messages):
             user = messages[-1]["content"]
             if user.startswith("候选方案"):
                 return {"role": "assistant", "content": "2"}
@@ -672,7 +672,7 @@ def test_ask_many_structured_ordered_records(monkeypatch):
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             return {"content": "hi"}
 
     monkeypatch.setattr(orch, "LLMClient", Instant)
@@ -705,7 +705,7 @@ def test_answer_starting_with_error_prefix_is_still_success(monkeypatch):
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             return {"role": "assistant", "content": "错误：这里只是正文的开头，不是故障"}
 
     monkeypatch.setattr(orch, "LLMClient", Prefixy)
@@ -737,7 +737,7 @@ def test_ask_result_error_leaves_answer_empty(monkeypatch):
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             raise LLMError("api", "HTTP 429 错误码 1", retryable=True)
 
     monkeypatch.setattr(orch, "LLMClient", Boom)
@@ -765,7 +765,7 @@ def test_ask_many_structured_uses_stable_status_codes():
         def __init__(self, *_a, **_k):
             pass
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             return {"role": "assistant", "content": "hi"}
 
     monkey = Instant
@@ -871,7 +871,7 @@ def test_fallback_to_peer_on_retryable_failure(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             if self.model == "m1":
                 raise LLMError("rate_limit", "429", retryable=True)  # 持续瞬时失败
             return {"role": "assistant", "content": f"ok-from-{self.model}"}
@@ -891,7 +891,7 @@ def test_fallback_respects_cooldown_skip(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             raise LLMError("rate_limit", "429", retryable=True)  # 全部可重试失败
 
     monkeypatch.setattr(orch, "LLMClient", AlwaysBoom)
@@ -910,7 +910,7 @@ def test_fallback_not_cross_station(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             calls["models"].append(self.model)
             raise LLMError("rate_limit", "429", retryable=True)  # 全站可重试失败
 
@@ -927,9 +927,11 @@ def test_fallback_not_cross_station(monkeypatch):
         )
     )
     pool = WorkerPool(cfg, exclude=None)
+    pool._max_retries = 0  # 本用例只验「换模型」的链，不叠加每个模型自身的重试次数
     pool._cooldowns["st:m2"] = time.monotonic() + 999  # 同站无可用回退
     pool._cooldowns["st:m3"] = time.monotonic() + 999
     r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is False and r["status"] == "error"
     assert r["ok"] is False and r["status"] == "error"
     assert calls["models"] == ["m1"], f"关闭跨站后不得跨站，实际试过：{calls['models']}"
 
@@ -941,7 +943,7 @@ def test_fallback_cross_station_recovers(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             if self.model == "m1":
                 raise LLMError("rate_limit", "429", retryable=True)  # 仅 m1 瞬时失败
             return {"role": "assistant", "content": f"ok-from-{self.model}"}
@@ -964,7 +966,7 @@ def test_fallback_terminal_error_no_fallback(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             calls["models"].append(self.model)
             raise LLMError("auth", "bad key", retryable=False)  # 终态
 
@@ -984,7 +986,7 @@ def test_fallback_disabled_when_zero(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             calls["models"].append(self.model)
             raise LLMError("rate_limit", "429", retryable=True)
 
@@ -998,7 +1000,9 @@ def test_fallback_disabled_when_zero(monkeypatch):
         )
     )
     pool = WorkerPool(cfg, exclude=None)
+    pool._max_retries = 0  # 本用例只验「换模型」的链，不叠加每个模型自身的重试次数
     r = pool.ask_result("st:m1", "任务")
+    assert r["ok"] is False and r["status"] == "error"
     assert r["ok"] is False and r["status"] == "error"
     assert calls["models"] == ["m1"], "关闭回退时只打原模型，不回退到 m2"
 
@@ -1017,16 +1021,18 @@ def test_station_memo_suppresses_cross_worker_fallback(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             calls["models"].append(self.model)
             raise LLMError("rate_limit", "429", retryable=True)  # 整站持续可重试失败
 
     monkeypatch.setattr(orch, "LLMClient", AllBoom)
     pool = _fallback_pool()  # st: m1/m2/m3 同站 + other: x1；fallback_models 默认 2
+    pool._max_retries = 0  # 本用例只验「换模型」的链，不叠加每个模型自身的重试次数
     memo = StationMemo()
 
     # 工人1：主调用 m1 失败 → 同站回退链 m2、m3（均失败）→ 链耗尽记该站死。共 3 次网络。
     pool.ask_result("st:m1", "任务", memo=memo)
+    assert calls["models"] == ["m1", "m2", "m3"], "首个工人应走完同站回退链再判死"
     assert calls["models"] == ["m1", "m2", "m3"], "首个工人应走完同站回退链再判死"
 
     # 工人2：主调用 m2（点名不能省）失败后，同站候选已被 memo 抑制（不再撞 m1/m3），
@@ -1052,11 +1058,125 @@ def test_memo_absent_preserves_full_fallback_chain(monkeypatch):
         def __init__(self, base_url, api_key, model, **kw):
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             calls["models"].append(self.model)
             raise LLMError("rate_limit", "429", retryable=True)
 
     monkeypatch.setattr(orch, "LLMClient", AllBoom)
     pool = _fallback_pool()
+    pool._max_retries = 0  # 本用例只验「换模型」的链，不叠加每个模型自身的重试次数
     pool.ask_result("st:m1", "任务")  # 无 memo
     assert calls["models"] == ["m1", "m2", "m3"], "无 memo 时单发必须仍打满同站回退链"
+    assert calls["models"] == ["m1", "m2", "m3"], "无 memo 时单发必须仍打满同站回退链"
+
+
+def test_registry_inline_comment_does_not_block_last_model_retire(tmp_path):
+    """行内注释不得吃掉该行最后一个模型：两侧解析口径必须一致。
+
+    旧行为：`_load_dotenv`（注入 env 那条路）会剥 ` #` 注释，而 load_model_registry /
+    retire_model 直读文件时不剥 → `m2@256k # 备注` 成为一个条目，`_bare_model` 取不出
+    裸名 m2，自动下线对 m2 永久返回 missing（静默失效）。
+    """
+    from agent.model_registry import RETIRE_OFFLINED, load_model_registry, retire_model
+
+    reg = tmp_path / "model_registry.txt"
+    reg.write_text("NODE_A_MODELS=m1@256k,m2@256k # 输出参考\n", encoding="utf-8")
+    assert load_model_registry(reg)["NODE_A_MODELS"] == "m1@256k,m2@256k"
+
+    assert retire_model(reg, "NODE_A_MODELS", "m1") == RETIRE_OFFLINED
+    assert retire_model(reg, "NODE_A_MODELS", "m2") == RETIRE_OFFLINED, (
+        "带行内注释也要匹配上最后一个模型"
+    )
+    line = reg.read_text(encoding="utf-8").strip()
+    assert line == "NODE_A_MODELS=#m1@256k,#m2@256k # 输出参考", f"注释必须原样保留：{line!r}"
+
+
+def test_successful_dispatch_registers_run_day(tmp_path, monkeypatch):
+    """成功派工必须把今天登记为"运行日"。
+
+    旧行为：active_dates 只由 record_failure 追加（note_active 全仓仅测试调用），于是
+    模型**成功**的日子不进窗口、打断不了连击 —— 相隔两个月各失败一天，攒够 retire_days
+    天就被标 `#` 下线（实测复现）。
+    """
+    import json
+    import os
+    import time
+    from pathlib import Path
+
+    import agent.core.orchestrator as orch
+
+    class Ok:
+        def __init__(self, *a, **kw):
+            pass
+
+        def chat_once(self, messages):
+            return {"role": "assistant", "content": "干完了"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(orch, "LLMClient", Ok)
+    pool = _fallback_pool()
+    try:
+        pool.ask("st:m1", "任务")
+        health = json.loads(Path(os.environ["MAO_HEALTH_FILE"]).read_text(encoding="utf-8"))
+        assert time.strftime("%Y-%m-%d") in health["active_dates"]
+    finally:
+        pool.close()
+
+
+def test_redact_masks_underscore_suffixed_secret_names():
+    """脱敏必须命中本项目实际的 key 命名（`NODE_A_KEY=` / `CF_API_TOKEN=`），且不误抹普通词。"""
+    from agent.core.redact import safe_error_text
+
+    out = safe_error_text("fail NODE_A_KEY=abcdefghijkl CF_API_TOKEN=zyxwvu monkey=3 status=404")
+    assert "abcdefghijkl" not in out and "zyxwvu" not in out, out
+    assert "NODE_A_KEY=****" in out and "CF_API_TOKEN=****" in out, out
+    assert "monkey=3" in out, f"同尾词不该被误抹：{out}"
+    assert "status=404" in out
+
+
+def test_run_shell_child_env_has_no_secret_vars(monkeypatch, tmp_path):
+    """run_shell 的子进程环境不得带池 key：`set` 一条命令就能把凭据带回外部主。"""
+    import agent.tools.builtin as bi
+
+    monkeypatch.setenv("NODE_A_KEY", "sk-shouldnotleak")
+    monkeypatch.setenv("CF_API_TOKEN", "cftok-shouldnotleak")
+    seen = {}
+
+    class FakeProc:
+        stdout = b"ok"
+        stderr = b""
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        seen["env"] = kw.get("env")
+        return FakeProc()
+
+    monkeypatch.setattr(bi.subprocess, "run", fake_run)
+    cfg = Config(_interpolate({"tools": {"shell_timeout": 5}}))
+    reg = bi.build_builtin_tools(cfg)
+    reg.run("run_shell", {"command": "set | find /c KEY"})
+    assert seen["env"] is not None, "必须显式传 env，不能让子进程继承 os.environ"
+    assert "NODE_A_KEY" not in seen["env"] and "CF_API_TOKEN" not in seen["env"]
+    assert "PATH" in seen["env"], "功能变量不能被剔掉，否则 cmd 跑不动"
+
+
+def test_read_file_refuses_env_secret(tmp_path):
+    """`.env` 就在允许根内，但工具层不得把它的内容读出（模板 `.env.example` 除外）。"""
+    import agent.tools.builtin as bi
+
+    work = tmp_path / "proj"
+    work.mkdir()
+    (work / ".env").write_text("NODE_A_KEY=sk-leak\n", encoding="utf-8")
+    (work / ".env.example").write_text("#NODE_A_KEY=\n", encoding="utf-8")
+    reg = bi.build_builtin_tools(Config(_interpolate({})))
+    bi.set_workspace_roots([str(work)])  # 必须在建表之后：build_builtin_tools 会重设允许根
+    try:
+        out = reg.run("read_file", {"path": str(work / ".env")})
+        assert out["ok"] is False and "sk-leak" not in out["result"], out
+        assert reg.run("read_file", {"path": str(work / ".env.example")})["ok"] is True, (
+            "模板必须仍可读"
+        )
+    finally:
+        bi.set_workspace_roots([])

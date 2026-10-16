@@ -5,9 +5,18 @@ on:
     branches: [main, master]
   pull_request:
 
+# 同一个 PR/分支连续多次 push 时，只跑最新的一次：旧 run 的结果没人看，白占 runner。
+# （cancel-in-progress 只在同一 group 内生效，所以 group 里带上 ref 把不同分支隔开。）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    # 子进程冒烟用例（test_smoke 起 `python -m agent`）单条上限 120-180s；没有这个值时
+    # 一次挂死会一路耗到 GitHub 的 6 小时上限，把 queue 里的其它 PR 一起拖住。
+    timeout-minutes: 20
     strategy:
       # requires-python 写的是 >=3.10，但过去只用 .python-version（3.14）跑过：
       # 下限从未被验证，用 3.11+ 才有的特性（tomllib / TaskGroup / datetime.UTC…）
@@ -46,6 +55,8 @@ jobs:
   mutation-gate:
     needs: lint-and-test
     runs-on: ubuntu-latest
+    # 这里要跑的 pytest 次数 = 变异条目数（几十次子进程启动），给足但不放任挂死。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

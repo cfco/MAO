@@ -55,6 +55,16 @@ class _Tracker:
             self.inflight_total -= 1
 
 
+def _worst(pool) -> float:
+    """一次派工的最坏墙钟（重试+退避都算）：与实现同源，断言不写死 magic number。"""
+    from agent.core.llm import worst_case_per_request
+
+    return worst_case_per_request(
+        float(pool.cfg.llm_cfg.get("timeout", 120) or 120),
+        int(pool.cfg.llm_cfg.get("max_retries", 2) or 0),
+    )
+
+
 def _pool(
     station_specs,
     max_per_station: int = 1,
@@ -92,7 +102,7 @@ def _fake_client(tracker: _Tracker, fail_once=()):
             self.station = (base_url, api_key)
             self.model = model
 
-        def chat(self, messages):
+        def chat_once(self, messages):
             n = tracker.calls.get(self.station, 0) + 1
             if self.station in fail_once and n == 1:
                 tracker.enter(self.station)
@@ -165,14 +175,14 @@ def test_max_per_station_relaxes_the_gate(monkeypatch):
 
 
 def test_effective_timeout_accounts_for_station_serialization():
-    """6 名 / 2 站 / 每站 1 ⇒ 实际并行 2 路 = 3 批 ⇒ 3×120+30；旧口径只有 2 批会误杀尾部。"""
+    """6 名 / 2 站 / 每站 1 ⇒ 实际并行 2 路 = 3 批 ⇒ 3×最坏墙钟+30；旧口径只有 2 批会误杀尾部。"""
     pool = _pool([("A", "http://a", "m1,m2,m3"), ("B", "http://b", "m1,m2,m3")])
     try:
         names = ["A:m1", "A:m2", "A:m3", "B:m1", "B:m2", "B:m3"]
         assert pool._batch_concurrency(len(names), names) == 2, "min(max_workers=3, 1×2站)"
-        assert pool._effective_timeout(len(names), None, names) == 3 * 120 + 30
+        assert pool._effective_timeout(len(names), None, names) == 3 * _worst(pool) + 30
         # 不传 workers ⇒ 退回旧口径（既有断言/调用方行为逐字不变）
-        assert pool._effective_timeout(len(names), None) == 2 * 120 + 30
+        assert pool._effective_timeout(len(names), None) == 2 * _worst(pool) + 30
         # 显式传入永远优先
         assert pool._effective_timeout(len(names), 0.3, names) == 0.3
     finally:
@@ -185,7 +195,7 @@ def test_single_station_batch_widens_timeout_the_most():
     try:
         names = ["A:m1", "A:m2", "A:m3"]
         assert pool._batch_concurrency(len(names), names) == 1
-        assert pool._effective_timeout(len(names), None, names) == 3 * 120 + 30
+        assert pool._effective_timeout(len(names), None, names) == 3 * _worst(pool) + 30
     finally:
         pool.close()
 

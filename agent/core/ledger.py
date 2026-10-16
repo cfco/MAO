@@ -58,10 +58,31 @@ class AtomicJsonLedger:
         """账本 → 待写文本。子类实现，且只读内存、不碰磁盘。"""
         raise NotImplementedError
 
+    def _disk_for_merge(self):
+        """写盘前重读磁盘，返回对端进程已落盘的数据；None=不合并（默认）。
+
+        为什么需要：`shared_by_path` 与 `_write_lock` 的串行只在**进程内**有效。外部主常
+        并发跑多个 `mao call`（每次一个新进程），各进程的内存账本互不可见，`write()` 又是
+        整篇覆盖 → 后写者把先写者的记录整段抹掉（实测两个进程各记一条，6/6 轮只剩一条）。
+        当日隔离记录被抹掉等于坏节点当天被反复派工，属于状态损坏而不只是"少一条样本"，
+        所以需要合并；延迟账本样本会不断重测、丢一两个无害，且合并会与 `_trim` 的裁剪
+        互相打架（被裁掉的样本每次又被并回来 → 档案不降反增），故保持整篇覆盖。
+        """
+        return None
+
+    def _merge_disk_locked(self, disk) -> None:  # 调用方持 _lock
+        """把 `_disk_for_merge` 读到的对端记录并进内存账本。子类实现，只读内存。"""
+
     def write(self) -> None:
-        """取快照并原子落盘（在 _lock 之外调用）。落盘失败只丢持久化，不外抛。"""
+        """取快照并原子落盘（在 _lock 之外调用）。落盘失败只丢持久化，不外抛。
+
+        顺序固定：读盘（锁外 IO）→ 合并 + 取快照（锁内纯内存）→ 落盘。
+        """
         with self._write_lock:
+            disk = self._disk_for_merge()  # IO 留在 _lock 之外
             with self._lock:
+                if disk is not None:
+                    self._merge_disk_locked(disk)
                 text = self._snapshot_locked()
             try:
                 atomic_write_text(self.store_path, text)

@@ -63,17 +63,22 @@ class StationGateMixin:
         station: tuple[str, str],
         messages: list[dict],
     ) -> tuple[dict | None, Exception | None, float]:
-        """在「同站串行门」内发**一次**请求，返回 (resp, error, 往返毫秒)。
+        """在「同站串行门」内发**一次网络尝试**，返回 (resp, error, 往返毫秒)。
+
+        调的是 `client.chat_once()` 而不是 `chat()`：`chat()` 自带退避重试与 `sleep`，
+        把它整段包在门里等于让退避等待也占着"一站一请求"的配额（实测同站第二个工人
+        要等 1.55s 才拿到门，而它等的几乎全是别人的 sleep）。重试环现在归
+        `WorkerPool._call_result` 在门外跑。
 
         - error 为 None 表示成功；异常原样带回由调用方分类（LLMError / 意外异常），
           这里不吞也不记账，保持错误分级语义在 `_call_result` 一处可见。
-        - 只包一次 chat、**绝不在此递归**：见模块文档第 2 条，返回时门必定已释放。
+        - 只包一次尝试、**绝不在此递归**：见模块文档第 2 条，返回时门必定已释放。
         - 毫秒只在门内计时：等同站前一个请求的排队时间不属于这个模型的延迟。
         """
         with self._station_gate(station):
             t0 = time.monotonic()  # 只量真实请求往返（不含建连/排队），与探测同口径
             try:
-                return client.chat(messages), None, (time.monotonic() - t0) * 1000.0
+                return client.chat_once(messages), None, (time.monotonic() - t0) * 1000.0
             except Exception as e:  # noqa: BLE001 - 交回上层按 LLMError/意外异常分类
                 return None, e, (time.monotonic() - t0) * 1000.0
 

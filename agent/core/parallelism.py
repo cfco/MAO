@@ -15,11 +15,13 @@ _effective_timeout / _spawn / _run_parallel）约 100 行，与「派工 + 健�
 from __future__ import annotations
 
 import concurrent.futures
+import queue
 import threading
 import time
 from concurrent.futures import Future, wait
 
 from .constants import ST_ERROR
+from .llm import worst_case_per_request
 from .redact import safe_error_text
 
 
@@ -150,37 +152,22 @@ class ParallelMixin:
         传入 workers 时并行度按站数折算（见 _batch_concurrency）：同站串行后批次数会
         变大，限时随之放宽。
         """
-        if timeout is not None:
+        if timeout is not None and float(timeout) > 0:
             return float(timeout)
+        # timeout<=0（含显式 0）不按"限时 0 秒"处理：那会让 `wait()` 立即返回、全员被判
+        # "未完成"，额度照烧、结果全丢。调用方要给上界就传正数，否则回到自适应口径。
         per_call = self.cfg.as_float(
             self.cfg.llm_cfg.get("timeout", 120) or 120, "llm.timeout", 120.0, minimum=1.0
         )
+        max_retries = self.cfg.as_int(
+            self.cfg.llm_cfg.get("max_retries", 2), "llm.max_retries", 2, minimum=0
+        )
+        # 每批按"一次派工的最坏墙钟"折算（含重试与退避），不是单次 timeout：
+        # 见 llm.worst_case_per_request 的原因说明。
+        worst = worst_case_per_request(per_call, max_retries)
         concurrency = self._batch_concurrency(max(1, n), workers)
         batches = max(1, -(-max(1, n) // concurrency))
-        return batches * per_call + 30.0
-
-    def _spawn(self, fn, sem: threading.Semaphore) -> Future:
-        """起一个 daemon 工作线程执行 fn，返回其 Future（取代 ThreadPoolExecutor）。
-
-        为什么不用 ThreadPoolExecutor（审计 P2）：它的 worker 是非 daemon 线程，
-        解释器退出时 atexit 会把它们全部 join——批量派工里的「放弃等待」只是不再
-        等结果，bridge/mcp 进程收尾仍会被在飞请求（最长 LLM timeout×retries）拖住。
-        daemon 线程让退出干脆。取消语义保留：整体限时到点后尚未开跑的任务被 cancel，
-        set_running_or_notify_cancel 返回 False ⇒ 不再打网络，不白烧免费额度。
-        """
-        fut: Future = Future()
-
-        def _run() -> None:
-            with sem:
-                if not fut.set_running_or_notify_cancel():
-                    return  # 已被放弃（cancel），不派工
-                try:
-                    fut.set_result(fn())
-                except BaseException as e:  # noqa: BLE001 - 异常必须进 future，不能杀线程
-                    fut.set_exception(e)
-
-        threading.Thread(target=_run, daemon=True).start()
-        return fut
+        return batches * worst + 30.0
 
     def _run_parallel(
         self,
@@ -199,10 +186,33 @@ class ParallelMixin:
         """
         if not workers:
             return {}
-        sem = threading.Semaphore(min(len(workers), self.cfg.max_workers))
         memo = StationMemo()  # 本批次共享：同站整故障时抑制跨工人回退放大
-        futs = {
-            self._spawn(lambda w=w: self.ask_result(w, prompt, system, memo=memo), sem): w
-            for w in workers
-        }
+        # 线程数 = 并发上限，而不是点名人头数。旧写法为每个工人都起一条线程、只靠信号量
+        # 排队（实测点名 40 个工人 → 40 条 live 线程，每条约 8MB 栈），规模一大就先撞系统
+        # 线程上限；并发口径与旧实现逐字一致，只是不再让"排队"也占一条线程。
+        slots = min(len(workers), max(1, self.cfg.max_workers))
+        jobs: queue.SimpleQueue = queue.SimpleQueue()
+        futs: dict[concurrent.futures.Future, str] = {}
+        for w in workers:
+            fut: concurrent.futures.Future = concurrent.futures.Future()
+            futs[fut] = w
+            jobs.put((w, fut))
+        for _ in range(slots):
+            jobs.put(None)  # 每条线程取到自己的收工标记就退出
+
+        def _worker_thread() -> None:
+            while True:
+                item = jobs.get()
+                if item is None:
+                    return
+                w, fut = item
+                if not fut.set_running_or_notify_cancel():
+                    continue  # 已被整体限时放弃 ⇒ 不打网络、不烧免费额度
+                try:
+                    fut.set_result(self.ask_result(w, prompt, system, memo=memo))
+                except BaseException as e:  # noqa: BLE001 - 异常必须进 future，不能杀线程
+                    fut.set_exception(e)
+
+        for i in range(slots):
+            threading.Thread(target=_worker_thread, daemon=True, name=f"mao-dispatch-{i}").start()
         return self._wait_gather(futs, timeout, on_done=on_done)

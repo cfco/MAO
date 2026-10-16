@@ -339,7 +339,7 @@ class _Boom:
         self.model = model  # 真 LLMClient 也暴露该属性，主智能体记档要用
         self.closed = 0
 
-    def chat(self, messages):
+    def chat_once(self, messages):
         raise LLMError("api", "boom", retryable=False)
 
     def close(self):
@@ -364,7 +364,7 @@ class _Transient:
         self.model = model
         self.closed = 0
 
-    def chat(self, messages):
+    def chat_once(self, messages):
         raise LLMError("timeout", "boom", retryable=True)
 
     def close(self):
@@ -386,3 +386,39 @@ def test_transient_failure_cools_down_but_not_quarantined_today(tmp_path, monkey
     assert "隔离" not in pool.ask("st:m2", "任务B")
     # 终态失败模型不受影响：另一个模型的隔离判定独立
     assert not pool.health.quarantined("st:m1")
+
+
+def test_write_merges_records_from_another_process(tmp_path):
+    """并发多进程的记账不得互相覆盖（`get_health` 的共享只在进程内）。
+
+    旧行为：`write()` 直接把自己那份内存账本整篇落盘。外部主常同时开多个 `mao call`
+    （每次一个新进程），两个进程各自读盘建账本再各写一次 → 后写的把先写的整段抹掉，
+    实测 6/6 轮都只剩一条。被抹掉的可能是"某模型今天终态失败"的当日隔离记录。
+    """
+    import json
+
+    store = tmp_path / "h.json"
+    a = ModelHealth(store, None, 7)
+    b = ModelHealth(store, None, 7)
+    # 双方都在"空档案"上建好内存账本 —— 等价于两个进程几乎同时首次读盘
+    assert not a.quarantined("w-a") and not b.quarantined("w-b")
+    a.record_failure("w-a", "m-a", "")
+    b.record_failure("w-b", "m-b", "")
+    keys = set(json.loads(store.read_text(encoding="utf-8")).get("models", {}))
+    assert {"w-a", "w-b"} <= keys, f"后写者不得覆盖对端记录：{sorted(keys)}"
+
+
+def test_merged_active_dates_do_not_fake_a_retire(tmp_path):
+    """运行日并集不得让"没失败过的日子"混进窗口去凑连击。"""
+    import json
+
+    store = tmp_path / "h.json"
+    a = ModelHealth(store, None, 3)
+    for day in ("2026-01-01", "2026-01-02"):
+        a.record_failure("w-a", "m-a", "NODE_A_MODELS", day=day)
+    b = ModelHealth(store, None, 3)  # 另一进程：只登记了一个"该模型没失败"的运行日
+    b.note_active("2026-01-03")
+    b.record_failure("w-b", "m-b", "NODE_B_MODELS", day="2026-01-03")
+    active = json.loads(store.read_text(encoding="utf-8"))["active_dates"]
+    assert active == ["2026-01-01", "2026-01-02", "2026-01-03"]
+    assert "disabled" not in a.snapshot()["w-a"], "w-a 只失败了窗口内 2/3 天，不该下线"
