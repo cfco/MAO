@@ -135,7 +135,7 @@ def test_duplicate_mcp_tool_names_skipped_not_fatal(monkeypatch):
             self.description = ""
 
     class FakeConn:
-        def __init__(self, name, cfg):
+        def __init__(self, name, cfg, call_timeout=300.0):
             self.name = name
             self.error = None
             self.session = object()  # 假装已连接

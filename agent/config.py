@@ -1,13 +1,13 @@
-"""配置加载：config.yaml 骨架 + ${ENV_VAR} 环境变量插值。
+"""配置对象：把插值后的 config.yaml 映射成可读属性（池 / 数值 / 路径 / 开关）。
 
-v4（2026-09-23 配置重构二期）：
-    - config.yaml 只保留**结构骨架**（各段的值全部用 ${VAR} 引用，可带 :-默认值），
-      不写任何真实运行值；
-    - .env 承载**全部配置值**（端点 / KEY / LLM 参数 / 协作参数 / 工具参数），
-      密级、不进 git；
-    - model_registry.txt 承载**全部模型清单**（NODE_A_MODELS / NODE_B_MODELS / NODE_C_MODELS / NODE_D_MODELS 等），
-      随仓库维护、git pull 即更新，也是自动下线机制唯一可改写区（给模型名加 #）。
-    模型名与配置彻底分家：.env 里出现 *_MODEL(S) 会被分层守卫点名提醒。
+本文件只保留 **Config 装配与读取面**。周边已按职责分家（2026-10-19，原单文件 806 行
+超「单文件 ≤500 行」约定）：
+  config_util.py —— 无状态工具：${VAR} 插值、模型清单拆分、路径口径、类型容错告警
+  profiles.py    —— AgentProfile（池成员定义）+ DEFAULT_CONTEXT
+  config_load.py —— 加载流程：分层 dotenv、叠加层套用、进程内缓存（load_config）
+
+三者的公共名字仍从本模块 re-export，历史导入面（`from .config import Config,
+load_config, ROOT, _interpolate`）一律不用改。
 
 配置分层（环境变量注入顺序，后层覆盖前层）：
     shell 环境变量 > .env（本地配置，含端点/key/参数）> model_registry.txt（模型清单基础层）
@@ -16,164 +16,25 @@ v4（2026-09-23 配置重构二期）：
 from __future__ import annotations
 
 import os
-import re
-import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-ROOT = Path(__file__).resolve().parent.parent
-# ${VAR} 取环境变量；${VAR:-默认值} 缺失时用默认值（不告警）。
-# 默认值语法是为了「同一份 config.yaml 既能开箱即用、又能被 .env 覆盖」：
-# 例如 collaboration.cooldown_base: ${COLLAB_COOLDOWN_BASE:-10}
-_ENV_PATTERN = re.compile(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}")
-# 启动时已打印过的缺失变量，避免同一变量在嵌套结构中重复警告
-_missing_logged: set[str] = set()
-# 已警告过的"类型写错"配置项，避免同一 key 每次读取都刷屏
-_bad_value_logged: set[str] = set()
-# 免费节点叠加层默认路径（自动发现的增量写这里，绝不碰 git 跟踪的 model_registry.txt）
-_DEFAULT_OVERLAY = "data/free_nodes.json"
-
-
-def _warn_bad_value(key: str, value: Any, default: Any) -> None:
-    """配置值类型异常时告警一次（走 stderr，保持 stdout 纯净约定）。"""
-    if key in _bad_value_logged:
-        return
-    print(
-        f"[配置警告] {key} 的值 {value!r} 不是合法数字，已按默认值 {default} 处理",
-        file=sys.stderr,
-    )
-    _bad_value_logged.add(key)
-
-
-def _warn_bad_bool(key: str, value: Any, default: Any) -> None:
-    """布尔配置值异常时告警一次（与 _warn_bad_value 同源，提示语区分类型）。"""
-    if key in _bad_value_logged:
-        return
-    print(
-        f"[配置警告] {key} 的值 {value!r} 不是合法布尔（true/false/1/0），已按默认值 {default} 处理",
-        file=sys.stderr,
-    )
-    _bad_value_logged.add(key)
-
-
-def _interpolate(value: Any) -> Any:
-    """递归把字符串里的 ${VAR} / ${VAR:-默认值} 替换为环境变量值。
-
-    取值规则：
-    - 环境变量存在（含空串）→ 用它的值；
-    - 不存在且有 `:-默认值` → 用默认值，**不告警**（这是用户明确写了兜底）；
-    - 不存在且无默认值 → 替换为空串并打印一次警告。
-
-    设计选择：缺失 key 不直接报错，让启动能走完；但打印警告提醒用户配置可能不完整，
-    避免 API Key 为空时静默走到运行时才炸。
-    警告必须走 stderr：bridge 协议与 CLI --stream 的 stdout 是纯 JSON 行，
-    任何混入 stdout 的提示都会让按行 json.loads 的调用方解析失败。
-    """
-
-    def _sub(m: re.Match) -> str:
-        key, default = m.group(1), m.group(2)
-        val = os.environ.get(key)
-        if val is not None:
-            return val
-        if default is not None:
-            return default
-        if key not in _missing_logged:
-            print(
-                f"[配置警告] ${key} 未在 .env / model_registry.txt / 环境变量中定义，插值为空串",
-                file=sys.stderr,
-            )
-            _missing_logged.add(key)
-        return ""
-
-    if isinstance(value, str):
-        return _ENV_PATTERN.sub(_sub, value)
-    if isinstance(value, dict):
-        return {k: _interpolate(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_interpolate(v) for v in value]
-    return value
-
-
-def _split_models(raw: Any) -> list[tuple[str, int]]:
-    """把「一站多模型」字段拆成 (模型名, 上下文长度) 列表，支持临时屏蔽。
-
-    屏蔽机制（中转站免费模型常变，注释即下线）：
-    - 列表中 # 前缀的项跳过，如 "a,#b,c" → ["a","c"]
-    - YAML 里行首 # 注释的项 YAML 本身就会忽略
-    上下文长度：用 "@长度" 标注单模型窗口，如 "gpt-4o-mini@128k,claude-3-haiku@200000"，
-    不带 @ 的模型上下文长度记为 0（表示未指定，按默认处理）。
-    长度单位缩写：k/K×1024，其余按整数 token 数。
-    """
-    if isinstance(raw, list):
-        raw = ",".join(str(x) for x in raw)
-    out: list[tuple[str, int]] = []
-    for part in str(raw or "").split(","):
-        p = part.strip()
-        if not p or p.startswith("#"):  # 空项或 # 前缀 = 临时屏蔽
-            continue
-        # 取最后一个 @ 拆「窗口标注」；但模型名本身可能带 @（如 Cloudflare 的 @cf/...）。
-        # 只有当 @ 之后是纯数字（可带 k/K 上下文长度）时才算窗口标注，否则 @ 属于模型名。
-        name, sep, ctx = p.rpartition("@")
-        ctx_len = 0
-        if sep:
-            s = ctx.strip().lower()
-            mul = 1024 if s.endswith("k") else 1
-            num = s[:-1] if s.endswith("k") else s
-            if num.isdigit():  # @ 之后是上下文长度 → 拆窗口
-                try:
-                    ctx_len = int(num) * mul
-                except ValueError:
-                    ctx_len = 0
-                name = name.strip()
-            else:  # @ 是模型名一部分（@cf/...），整串即模型名
-                name = p
-        else:  # 无 @ 标注，整串即模型名
-            name = p
-        if name:
-            out.append((name, ctx_len))
-    return out
-
-
-DEFAULT_CONTEXT = 128_000  # 未标注上下文长度的模型按这个大小时钟估算裁剪历史
-
-
-@dataclass
-class AgentProfile:
-    """智能体池中的一条：一个可 API 接入的模型智能体。
-
-    支持「一站多模型」：一个站（base_url+api_key）可挂多个 model，
-    每个模型展开成一个 AgentProfile。名字：单模型取站名，多模型取"站名:模型名"。
-    """
-
-    name: str
-    base_url: str
-    api_key: str
-    model: str
-    context_length: int = 0  # 上下文窗口(token)；0=未指定按 DEFAULT_CONTEXT
-    note: str = ""
-    # 能力标签（逗号分隔，如 "code,中文,长上下文"）：外部主据此决定把哪类活派给谁。
-    tags: str = ""
-    # 该模型清单来自 model_registry.txt 里的哪个变量（如 NODE_A_MODELS），
-    # 便于诊断"这批模型挂在哪一站"，也是自动下线改写（加 #）的目标行定位用。
-    # 值写死在 config.yaml（非 ${VAR}）时为空。
-    models_env: str = ""
-    # 免费节点发现适配器名（"kilo"/"bynara"/""=不自动发现）。由 config.yaml 各 agent
-    # 的 `discovery:` 字面量指定；发现器据此拉该站在线免费清单并与 registry 对账。
-    discovery: str = ""
-
-    def brief(self) -> dict:
-        """对外展示用（不含 key）。"""
-        return {
-            "name": self.name,
-            "base_url": self.base_url,
-            "model": self.model,
-            "context_length": self.context_length or DEFAULT_CONTEXT,
-            "note": self.note,
-            "tags": self.tags,
-        }
+# re-export：加载流程与工具函数历史上都在本文件内，测试/外壳按名取（F401 是有意的）
+from .config_load import _load_dotenv, load_config  # noqa: F401
+from .config_util import (  # noqa: F401
+    _DEFAULT_OVERLAY,
+    _ENV_PATTERN,
+    ROOT,
+    _bad_value_logged,
+    _free_nodes_path,
+    _interpolate,
+    _missing_logged,
+    _model_registry_path,
+    _split_models,
+    _warn_bad_bool,
+    _warn_bad_value,
+)
+from .profiles import DEFAULT_CONTEXT, AgentProfile  # noqa: F401
 
 
 class Config:
@@ -239,6 +100,12 @@ class Config:
     # ---------- 智能体池 ----------
 
     def profile(self, name: str) -> AgentProfile | None:
+        """按名字取池成员（线性查找）。
+
+        生产里的热路径走 `WorkerPool.profiles`（dict，O(1)）；本方法是配置层的查询面，
+        供测试断言与"只想读配置、不想建池"的程序化调用方使用——不要因为 grep 生产代码
+        没有调用点就删掉它。
+        """
         for p in self.agent_profiles:
             if p.name == name:
                 return p
@@ -359,6 +226,24 @@ class Config:
         """
         return self.as_bool(self.collab_cfg.get("economy", False), "collaboration.economy", False)
 
+    # ---------- 投票与评审 ----------
+
+    @property
+    def vote_preview_chars(self) -> int:
+        """投票阶段每个候选方案给投票人看的预览长度（字符，默认 240，夹在 40~2000）。
+
+        为什么可配：预览太短（曾固定 80）时，投票人只能凭开头几十字判断，长方案之间
+        的差异被截掉，投票退化成"选标题"；太长则 N 份候选 × 长度直接顶爆投票 prompt
+        （免费小模型上下文有限）。默认 240 是"能看出结构差异、又不至于压垮上下文"的折中。
+        """
+        raw = self.as_int(
+            self.collab_cfg.get("vote_preview_chars", 240),
+            "collaboration.vote_preview_chars",
+            240,
+            minimum=40,
+        )
+        return min(2000, raw)
+
     # ---------- 模型健康档案（collaboration.*） ----------
 
     @property
@@ -407,12 +292,11 @@ class Config:
     def model_registry_path(self) -> Path:
         """模型清单文件（model_registry.txt）路径，自动下线改写（加 #）的目标文件。
 
-        优先级：环境变量 MAO_MODEL_REGISTRY_FILE（测试隔离用）> 项目根 model_registry.txt。
-        该文件承载全部模型名、随仓库维护，与 .env（配置）分开。
+        优先级与读侧统一走 `_model_registry_path()`：环境变量 MAO_MODEL_REGISTRY_FILE
+        （测试隔离 / 临时指定）> 项目根 model_registry.txt。该文件承载全部模型名、
+        随仓库维护，与 .env（配置）分开。
         """
-        rel = os.environ.get("MAO_MODEL_REGISTRY_FILE") or "model_registry.txt"
-        p = Path(rel)
-        return p if p.is_absolute() else ROOT / p
+        return _model_registry_path()
 
     @property
     def model_health_path(self) -> Path:
@@ -484,6 +368,22 @@ class Config:
             "collaboration.latency_probe_timeout",
             8.0,
             minimum=1.0,
+        )
+
+    @property
+    def latency_probe_max_tokens(self) -> int:
+        """探测请求的输出上限（token，默认 8，<=0 = 不带该参数）。
+
+        为什么带：不带 max_tokens 时，样本里混进了"这个模型爱写多长"——一个话痨模型
+        在同等节点速度下会被系统性地记成"更慢"，而延迟档案正是选路裁剪的排名依据。
+        免费网关对未知参数行为不一，故这里是**可关**的软约束：探测侧遇到"参数不支持"
+        类 4xx 会自动按站降级为不带该参数（见 LatencyMixin._probe_one），不会整轮丢样本。
+        """
+        return self.as_int(
+            self.collab_cfg.get("latency_probe_max_tokens", 8),
+            "collaboration.latency_probe_max_tokens",
+            8,
+            minimum=0,
         )
 
     @property
@@ -564,6 +464,21 @@ class Config:
         )
 
     @property
+    def mcp_tool_timeout(self) -> float:
+        """单次 MCP 工具调用的最长等待（秒，默认 300，下限 5）。
+
+        原先硬编码 300：长事务型工具（跑测试、等构建）会被直接判超时，而短工具又白等
+        同一个上限。抽成配置项后按接入的 server 类型自行调；超时只影响这一次调用
+        （session 作废、后台走重连），不会永久摘掉该 server。
+        """
+        return self.as_float(
+            self.tools_cfg.get("mcp_tool_timeout", 300),
+            "tools.mcp_tool_timeout",
+            300.0,
+            minimum=5.0,
+        )
+
+    @property
     def workspace(self) -> list[str]:
         """额外允许工具访问的工作区目录（tools.workspace）。
 
@@ -580,206 +495,3 @@ class Config:
         """
         raw = self.as_list(self.tools_cfg.get("workspace"), "tools.workspace", [])
         return [s for s in (str(x).strip() for x in raw) if s]
-
-
-def _load_dotenv(path: Path, into: set[str] | None = None) -> list[str]:
-    """把一个 KEY=VALUE 文件注入 os.environ（供 ${VAR} 插值使用），返回文件里出现的变量名。
-
-    只返回名字、不返回值：调用方据此做分层体检（如 .env 里混入 *_MODELS 模型变量），
-    返回值设计上就拿不走任何密钥内容。
-
-    `into`（可选）收集**本次实际注入**的 key：热重载时用于回收"上次由 dotenv
-    注入、但本次文件已删除"的 key（见 load_config），保证从 .env 删掉一行后
-    os.environ 不再残留旧值。只对等于 os.environ 时才收集；shell 预置的
-    同名变量（`key in os.environ and key not in _dotenv_keys` 分支）不收集、
-    load_config 也不会回收它。
-
-    分层加载（调用方按序调两次，后层覆盖前层同名变量）：
-    1) model_registry.txt —— 基础层：模型清单（随仓库维护，进 git，自动下线改写它）；
-    2) .env         —— 配置层：端点 / KEY / LLM 与协作参数（保密，不进 git）。
-    优先级：shell 启动前已 export 的变量 > .env > model_registry.txt。
-
-    保密约定：.env 以点开头，AI 不读取其内容；这里只负责在运行时加载，
-    不打印、不落盘、不返回任何值。缺失的文件不影响启动（静默跳过，返回空列表）。
-
-    热加载语义：
-    - 进程启动前已在 shell 里 export 的变量优先级最高（不被 dotenv 文件覆盖）；
-    - 由本函数注入的变量（记录在 _dotenv_keys）在文件变化时会被更新，
-      避免「只改 .env 不改 config.yaml」时旧值被 setdefault 钉死、缓存永远不刷新。
-    """
-    global _dotenv_keys
-    names: list[str] = []
-    if not path.exists():
-        return names
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            key = key.strip()
-            # 引号优先于注释剥离（审计：旧实现先 split(" #") 再 strip('"')）：
-            # `KEY="a #b"` 的 # 属于值本身，旧写法会把它静默截成 `a`。
-            val = val.strip()
-            if val[:1] in ('"', "'"):
-                quote = val[0]
-                end = val.find(quote, 1)
-                # 闭合引号之后的内容（` " # 备注`）视为注释丢弃；未闭合则取起始引号之后
-                val = val[1:end] if end != -1 else val[1:]
-            else:
-                # 未加引号时才剥行内注释：值里以"空格+#"开头的部分视为注释（如
-                # `TOOLS_SHELL_TIMEOUT=120 # 秒`）。不剥模型清单的屏蔽标记：
-                # `NODE_A_MODELS=#m-one` 的 # 紧贴值无前导空格，不受影响。
-                val = val.split(" #", 1)[0].strip()
-            if not key:
-                continue
-            names.append(key)
-            # 区分"shell 预置"与"dotenv 注入"：前者不覆盖，后者每次都更新
-            # （后者规则同时保证分层顺序：先读 model_registry.txt 后读 .env，.env 覆盖 registry）
-            if key in os.environ and key not in _dotenv_keys:
-                continue  # shell 里已有，尊重 shell 的值
-            os.environ[key] = val
-            _dotenv_keys.add(key)
-            if into is not None:
-                into.add(key)
-    except OSError:
-        pass  # 读取失败不拖垮启动，交给原环境变量
-    return names
-
-
-def _safe_mtime(p: Path) -> float:
-    """取文件 mtime，不存在返回 0.0（不抛异常，方便缓存比较）。"""
-    try:
-        return p.stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def _free_nodes_path(collab_cfg: dict) -> Path:
-    """免费节点叠加层（data/free_nodes.json）路径的唯一口径。
-
-    优先级：环境变量 `MAO_FREE_NODES_FILE`（测试隔离/临时指定）>
-    `collaboration.free_nodes_file`（可对模型清单与密钥无感地改路径）> `_DEFAULT_OVERLAY`。
-    写侧（`Config.free_nodes_path`，发现器落盘处）与读侧（`load_config` 套叠加层处）
-    必须共用本函数：两处各写一份时曾出现"发现写到 A、启动读 B"，自动发现结果永不生效。
-    值本身可能写成 `${COLLAB_FREE_NODES_FILE:-data/free_nodes.json}`，故先插值再判定绝对路径。
-    """
-    rel = os.environ.get("MAO_FREE_NODES_FILE") or str(
-        _interpolate(collab_cfg.get("free_nodes_file", _DEFAULT_OVERLAY))
-    )
-    p = Path(rel)
-    return p if p.is_absolute() else ROOT / p
-
-
-def load_config(path: Path | None = None, force: bool = False) -> Config:
-    """加载 config.yaml 并做环境变量插值。
-
-    设计：
-    - 分层 dotenv：先 model_registry.txt（模型清单基础层）再 .env（配置层：
-      端点/KEY/参数），同名变量后者胜出、shell 预置最高（见 _load_dotenv）。
-    - 带进程内缓存，config.yaml / .env / model_registry.txt 三者 mtime 均未变则直接复用。
-      （model_registry.txt 参与运行时配置——模型健康下线会改写它，必须纳入失效判断；
-      .env 由用户/AI 改值时同样要让缓存失效。）
-    - force=True 强制重读并重新构建 Config（热加载场景）。
-    - 缓存只服务于默认路径：显式传 path（测试/多配置场景）每次真实读盘，
-      既不读缓存也不写缓存（审计 P2：旧实现缓存全局唯一却不区分 path，
-      加载过一次显式路径后，默认路径的调用可能拿到别的文件构建的缓存）。
-    - 返回新 Config 对象，调用方用它替换自己的 cfg 引用；已有 Agent 持有的旧 cfg
-      不受影响，避免 MCP 连接被意外重连。
-
-    调用方可频繁调用本函数，只有配置真正变化时才解析。
-    """
-    global \
-        _cfg_cache, \
-        _cfg_cache_mtime, \
-        _cfg_cache_dotenv_mtime, \
-        _cfg_cache_registry_mtime, \
-        _cfg_cache_overlay_mtime
-    global _dotenv_keys
-    p = path or (ROOT / "config.yaml")
-    cacheable = path is None
-    registry_path = ROOT / "model_registry.txt"
-    dotenv_path = ROOT / ".env"
-    # 两层 dotenv 只解析**一次**，注入与后面的回收/分层体检共用同一结果。
-    # 旧实现在这里先无参解析一遍（只为拿 os.environ 供缓存判定用），确认要重建后又带
-    # injected 再解析一遍：命中缓存时白解析（每次调用都吃两份磁盘 IO），未命中时
-    # 第一遍的注入副作用又被第二遍覆盖，逻辑绕且容易改一处漏一处。
-    injected: set[str] = set()
-    _load_dotenv(registry_path, injected)  # 基础层：模型清单
-    env_names = _load_dotenv(dotenv_path, injected)  # 配置层：端点/KEY/参数
-
-    # config.yaml 先读出来：叠加层路径要取 collaboration.free_nodes_file（下面插值也用同一份）。
-    data: dict = {}
-    if p.exists():
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-
-    # 免费节点叠加层：在插值前把"自动发现"的增量（added/retired）叠加到对应
-    # NODE_*_MODELS 变量上。registry 仍是唯一真源，叠加层只做增量修正；
-    # 抓取失败/MAO_FREE_NODE_PROBE=0 时 apply_overlay 整段跳过，离线安全。
-    # 路径必须走 _free_nodes_path（与 Config.free_nodes_path 同一函数）：旧写法在这里只认
-    # MAO_FREE_NODES_FILE 和硬编码默认，而写侧认 collaboration.free_nodes_file —— 配了该值的
-    # 用户"发现写到 A、启动读 B"，发现结果永不生效。路径也不能只在 try 里赋值：import 一旦
-    # 失败，下面 `_safe_mtime(overlay_path)` 就是 UnboundLocalError，启动直接崩。
-    overlay_path = _free_nodes_path(data.get("collaboration") or {})
-    try:
-        from .core.node_discovery import apply_overlay as _apply_free_node_overlay
-
-        _apply_free_node_overlay(overlay_path)
-    except Exception:  # noqa: BLE001 - 叠加层读写异常绝不影响启动
-        pass
-
-    cfg_mtime = _safe_mtime(p)
-    dotenv_mtime = _safe_mtime(dotenv_path)
-    registry_mtime = _safe_mtime(registry_path)
-    overlay_mtime = _safe_mtime(overlay_path)
-    if (
-        cacheable
-        and not force
-        and _cfg_cache is not None
-        and _cfg_cache_mtime == cfg_mtime
-        and _cfg_cache_dotenv_mtime == dotenv_mtime
-        and _cfg_cache_registry_mtime == registry_mtime
-        and _cfg_cache_overlay_mtime == overlay_mtime
-    ):
-        return _cfg_cache
-    # mtime 变化 / 强制重载 / 首次加载：读磁盘 → 构建 Config → 更新缓存
-    _missing_logged.clear()  # 新 config 可能引用不同的 ${VAR}，重置警告
-    _bad_value_logged.clear()  # 同上：新配置可能已修好类型错，允许重新告警
-    # 热重载回收：把「上次由 dotenv 注入、本次文件已删除」的 key 从 os.environ 清掉。
-    # 旧实现 _dotenv_keys 只增不清，从 .env 删掉一行 key 后 os.environ 仍残留旧值，
-    # "停用某 key" 永远不会生效（配置/安全语义泄漏）。回收集合只含**本次实际注入**
-    # 的 key：shell 预置（不在 _dotenv_keys）的变量不受影响；registry/.env 两层任一
-    # 层还有该 key 也不会被回收。
-    for stale in _dotenv_keys - injected:
-        os.environ.pop(stale, None)
-    _dotenv_keys = injected
-    # 分层守卫：模型名**必须**写在 model_registry.txt（随仓库维护、自动下线改写它），
-    # .env 是配置区。若 .env 里混进模型清单变量，会静默盖住 registry 的 git 更新和
-    # 自动下线（# 下线看似失效），必须显式提醒——只报变量名，绝不回显任何值。
-    strays = [n for n in env_names if n.endswith("_MODEL") or n.endswith("_MODELS")]
-    if strays:
-        print(
-            f"[配置分层提醒] .env 中出现模型清单变量：{', '.join(strays)}。"
-            "模型名一律写在 model_registry.txt（随仓库维护、自动下线也只改写它），"
-            ".env 里的同名变量会盖住 registry 的 git 更新和自动下线，"
-            "导致模型新增/下线看似失效——建议删掉这几行。",
-            file=sys.stderr,
-        )
-    cfg = Config(_interpolate(data), raw=data)
-    if not cacheable:
-        return cfg  # 显式路径：不进全局缓存，避免污染/错拿默认配置的缓存
-    _cfg_cache = cfg
-    _cfg_cache_mtime = cfg_mtime
-    _cfg_cache_dotenv_mtime = dotenv_mtime
-    _cfg_cache_registry_mtime = registry_mtime
-    _cfg_cache_overlay_mtime = overlay_mtime
-    return _cfg_cache
-
-
-# ---------- 进程内配置缓存（热加载用）----------
-_cfg_cache: Config | None = None
-_cfg_cache_mtime: float = 0.0  # config.yaml 的 mtime，变化即重载
-_cfg_cache_dotenv_mtime: float = 0.0  # .env 的 mtime，变化即重载
-_cfg_cache_registry_mtime: float = 0.0  # model_registry.txt 的 mtime，变化即重载
-_cfg_cache_overlay_mtime: float = 0.0  # data/free_nodes.json 的 mtime，变化即重载
-_dotenv_keys: set[str] = set()  # 由 dotenv 文件注入的变量名（热加载时需更新）

@@ -178,10 +178,7 @@ def _head_word(segment: str) -> str:
     s = _CMD_WRAPPER.sub("", segment.strip())
     if not s:
         return ""
-    try:
-        tokens = shlex.split(s, posix=False)
-    except ValueError:
-        tokens = [s]
+    tokens = _split_tokens(s) or [s]  # 拆词统一走 _split_tokens：ValueError 已兜成空列表
     if not tokens:
         return ""
     # 剥引号后可能仍带空格（整个命令被一对引号包住），取第一个词才是命令词
@@ -294,7 +291,11 @@ _EMBEDDED_Q = re.compile(r"'([^']*)'|\"([^\"]*)\"")
 
 
 def _split_tokens(command: str) -> list[str]:
-    """尝试把命令拆分成参数列表；失败返回空列表。"""
+    """把命令拆成参数列表；**全模块唯一的 shlex 入口**，失败（引号不闭合等 ValueError）返回空列表。
+
+    原先 _command_head / _try_split_args 等各自再包一层 shlex.split + except，
+    容错口径散在多处、改一处漏一处；统一收在这里。
+    """
     try:
         return shlex.split(command, posix=False)
     except ValueError:
@@ -400,10 +401,7 @@ def _check_command_safety(command: str) -> str | None:
 
     if head in ("powershell", "pwsh"):
         # PowerShell 模式：跳过 powershell.exe [-nop] [-command] 包裹，检查 -Command 后的正文
-        try:
-            tokens = shlex.split(stripped, posix=False)
-        except ValueError:
-            tokens = [stripped]
+        tokens = _split_tokens(stripped) or [stripped]
         body_start = 0
         for i, t in enumerate(tokens):
             if _is_encoded_cmd_flag(t):
@@ -439,8 +437,5 @@ def _try_split_args(command: str) -> list[str] | None:
     """
     if _SHELL_ONLY_SIGNS.search(command):
         return None  # 有 shell 专有语法，只能用 shell=True
-    try:
-        args = shlex.split(command, posix=False)
-        return [_strip_wrapping_quotes(a) for a in args] if args else None
-    except ValueError:
-        return None
+    args = _split_tokens(command)  # 拆词统一走 _split_tokens（ValueError 已兜成空列表）
+    return [_strip_wrapping_quotes(a) for a in args] if args else None

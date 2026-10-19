@@ -100,7 +100,7 @@ class StationGateMixin:
         外部主靠它决定"一批点几个、要不要跨站点名、分几轮打"：只看 max_workers 会把
         3 个同站模型点成一批，实际它们是排成一路慢慢过队。
         """
-        stations = len({(p.base_url, p.api_key) for p in self.profiles.values()})
+        stations = len({p.station_key for p in self.profiles.values()})
         per_station = max(1, self._max_per_station)
         return {
             "stations": stations,

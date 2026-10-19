@@ -14,6 +14,7 @@ DeepSeek / Kimi / 豆包(方舟) / OpenAI / 本地 Ollama 均兼容，换模型�
 from __future__ import annotations
 
 import random
+import threading
 import time
 
 import openai
@@ -121,17 +122,29 @@ class LLMClient:
         self.temperature = temperature
         self.timeout = timeout
         self.max_retries = max_retries
+        # 在飞计数 + 延迟关闭（供 WorkerPool 回收被移出工人的连接池）：
+        # 直接 close 会掐断正在飞的请求；完全不关则每次热同步都漏一个 httpx 池。
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+        self._close_pending = False
+        self._closed = False
 
     # ---------- 对外接口 ----------
 
-    def chat_once(self, messages: list[dict]) -> dict:
+    def chat_once(self, messages: list[dict], max_tokens: int | None = None) -> dict:
         """**一次**网络尝试：不重试、不睡眠。
 
         派工路径要的是这个粒度：同站串行门只该包住真实的一次往返，退避睡眠绝不能
         占着门（见 station_gate 与 `WorkerPool._call_result`）——否则一个坏模型会把整站
         锁住 `timeout x (retries+1) + 退避` 量级，同站其它可用模型全排在后面。
+        进出都记在飞数：`close_when_idle` 靠它判断"现在关会不会掐断请求"。
+        `max_tokens` 供延迟探测限制输出长度（让样本只反映往返速度、不混入"模型话多"）。
         """
-        return self._once(messages)
+        self._enter_call()
+        try:
+            return self._once(messages, max_tokens=max_tokens)
+        finally:
+            self._leave_call()
 
     def chat(self, messages: list[dict]) -> dict:
         """发起一轮对话补全（内部按 `max_retries` 退避重试），返回 assistant 消息 dict。
@@ -143,37 +156,74 @@ class LLMClient:
         真实派工不走这里，走 `chat_once` + 编排层的门外重试环。
         """
         last: LLMError | None = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                return self._once(messages)
-            except LLMError as e:
-                last = e
-                if not e.retryable or attempt >= self.max_retries:
-                    raise
-                time.sleep(self._backoff(attempt, e.error_type))  # 经实例钩子：可被测试替换
-        raise last  # 理论不可达（上面必 raise），占位保险
+        self._enter_call()  # 整条重试链算一次"在飞"：中途被回收会打断退避后的重试
+        try:
+            for attempt in range(self.max_retries + 1):
+                try:
+                    return self._once(messages)
+                except LLMError as e:
+                    last = e
+                    if not e.retryable or attempt >= self.max_retries:
+                        raise
+                    time.sleep(self._backoff(attempt, e.error_type))  # 经实例钩子：可被测试替换
+            raise last  # 理论不可达（上面必 raise），占位保险
+        finally:
+            self._leave_call()
 
     def close(self) -> None:
         """释放底层 HTTP 连接池（幂等，可重复调用）。
 
         OpenAI 客户端持有一个 httpx 连接池：不显式关，就只能等 GC 回收，
-        长生命周期进程（Web 会话频繁创建/淘汰、bridge 常驻）会积压废弃连接。
-        释放失败不应影响调用方收尾，故整体吞异常。
+        长生命周期进程（bridge 常驻、反复 refresh_nodes）会积压废弃连接。
+        释放失败不应影响调用方收尾，故整体吞异常；`_closed` 让重复调用变成空操作。
         """
+        with self._inflight_lock:
+            if self._closed:
+                return
+            self._closed = True
         try:
             self.client.close()
         except Exception:  # noqa: BLE001 - 释放失败不影响上层收尾
             pass
 
+    def close_when_idle(self) -> None:
+        """标记"不再复用"，等在飞请求收尾后再关连接池（空闲则当场关）。
+
+        用于工人被移出池（`sync_free_nodes`）：此刻它可能正在回答一个已发出的请求，
+        直接关会把在飞请求打成异常；完全不关则连接池挂到进程退出（频繁热同步会累积）。
+        标记后仍接受新调用（旧引用可能还在回调链里），最后一次收尾时统一关闭——
+        `close()` 幂等，重复触发无害。
+        """
+        with self._inflight_lock:
+            self._close_pending = True
+            idle = self._inflight <= 0
+        if idle:
+            self.close()
+
+    def _enter_call(self) -> None:
+        with self._inflight_lock:
+            self._inflight += 1
+
+    def _leave_call(self) -> None:
+        with self._inflight_lock:
+            self._inflight -= 1
+            should_close = self._inflight <= 0 and self._close_pending
+        if should_close:
+            self.close()
+
     # ---------- 内部 ----------
 
-    def _once(self, messages: list[dict]) -> dict:
+    def _once(self, messages: list[dict], max_tokens: int | None = None) -> dict:
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "timeout": self.timeout,
         }
+        if max_tokens is not None:
+            # 只在显式要求时带上：免费网关对未知参数行为不一（有的直接 400），
+            # 派工路径保持"只发标准三件套"，探测路径由 LatencyMixin 按站决定是否带。
+            kwargs["max_tokens"] = max_tokens
         try:
             resp = self.client.chat.completions.create(**kwargs)
         except APITimeoutError as e:

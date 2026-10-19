@@ -20,13 +20,18 @@ from agent.core.orchestrator import WorkerPool
 
 
 def test_llm_client_close_is_idempotent():
-    """LLMClient.close 释放底层客户端，且重复调用不抛异常。"""
+    """LLMClient.close 释放底层客户端；重复调用变空操作（不二次触碰已关闭的池）。
+
+    幂等语义在 2026-10-19 收紧为"第二次不再调用底层"：`close_when_idle`（工人被移出池
+    时的延迟回收）可能在最后一个在飞请求收尾时触发 close，而调用方也可能同时 close，
+    重复关闭已关闭的 httpx 池是多余行为，用一个 _closed 标记短路掉更明确。
+    """
     client = LLMClient("http://x", "k", "m")
     fake = MagicMock()
     client.client = fake
     client.close()
     client.close()
-    assert fake.close.call_count == 2
+    assert fake.close.call_count == 1
 
 
 def test_llm_client_close_swallows_errors():

@@ -14,12 +14,18 @@ MAO/
 │   ├── __main__.py         # CLI 入口：bridge / mcp / call 三条外壳
 │   ├── bridge.py           # 外部智能体驱动协议（谁驱动谁当主，逐行 JSON 走 stdout）
 │   ├── mcp_server.py       # 标准 MCP server（stdio）外壳，宿主可并发发工具调用
-│   ├── config.py           # 配置分层加载（shell > .env > model_registry.txt）+ 数值容错
+│   ├── config.py           # Config 对象（池 / 数值 / 路径 / 开关）+ 兼容旧导入的门面
+│   ├── config_util.py      # ${VAR} 插值、模型清单拆分、路径唯一口径、类型容错告警
+│   ├── config_load.py      # 加载流程：分层 dotenv + 叠加层套用 + 进程内缓存（load_config）
+│   ├── profiles.py         # AgentProfile（池成员定义：站键 / 能力标签 / 展示面）
 │   ├── model_registry.py   # model_registry.txt 的读写层：清单解析 + 自动下线标 `#`（三态、幂等）
 │   ├── skills_manager.py   # Skill 机制（单个坏文件只跳过并警告，不炸启动）
 │   ├── core/
 │   │   ├── llm.py          # LLM 适配层（超时/错误分类/指数退避/畸形响应归一）
-│   │   ├── orchestrator.py # WorkerPool：ask / ask_many(结构化) / vote + 冷却与健康预检
+│   │   ├── orchestrator.py # WorkerPool 装配：池状态 + pick 轮转 + 健康/冷却记账 + 客户端缓存
+│   │   ├── dispatch.py     # DispatchMixin：单工人派工（ask / ask_result / 回退 / 门外重试）
+│   │   ├── batch.py        # BatchMixin：批量派工（collect / ask_many(结构化)）
+│   │   ├── free_nodes.py   # FreeNodeMixin：免费节点发现增量的热同步
 │   │   ├── parallelism.py  # 线程并行派工 + 按规模折算的整体限时
 │   │   ├── voting.py       # 两步投票（各出方案 → 编号表决），废票不进分母
 │   │   ├── latency.py      # 延迟档案 + 懒式探测轮（缺省派工的裁剪依据）

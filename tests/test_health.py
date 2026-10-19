@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 import agent.config as ac
+import agent.config_load as acl
 import agent.core.orchestrator as orch
 from agent.config import Config, _interpolate, load_config
 from agent.core.health import ModelHealth, _today
@@ -40,15 +41,18 @@ def cfg_home(tmp_path, monkeypatch):
     # 先摘掉此前由 dotenv 注入的变量（如 test_config_contract 加载真实仓库配置时
     # 注入的 NODE_*/LLM_*）：不清的话会被 _load_dotenv 当作"shell 预置"最高优先级，
     # tmp 里的分层文件永远覆盖不掉，池子插值到的是真仓库的模型清单。
-    for leaked in ac._dotenv_keys:
+    #
+    # 注意：这些是**加载层**的模块级状态，2026-10-19 拆分后住在 config_load.py
+    # （config.py 只 re-export 门面）。patch 门面不会影响真正执行业务的模块。
+    for leaked in acl._dotenv_keys:
         os.environ.pop(leaked, None)
-    monkeypatch.setattr(ac, "ROOT", tmp_path)
-    monkeypatch.setattr(ac, "_cfg_cache", None)
-    monkeypatch.setattr(ac, "_cfg_cache_mtime", 0.0)
-    monkeypatch.setattr(ac, "_cfg_cache_dotenv_mtime", 0.0)
-    monkeypatch.setattr(ac, "_cfg_cache_registry_mtime", 0.0)
-    monkeypatch.setattr(ac, "_dotenv_keys", set())
-    monkeypatch.setattr(ac, "_missing_logged", set())
+    monkeypatch.setattr(acl, "ROOT", tmp_path)
+    monkeypatch.setattr(acl, "_cfg_cache", None)
+    monkeypatch.setattr(acl, "_cfg_cache_mtime", 0.0)
+    monkeypatch.setattr(acl, "_cfg_cache_dotenv_mtime", 0.0)
+    monkeypatch.setattr(acl, "_cfg_cache_registry_mtime", 0.0)
+    monkeypatch.setattr(acl, "_dotenv_keys", set())
+    monkeypatch.setattr(acl, "_missing_logged", set())
     yield tmp_path
     os.environ.clear()
     os.environ.update(snapshot)

@@ -230,6 +230,13 @@ def test_test_harness_keeps_all_runtime_stores_outside_repo():
     }
     for label, p in targets.items():
         assert ROOT not in p.parents, f"{label} 指向仓库内 {p}：测试隔离失效，会写脏真实文件"
+    # 覆盖留档目录同样要隔离：漏了它，覆盖写用例每跑一次就往 data/backup/ 增生 .bak
+    # （2026-10-19 实测一天 41 个），虽然 data/ 已忽略，但属于"测试写仓库"的同类问题。
+    from agent.tools import builtin
+
+    assert ROOT not in builtin.BACKUP_DIR.parents, (
+        f"覆盖留档目录指向仓库内 {builtin.BACKUP_DIR}：测试会往 data/backup 增生 .bak"
+    )
     assert os.environ.get("MAO_LATENCY_PROBE") == "0", "延迟自动探测必须关，否则首个派工就真打网络"
     assert os.environ.get("MAO_FREE_NODE_PROBE") == "0", (
         "免费节点发现必须关，否则建池就真打 api.kilo.ai"

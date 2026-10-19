@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -58,7 +59,7 @@ class FreeModel:
 
 # ---------- 基础解析工具（与 model_registry.py 的 _bare_model 同口径） ----------
 
-_SIZE_SUFFIX = __import__("re").compile(r"\d+[kK]?")
+_SIZE_SUFFIX = re.compile(r"\d+[kK]?")
 
 
 def _bare(item: str) -> str:

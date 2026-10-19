@@ -32,14 +32,30 @@ def isolate_model_health_store(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_backup_dir(tmp_path, monkeypatch):
+    """`write_file` 的覆盖留档目录也必须落在仓库之外。
+
+    第五轮那条"落盘目标在仓库外"的守卫只覆盖健康/延迟/叠加层/registry 四个路径，
+    漏了 `builtin.BACKUP_DIR`——于是覆盖写用例每跑一次就往仓库 `data/backup/` 丢几个
+    `.bak`（实测：`test_audit5_fixes.py` 一条用例 +2，2026-10-19 一天累计 41 个）。
+    它不影响提交（`data/` 已忽略），但会掩盖"留档究竟写到哪"的验证，并让工作区持续增生。
+    """
+    import agent.tools.builtin as builtin
+
+    monkeypatch.setattr(builtin, "BACKUP_DIR", tmp_path / "backup")
+
+
+@pytest.fixture(autouse=True)
 def zero_dispatch_backoff(monkeypatch):
     """把派工重试的退避时长归零（只影响"睡多久"，不动"退避几次、按什么顺序"）。
 
-    第五轮审计把重试环从 `LLMClient.chat()` 挪到了编排层的 `_attempt_with_retry`，
+    第五轮审计把重试环从 `LLMClient.chat()` 挪到了编排层的 `_attempt_with_retry`
+    （2026-10-19 起在 agent/core/dispatch.py 的 DispatchMixin 里），
     退避不再由测试里 patch 的 `client._backoff` 管：整套从 17s 涨到 214s（7 个用例
     各真睡 2/4/8 秒）。CI 的 ubuntu 同样会白付这三分钟。要验退避**顺序/是否发生**的
     用例自己 patch `time.sleep` 记事件（见 test_audit5 的门序用例），别依赖真实秒数。
+    打桩点要指向**实际调用 backoff_seconds 的模块**（dispatch），否则 patch 不生效。
     """
-    import agent.core.orchestrator as orch
+    import agent.core.dispatch as dispatch_mod
 
-    monkeypatch.setattr(orch, "backoff_seconds", lambda attempt, error_type: 0.0)
+    monkeypatch.setattr(dispatch_mod, "backoff_seconds", lambda attempt, error_type: 0.0)

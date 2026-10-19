@@ -10,8 +10,12 @@
 - 历史演进：ask 结果 LRU 缓存、并发同 key 去重、swarm 的 ask_worker 工具等均已移除
   （外部主按需发话、命中率极低）；每次如实打网络。
 
-文件结构（2026-09-22 拆分、2026-09-23 二次拆分并行段后）：
-  orchestrator.py —— WorkerPool 类：派工 + 健康 + pick 轮转
+文件结构（2026-09-22 拆分、2026-09-23 二次拆分并行段、
+2026-10-19 三次拆分单工派工 / 批量 / 免费节点后发现，本文件回到 ≤500 行）：
+  orchestrator.py —— WorkerPool 类装配：池状态 + pick 轮转 + 健康/冷却记账 + 客户端缓存
+  dispatch.py     —— DispatchMixin：单工人派工（ask_result / ask / 回退 / 门外重试）
+  batch.py        —— BatchMixin：批量派工（collect / _gather_many / ask_many / ask_many_structured）
+  free_nodes.py   —— FreeNodeMixin：免费节点发现与热同步
   station_gate.py —— StationGateMixin：同站串行门（一站同时只跑一个模型）+ 并发口径
   parallelism.py  —— ParallelMixin：并行派工（_wait_gather / _effective_timeout / _run_parallel）
   voting.py       —— VotingMixin：投票两步（收集 + 编号投票）、择优
@@ -28,31 +32,27 @@ import threading
 import time
 
 from ..config import AgentProfile, Config
-from .constants import (
-    ST_COOLDOWN,
-    ST_ERROR,
-    ST_MISSING,
-    ST_OK,
-    ST_QUARANTINED,
-    ST_TIMEOUT,
-    WORKER_SYSTEM,
-)
+from .batch import BatchMixin
+from .dispatch import DispatchMixin
+from .free_nodes import FreeNodeMixin
 from .health import ModelHealth, get_health
 from .latency import LatencyMixin, LatencyStore
-from .llm import LLMClient, LLMError, backoff_seconds
-from .node_discovery import (
-    FreeNodeDiscoverer,
-    _bare,
-    _parse_one,
-    load_overlay,
-)
-from .parallelism import ParallelMixin, StationMemo
-from .redact import safe_error_text
+from .llm import LLMClient
+from .node_discovery import FreeNodeDiscoverer
+from .parallelism import ParallelMixin
 from .station_gate import StationGateMixin
 from .voting import VotingMixin
 
 
-class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
+class WorkerPool(
+    StationGateMixin,
+    LatencyMixin,
+    ParallelMixin,
+    VotingMixin,
+    DispatchMixin,
+    BatchMixin,
+    FreeNodeMixin,
+):
     """子智能体池：纯文本执行器（不挂本地工具，兼容性最好、最安全）。
 
     免费节点友好：单节点抖动/限流/不可用不拖垮整体——连续失败进入**短时冷却**，
@@ -67,8 +67,9 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
     是 _run_ballot 的公共出口）、names 是有意保留的程序化公共 API——供直接以 Python
     方式复用内核的调用方与单测使用，不是待清理的死代码。
 
-    WorkerPool 继承 VotingMixin：投票相关的 vote / select_best / _run_ballot /
-    render_answer 均在 VotingMixin 中定义，这里专注派工与健康逻辑。
+    本文件只放「池状态装配 + pick 轮转 + 健康/冷却记账 + 客户端缓存」；派工、批量、
+    免费节点发现各自拆到独立 Mixin（见文件头文件结构），它们通过 self 共享本类的
+    profiles / cfg / health 等属性，调用签名完全不变。
     """
 
     def __init__(
@@ -96,7 +97,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         # 模型延迟档案（问题5）：与 health 并列的一层——health 管"能不能用"，
         # 本档案管"快不快用"。同一批可用工人里优先派延迟低的（见 pick/_latency_window），
         # 并由 LatencyProber 每 latency_probe_interval 秒探测全部节点刷新它。
-        # 具体构造在 LatencyMixin._init_latency（本文件已超 500 行约定，延迟选路整段外置）。
+        # 具体构造在 LatencyMixin._init_latency（延迟选路整段外置到 latency.py）。
         self._init_latency(cfg, latency)
         # 下线改写需要模型名与清单变量名（如 NODE_A_MODELS），一次性建好映射
         self._model_of = {n: p.model for n, p in self.profiles.items()}
@@ -164,7 +165,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
         # 共用同一 endpoint 但不同 key，按 key 区分更精确（同 key 才意味着"整站级故障共担"）。
         self._station_models: dict[tuple[str, str], list[str]] = {}
         for nm, p in self.profiles.items():
-            self._station_models.setdefault((p.base_url, p.api_key), []).append(nm)
+            self._station_models.setdefault(p.station_key, []).append(nm)
 
         # 同站串行门（collaboration.max_per_station，默认 1）：门表与闸门方法在
         # StationGateMixin（见 station_gate.py），卡在被真正发请求的那一层，
@@ -274,101 +275,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
             )
         return out
 
-    # ---------- 免费节点自动发现 ----------
-
-    def _touch_free_nodes(self) -> None:
-        """派工/预检入口的顺带动作：发现到期就起一轮后台发现（不阻塞、不抛异常）。
-
-        与 _touch_latency 同理：挂在入口而非常驻线程，避免无人派工时空转烧额度；
-        free_node_discovery=false / interval<=0 / MAO_FREE_NODE_PROBE=0 时整段跳过。
-        """
-        if not self._free_node.enabled():
-            return
-        try:
-            self._free_node.maybe_start()
-        except Exception:  # noqa: BLE001 - 发现调度绝不拖累派工
-            pass
-
-    def refresh_free_nodes_now(self) -> dict:
-        """同步强制跑一轮免费节点发现，并把增量热同步进当前工人池（不重启即生效）。
-
-        供 bridge `refresh_nodes` 命令调用。返回 {stations, updated, applied} 摘要（不含密钥）；
-        发现失败/被禁用的站不计入变动。applied 是本次对运行中池子实际增/删的工人名。
-        """
-        report = self._free_node.refresh_now()
-        try:
-            overlay = load_overlay(self.cfg.free_nodes_path)
-            report["applied"] = self.sync_free_nodes(overlay)
-        except Exception:  # noqa: BLE001 - 热同步失败不炸命令
-            report["applied"] = {"error": "sync_failed"}
-        return report
-
-    def sync_free_nodes(self, overlay: dict) -> dict:
-        """把叠加层增量热同步进当前运行中的工人池：新增的进池、消失的移出池。
-
-        不改 registry、不重启。手动 `#` 屏蔽的模型不在 added 里（发现阶段已排除），
-        故不会因同步被重新启用。返回本次实际变动的工人名（不含密钥）。
-        """
-        with self._lock:
-            profiles = dict(self.profiles)
-            # 先按 env 抓一个模板（base_url/api_key/discovery 来源），即便该站活跃模型全被
-            # retired 移除也能据此把新增模型建出来——否则模板随 retired 一起被删就没法加了。
-            templates: dict[str, AgentProfile] = {}
-            for p in profiles.values():
-                templates.setdefault(p.models_env, p)
-            removed: list[str] = []
-            for env_var, delta in overlay.items():
-                if env_var.startswith("_") or not isinstance(delta, dict):
-                    continue
-                retired = {_bare(r).lstrip("#") for r in (delta.get("retired") or [])}
-                if not retired:
-                    continue
-                for name, p in list(profiles.items()):
-                    if p.models_env == env_var and _bare(p.model).lstrip("#") in retired:
-                        profiles.pop(name, None)
-                        removed.append(name)
-            added: list[str] = []
-            for env_var, delta in overlay.items():
-                if env_var.startswith("_") or not isinstance(delta, dict):
-                    continue
-                tmpl = templates.get(env_var)
-                if tmpl is None:
-                    continue
-                existing = {
-                    _bare(p.model).lstrip("#") for p in profiles.values() if p.models_env == env_var
-                }
-                station = tmpl.name.split(":")[0]
-                for entry in delta.get("added") or []:
-                    model, ctx = _parse_one(entry)
-                    if not model or model in existing:
-                        continue
-                    # 新增模型统一用 "站名:模型名"（与 config 多模型站命名一致）
-                    name = f"{station}:{model}"
-                    np = AgentProfile(
-                        name=name,
-                        base_url=tmpl.base_url,
-                        api_key=tmpl.api_key,
-                        model=model,
-                        context_length=ctx,
-                        note=tmpl.note,
-                        models_env=env_var,
-                        discovery=tmpl.discovery,
-                    )
-                    profiles[name] = np
-                    existing.add(model)
-                    added.append(name)
-            if removed or added:
-                self.profiles = profiles
-                self._model_of = {n: p.model for n, p in profiles.items()}
-                self._env_of = {n: p.models_env for n, p in profiles.items()}
-                self._station_models = {}
-                for nm, p in profiles.items():
-                    self._station_models.setdefault((p.base_url, p.api_key), []).append(nm)
-            return {"added": added, "removed": removed}
-
-    def free_node_status(self) -> dict:
-        """免费节点发现维度诊断快照（不含密钥）。"""
-        return {"discovery": self._free_node.status()}
+    # ---------- 冷却 / 当日隔离记账 ----------
 
     def _is_in_cooldown(self, name: str) -> bool:
         """该节点是否处于冷却期（冷却期跳过，避免反复打一个坏节点）。"""
@@ -453,242 +360,7 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
             return
         self._active_day = today
 
-    def ask_result(
-        self, worker: str, prompt: str, system: str | None = None, memo: StationMemo | None = None
-    ) -> dict:
-        """派工核心：返回结构化结果 {worker, ok, status, answer, error}（永不抛异常）。
-
-        全部派工路径（ask / ask_many / collect / vote / run_review）的唯一事实源：
-        成败由控制流决定（是否跳过、chat 是否抛错），而不是事后解析文本前缀（#4）。
-        跳过判定（冷却 / 当日隔离）也在这里直接算出，批量路径无需再预过滤或嗅探。
-        """
-        p = self.profiles.get(worker)
-        if not p:
-            return {
-                "worker": worker,
-                "ok": False,
-                "status": ST_MISSING,
-                "answer": "",
-                "error": f"子智能体 '{worker}' 不存在。可用：{', '.join(self.profiles) or '无'}",
-            }
-        self._touch_latency()  # 顺带检查探测是否到期（点名派工也走这里，别漏刷新延迟档案）
-        reason = self._skip_reason(worker)
-        if reason == "冷却中":
-            return {
-                "worker": worker,
-                "ok": False,
-                "status": ST_COOLDOWN,
-                "answer": "",
-                "error": f"子智能体 '{worker}' 近期连续失败，正在冷却中，建议稍后再试或换其它工人",
-            }
-        if reason == "当日失败隔离":
-            return {
-                "worker": worker,
-                "ok": False,
-                "status": ST_QUARANTINED,
-                "answer": "",
-                "error": (
-                    f"子智能体 '{worker}' 今日调用已失败，当天隔离不再派工，请换其它工人或明天再试"
-                ),
-            }
-        return self._call_result(p, system, prompt, memo=memo)
-
-    def ask(self, worker: str, prompt: str, system: str | None = None) -> str:
-        """派一个子任务给单个工人，返回其回答文本（含失败说明，不抛异常）。
-
-        薄封装：结构化判定交给 ask_result，这里只渲染成人读文本（向后兼容）。
-        免费节点友好：节点在**短时冷却**期、或当天已出现**终态不可重试错误**（当日隔离）
-        时直接快速跳过并提示，不傻等；冷却到期自动回来，隔离只针对当天的坏模型。
-        """
-        return self.render_answer(self.ask_result(worker, prompt, system))
-
-    def _fallback_target(
-        self,
-        p: AgentProfile,
-        tried: set[str],
-        memo: StationMemo | None = None,
-    ) -> AgentProfile | None:
-        """挑一个「当前可用且本轮未试过」的模型回退，供异常停止时自动恢复。
-
-        两级候选（确定性顺序）：
-        1) **同站优先**：同 (base_url, api_key) 组内、未试过、非冷却/隔离、且该站未被
-           本批次探明故障（memo）的模型；
-        2) **跨站兜底**（collaboration.fallback_cross_station=true 时）：同站无候选则从
-           整池挑「未试过、当前可用、且其所在站未死」的模型——这就是"子智能体异常
-           停止后自动换模型恢复"的落点。
-
-        memo 为本批次共享的「死站」记忆：已探明故障的站不再重复撞（抑制额度放大）。
-        候选内部再按延迟升序（问题5「优先选择延迟低的可用模型」）：同站/跨站各自排序后
-        取首个；无延迟样本时排序是恒等变换，回退行为与旧版逐字一致。
-        无候选返回 None（调用方不再回退）。
-        """
-        # 1) 同站优先
-        same = [
-            n
-            for n in (self._station_models.get((p.base_url, p.api_key)) or ())
-            if n not in tried and n in self.profiles and self._skip_reason(n) is None
-        ]
-        for name in self._latency_sorted(same):
-            prof = self.profiles[name]
-            if memo is not None and memo.is_dead((prof.base_url, prof.api_key)):
-                continue  # 该站本批次已判死，不再重复撞（抑制额度放大）
-            return prof
-        # 2) 跨站兜底（可关）
-        if not self._fallback_cross_station:
-            return None
-        cross = [
-            n
-            for n, prof in self.profiles.items()
-            if n not in tried
-            and self._skip_reason(n) is None
-            and not (memo is not None and memo.is_dead((prof.base_url, prof.api_key)))
-        ]
-        if cross:
-            return self.profiles[self._latency_sorted(cross)[0]]
-        return None
-
-    def _call_result(
-        self,
-        p: AgentProfile,
-        system: str | None,
-        prompt: str,
-        tried: set[str] | None = None,
-        fallbacks_left: int | None = None,
-        memo: StationMemo | None = None,
-    ) -> dict:
-        """真正打一次网络：取（或复用）LLMClient → chat → 按控制流记结构化成败。
-
-        失败时按性质分级记账（#1/#2），并在「可重试错误」场景下自动回退换模型重试
-        （见 _fallback_target）：先同站其它「当前可用」模型，同站无候选且
-        collaboration.fallback_cross_station=true 时再跨站、从整池挑未试过的可用模型——
-        即"子智能体异常停止就自动换模型恢复"，尽量不让一次抖动丢掉一个派工位。
-        回退不重复试已试过的模型、且受 fallback_models 上限约束（抑制额度蔓延）；
-        终态不可重试错误（认证等整站级问题）不回退，直接判当日隔离。
-
-        无论成败都返回 dict、不抛异常；ask_many/collect/vote 依赖该契约。
-        tried          本轮已尝试过的模型名集合（防回退环 / 重复打同一模型）
-        fallbacks_left 剩余可回退次数（= collaboration.fallback_models，0=关闭回退）
-        memo           本并行批次共享的「死站」记忆（见 parallelism.StationMemo）：
-                       某工人的回退链因可重试失败耗尽后记下该站，同站后续工人只做那一次
-                       主调用、不再各自回退撞死站，抑制 N×(1+fallback) 的跨工人额度放大。
-                       顺序单发不传（None）⇒ 回退行为逐字不变。
-        """
-        if tried is None:
-            tried = set()
-        if fallbacks_left is None:
-            fallbacks_left = self._fallback_models
-        tried.add(p.name)
-        station = (p.base_url, p.api_key)
-
-        def _mark_station_dead() -> None:
-            if memo is not None:
-                memo.mark_dead(station)
-
-        try:
-            client = self._client_for(p)
-            messages = [
-                {"role": "system", "content": system or WORKER_SYSTEM},
-                {"role": "user", "content": prompt},
-            ]
-            resp, err, elapsed_ms = self._attempt_with_retry(client, station, messages)
-            if err is not None:
-                # 分类与记账逐字沿用旧实现：LLMError 按 retryable 分级，其它意外异常按可重试
-                # 处理（别全天拉黑）。回退递归发生在**站点门之外**（见 _chat_gated 文档）。
-                if isinstance(err, LLMError):
-                    # 可重试的瞬时错误 + 仍有回退额度 ⇒ 换模型重试（同站优先，可跨站恢复）。
-                    # 死站抑制改由 _fallback_target 内的 memo 过滤承担，不再入口一刀切。
-                    if err.retryable and fallbacks_left > 0:
-                        fb = self._fallback_target(p, tried, memo)
-                        if fb is not None:
-                            # 当前模型记为瞬时失败（只冷却，当天仍可回来），换其它模型续跑
-                            self._record_result(p.name, ok=False, fatal=False)
-                            return self._call_result(
-                                fb, system, prompt, tried, fallbacks_left - 1, memo
-                            )
-                    # 不再回退：按终态与否记账（可重试耗尽只冷却；终态当日隔离）
-                    if err.retryable:
-                        _mark_station_dead()  # 可重试失败耗尽 ⇒ 抑制后续工人重复撞该站
-                    self._record_result(p.name, ok=False, fatal=not err.retryable)
-                    return {
-                        "worker": p.name,
-                        "ok": False,
-                        "status": ST_ERROR,
-                        "answer": "",
-                        "error": f"调用子智能体 '{p.name}' 失败 [{err.error_type}]："
-                        f"{safe_error_text(err)}",
-                    }
-                if fallbacks_left > 0:
-                    fb = self._fallback_target(p, tried, memo)
-                    if fb is not None:
-                        self._record_result(p.name, ok=False, fatal=False)
-                        return self._call_result(
-                            fb, system, prompt, tried, fallbacks_left - 1, memo
-                        )
-                _mark_station_dead()
-                self._record_result(p.name, ok=False, fatal=False)
-                return {
-                    "worker": p.name,
-                    "ok": False,
-                    "status": ST_ERROR,
-                    "answer": "",
-                    "error": f"调用子智能体 '{p.name}' 失败："
-                    f"{type(err).__name__}: {safe_error_text(err)}",
-                }
-            self._record_result(p.name, ok=True)
-            # 真实成功派工也回填延迟档案（"一套"）：探测给小请求基线，真实调用把负载下的
-            # 实际表现也计入同一份中位数——两路事实共写一个账本，选路看的是同一套数字。
-            # elapsed_ms 由 _chat_gated 在**门内**计时：排队等同站前一个请求的秒数绝不能
-            # 写进延迟档案，否则同站串行会被误记成"这个模型慢"，选路随之裁错。
-            self._record_latency(p.name, elapsed_ms)
-            return {
-                "worker": p.name,
-                "ok": True,
-                "status": ST_OK,
-                "answer": resp.get("content", "") or "(空回复)",
-                "error": "",
-            }
-        except Exception as e:  # noqa: BLE001 - 连取 client 都失败，也不让派工崩（只冷却）
-            if fallbacks_left > 0:
-                fb = self._fallback_target(p, tried, memo)
-                if fb is not None:
-                    self._record_result(p.name, ok=False, fatal=False)
-                    return self._call_result(fb, system, prompt, tried, fallbacks_left - 1, memo)
-            _mark_station_dead()
-            self._record_result(p.name, ok=False, fatal=False)
-            return {
-                "worker": p.name,
-                "ok": False,
-                "status": ST_ERROR,
-                "answer": "",
-                "error": f"调用子智能体 '{p.name}' 异常：{type(e).__name__}: {safe_error_text(e)}",
-            }
-
-    def _attempt_with_retry(
-        self, client: LLMClient, station: tuple[str, str], messages: list[dict]
-    ) -> tuple[dict | None, Exception | None, float]:
-        """按 `llm.max_retries` 重试，但**每次尝试单独过一次站点门、退避睡眠留在门外**。
-
-        为什么不再把 `LLMClient.chat()` 整段交给门：chat 自带退避 `sleep`，包在门里就等于
-        让"等待"也占用"一站同时只跑一个模型"的配额 —— 一个坏模型会把整站锁住
-        `timeout x (1+retries) + 退避` 量级，同站其它本来可用的模型全排在后面（实测第二个
-        工人白等 1.55s，等的基本都是别人的 sleep）。
-        重试次数与退避序列和旧实现逐字一致（`backoff_seconds` 同一个函数），只是挪到了门外。
-        返回最后一次尝试的 (resp, 错误, 门内毫秒)。
-        """
-        attempts = 1 + self._max_retries
-        resp: dict | None = None
-        err: Exception | None = None
-        elapsed_ms = 0.0
-        for attempt in range(attempts):
-            resp, err, elapsed_ms = self._chat_gated(client, station, messages)
-            if err is None:
-                return resp, None, elapsed_ms
-            if not isinstance(err, LLMError) or not err.retryable:
-                return resp, err, elapsed_ms  # 终态错误：重试也没用，直接交回上层按终态记账
-            if attempt >= attempts - 1:
-                return resp, err, elapsed_ms
-            time.sleep(backoff_seconds(attempt, err.error_type))  # 门已释放，退避不占站配额
-        return resp, err, elapsed_ms
+    # ---------- 客户端缓存 ----------
 
     def _client_for(self, p: AgentProfile) -> LLMClient:
         """按 profile.name 复用 LLMClient；首次访问时按工人配置创建并缓存。
@@ -736,6 +408,36 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                 self._probe_clients[p.name] = client
             return client
 
+    def _retire_worker_clients(
+        self, removed: list[str], live_stations: set[tuple[str, str]]
+    ) -> None:
+        """回收被移出池的工人的连接池与站门（`sync_free_nodes` 的收尾，锁外调用）。
+
+        为什么不能直接 close：被移出的工人可能**正在飞**（批量派工的 daemon 线程还会
+        回调它），直接断开会把在飞请求打成异常；但也不能不回收——每轮 `refresh_nodes`
+        都可能新增一批 LLMClient（各带一个 httpx 连接池），长期运行会持续累积。
+        故走 `close_when_idle`：标记后由最后一个在飞请求收尾时关闭；空闲的当场就关。
+
+        站门同理：只保留"池里还有模型的站"。已空的站门没人再取，摘掉即可
+        （等待中的线程仍持有旧 Semaphore 引用，会正常跑完，不会被掐断）。
+        """
+        retired: list[LLMClient] = []
+        # _clients_lock 只护缓存、不嵌套池锁：调用方已在池锁外（见 sync_free_nodes）
+        with self._clients_lock:
+            for name in removed:
+                for cache in (self._clients, self._probe_clients):
+                    client = cache.pop(name, None)
+                    if client is not None:
+                        retired.append(client)
+        for client in retired:
+            try:
+                client.close_when_idle()
+            except Exception:  # noqa: BLE001 - 回收失败不影响热同步结果
+                pass
+        with self._gates_lock:
+            for station in [s for s in self._station_gates if s not in live_stations]:
+                self._station_gates.pop(station, None)
+
     def close(self) -> None:
         """释放全部工人客户端连接池（含探测专用池，幂等）。池被弃用时由持有方调用。"""
         with self._clients_lock:
@@ -747,134 +449,3 @@ class WorkerPool(StationGateMixin, LatencyMixin, ParallelMixin, VotingMixin):
                 c.close()
             except Exception:  # noqa: BLE001 - 释放失败不应影响上层收尾
                 pass
-
-    def collect(
-        self,
-        workers: list[str],
-        prompt: str,
-        system: str | None = None,
-        timeout: float | None = None,
-    ) -> list[tuple[str, str]]:
-        """并行收集多个工人对同一任务的成功回答，按入参工人顺序返回（确定性）。
-
-        与 ask_many 的区别：只返回成功回答的 (工人, 回答) 列表，且顺序与
-        workers 入参顺序一致，不随完成先后漂移——投票编号、候选顺序
-        依赖该确定性（as_completed 完成序会导致同一任务两次运行编号互换）。
-        失败/冷却/当日隔离/超时/空回复的工人不进结果。
-
-        这里**不做**冷却/隔离预过滤：判定交给 ask_result 内部，返回结构化 status，
-        这里只按 status==ST_OK 过滤——成败由控制流决定，绝不解析回答文本前缀（#4）。
-        """
-        valid = [w for w in dict.fromkeys(workers) if w in self.profiles]
-        if not valid:
-            return []
-        got = self._run_parallel(
-            valid, prompt, system, self._effective_timeout(len(valid), timeout, valid)
-        )
-        return [
-            (w, got[w]["answer"])
-            for w in valid
-            if got.get(w) is not None and got[w]["status"] == ST_OK and got[w]["answer"]
-        ]
-
-    def _gather_many(
-        self,
-        workers: list[str],
-        prompt: str,
-        system: str | None,
-        timeout: float | None,
-    ) -> dict:
-        """并行派工的收集核心：ask_many（文本）与 ask_many_structured（结构化）共用。
-
-        返回 {valid, got, elapsed, limit}。got[worker] 为 None 表示超时未完成；
-        否则是 ask_result 的结构化 dict。elapsed[worker] 为该工人从派工到回来的毫秒数。
-
-        不认识的工人名**不再静默丢弃**（审计 P1）：照样进入结果、由 ask_result 如实
-        带回 status=missing——bridge 文档承诺的 status 词表含 missing，且外部主点名
-        拼错时若只收到「全部子 AI 均未成功」，会拿着同一个错名字永远重试。
-        """
-        valid = list(dict.fromkeys(workers))
-        if not valid:
-            return {"valid": [], "got": {}, "elapsed": {}, "limit": 0.0}
-        limit = self._effective_timeout(len(valid), timeout, valid)
-        t0 = time.monotonic()
-        elapsed: dict[str, int] = {}
-
-        def _on_done(w: str, res: dict | None) -> None:
-            # res 来自 _wait_gather 的 fut.result()：ask_result 的结构化 dict 或 None（超时）
-            elapsed[w] = int((time.monotonic() - t0) * 1000)
-
-        got = self._run_parallel(valid, prompt, system, limit, on_done=_on_done)
-        return {"valid": valid, "got": got, "elapsed": elapsed, "limit": limit}
-
-    def ask_many(
-        self,
-        workers: list[str],
-        prompt: str,
-        system: str | None = None,
-        timeout: float | None = None,
-    ) -> str:
-        """同一子任务并行派给多个工人，收集全部回答（失败也如实带回）。
-
-        输出按入参工人顺序排列（确定性）；timeout 对收集阶段整体限时，缺省按
-        参与人数与并发上限自适应（见 _effective_timeout）。超时工人以「未完成」带回。
-        冷却/当日隔离工人不预过滤，交给 ask_result 内部判定并如实带回跳过说明。
-        """
-        r = self._gather_many(workers, prompt, system, timeout)
-        valid = r["valid"]
-        if not valid:
-            return f"错误：没有可用的子智能体。可用：{', '.join(self.profiles) or '无'}"
-        got, limit = r["got"], r["limit"]
-        blocks: list[str] = []
-        for w in valid:  # 按入参顺序输出，含跳过项
-            res = got.get(w)
-            if res is None:  # 整体限时到点仍未完成
-                body = f"失败：超过 {limit:g}s 未完成，已放弃等待（后台线程会自行收尾）"
-            elif res["status"] in (ST_COOLDOWN, ST_QUARANTINED):
-                label = "冷却中" if res["status"] == ST_COOLDOWN else "当日隔离"
-                body = f"错误：工人{label}，本轮跳过"
-            else:  # ok 或 error：由结构化 status 渲染成人读文本，绝不回头解析文本
-                body = self.render_answer(res)
-            blocks.append(f"### 工人 {w} 的结果\n{body}")
-        return "\n\n".join(blocks)
-
-    def ask_many_structured(
-        self,
-        workers: list[str],
-        prompt: str,
-        system: str | None = None,
-        timeout: float | None = None,
-    ) -> list[dict]:
-        """并行派工的结构化结果（外部主程序化消费，替代 Markdown 大块文本）。
-
-        返回按入参顺序的 list[dict]，每项 {worker, ok(bool), status, answer, elapsed_ms}。
-        status ∈ {ok, error, cooldown, quarantined, missing, timeout}（与 ask_result 同一套
-        稳定码，不再翻译成中文）：直接取自结构化判定（#4，不解析文本前缀），ok 只认
-        status==ok，answer 仅在成功时为正文、其余为空串。
-        """
-        r = self._gather_many(workers, prompt, system, timeout)
-        got, elapsed = r["got"], r["elapsed"]
-        out: list[dict] = []
-        for w in r["valid"]:
-            res = got.get(w)
-            if res is None:  # 整体限时到点仍未完成
-                out.append(
-                    {
-                        "worker": w,
-                        "ok": False,
-                        "status": ST_TIMEOUT,
-                        "answer": "",
-                        "elapsed_ms": elapsed.get(w),
-                    }
-                )
-                continue
-            out.append(
-                {
-                    "worker": w,
-                    "ok": res["status"] == ST_OK,
-                    "status": res["status"],
-                    "answer": res["answer"] if res["status"] == ST_OK else "",
-                    "elapsed_ms": elapsed.get(w),
-                }
-            )
-        return out

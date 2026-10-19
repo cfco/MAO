@@ -68,13 +68,14 @@ class ModelHealth(AtomicJsonLedger):
         self.retire_days = max(1, int(retire_days))
         self._data: dict[str, dict] | None = None  # 懒加载：首次使用时才读盘
         self._active: list[str] = []  # 运行日清单（加载后随记账增长）
+        self._load_lock = threading.Lock()  # 只护"首次读盘"，与 _lock 分开（见 _ensure_loaded）
 
     # ---------- 查询 ----------
 
     def quarantined(self, name: str) -> bool:
         """当天记过失败 ⇒ 隔离（当天不再派工）。只查内存，热路径友好。"""
+        self._ensure_loaded()  # 读盘放在 _lock 之外：载入不在记账锁内碰磁盘
         with self._lock:
-            self._ensure_loaded()
             entry = self._data.get(name) or {}
             return _today() in (entry.get("fail_dates") or [])
 
@@ -97,8 +98,8 @@ class ModelHealth(AtomicJsonLedger):
         day = day or _today()
         notice: str | None = None
         disabled_now = False
+        self._ensure_loaded()  # 读盘放在 _lock 之外
         with self._lock:
-            self._ensure_loaded()
             self._mark_active_locked(day)  # 有失败记账 ⇒ 当天必然是运行日
             entry = self._data.setdefault(name, {})
             dates = sorted(set(entry.get("fail_dates") or []) | {day})
@@ -116,8 +117,8 @@ class ModelHealth(AtomicJsonLedger):
 
     def note_active(self, day: str | None = None) -> None:
         """显式登记一个运行日（测试注入用：模拟"这天开过程序、但该模型没失败"）。"""
+        self._ensure_loaded()  # 读盘放在 _lock 之外
         with self._lock:
-            self._ensure_loaded()
             self._mark_active_locked(day or _today())
         self.write()  # 落盘放锁外，理由同 record_failure
 
@@ -179,22 +180,31 @@ class ModelHealth(AtomicJsonLedger):
 
     # ---------- 落盘 ----------
 
-    def _ensure_loaded(self) -> None:  # 调用方持锁
+    def _ensure_loaded(self) -> None:
+        """保证内存账本已载入盘上数据。**必须在 _lock 之外调用**（载入要读盘）。
+
+        持 _lock 读盘会把慢盘串进派工热路径（ledger.AtomicJsonLedger 的"锁内绝不碰磁盘"
+        口径）。这里不碰 _lock，只用 _load_lock 防并发首查各读一遍盘；快速路径（已载入）
+        连 _load_lock 都不取。写盘路径由基类 write() 保证先载入再进 _lock。
+        """
         if self._data is not None:
             return
-        data: dict[str, dict] = {}
-        active: list[str] = []
-        try:
-            raw = json.loads(self.store_path.read_text(encoding="utf-8"))
-            models = raw.get("models") if isinstance(raw, dict) else None
-            if isinstance(models, dict):
-                data = {k: v for k, v in models.items() if isinstance(v, dict)}
-            if isinstance(raw, dict):
-                active = [d for d in (raw.get("active_dates") or []) if isinstance(d, str)]
-        except (OSError, ValueError):
-            data = {}  # 缺失/损坏都从空白账本重新开始，不拖垮派工
-        self._data = data
-        self._active = sorted(set(active))[-_MAX_ACTIVE_KEPT:]
+        with self._load_lock:
+            if self._data is not None:
+                return
+            data: dict[str, dict] = {}
+            active: list[str] = []
+            try:
+                raw = json.loads(self.store_path.read_text(encoding="utf-8"))
+                models = raw.get("models") if isinstance(raw, dict) else None
+                if isinstance(models, dict):
+                    data = {k: v for k, v in models.items() if isinstance(v, dict)}
+                if isinstance(raw, dict):
+                    active = [d for d in (raw.get("active_dates") or []) if isinstance(d, str)]
+            except (OSError, ValueError):
+                data = {}  # 缺失/损坏都从空白账本重新开始，不拖垮派工
+            self._data = data
+            self._active = sorted(set(active))[-_MAX_ACTIVE_KEPT:]
         # 注意：这里**不**把今天预记为运行日。运行日由记账决定——record_failure /
         # note_active 记哪一天，哪一天才算运行日（"没运行项目的那天不计入"）。
         # 若加载即预记今天，窗口会混入"今天还没机会失败"的日子：测试注入历史失败日
@@ -225,7 +235,6 @@ class ModelHealth(AtomicJsonLedger):
         合并口径保持单调：`fail_dates`/`active_dates` 取并集后各自仍受 `_MAX_*` 裁剪，
         `disabled` 取两者中更早的那天（下线日期不该被后写者推后）。
         """
-        self._ensure_loaded()
         d_models = disk.get("models")
         if isinstance(d_models, dict):
             for name, entry in d_models.items():
@@ -245,8 +254,8 @@ class ModelHealth(AtomicJsonLedger):
 
     def snapshot(self) -> dict[str, dict]:
         """当前档案的浅拷贝（诊断/测试用，不含任何密钥）。"""
+        self._ensure_loaded()  # 读盘放在 _lock 之外
         with self._lock:
-            self._ensure_loaded()
             return {k: dict(v) for k, v in self._data.items()}
 
 

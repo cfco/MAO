@@ -80,6 +80,7 @@ class AtomicJsonLedger:
         """
         with self._write_lock:
             disk = self._disk_for_merge()  # IO 留在 _lock 之外
+            self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）
             with self._lock:
                 if disk is not None:
                     self._merge_disk_locked(disk)

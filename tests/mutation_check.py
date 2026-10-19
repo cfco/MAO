@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 from pathlib import Path
@@ -162,7 +163,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M21 批次死站记忆不再抑制同站回退",
-        "agent/core/orchestrator.py",
+        "agent/core/dispatch.py",
         "                    fb = self._fallback_target(p, tried, memo)",
         "                    fb = self._fallback_target(p, tried, None)  # mutated: 忽略批次死站记忆",
         "tests/test_core.py::test_station_memo_suppresses_cross_worker_fallback",
@@ -258,11 +259,13 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "agent/core/ledger.py",
         """        with self._write_lock:
             disk = self._disk_for_merge()  # IO 留在 _lock 之外
+            self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）
             with self._lock:
                 if disk is not None:
                     self._merge_disk_locked(disk)
                 text = self._snapshot_locked()""",
         """        disk = self._disk_for_merge()  # mutated: 快照在写锁外取，写盘顺序可能反于快照顺序
+        self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）
         with self._lock:
             if disk is not None:
                 self._merge_disk_locked(disk)
@@ -272,7 +275,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M34 dotenv 注释剥离抢在引号处理之前",
-        "agent/config.py",
+        "agent/config_load.py",
         """            val = val.strip()
             if val[:1] in ('"', "'"):""",
         """            val = val.split(" #", 1)[0].strip().strip('"').strip("'")
@@ -298,7 +301,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M38 模型名按最后一个 @ 硬切",
         "agent/model_registry.py",
-        "    bare = name.strip() if sep and _SIZE_SUFFIX.fullmatch(suffix.strip()) else body.strip()",
+        "    bare = name.strip() if sep and WINDOW_SIZE_SUFFIX.fullmatch(suffix.strip()) else body.strip()",
         '    bare = body.rpartition("@")[0].strip()  # mutated: 不带 @ 的条目被切成空串',
         "tests/test_audit4_fixes.py::test_retire_model_reports_three_states",
     ),
@@ -364,9 +367,11 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "M46 账本写盘不并对方进程记录（互相覆盖）",
         "agent/core/ledger.py",
         "            disk = self._disk_for_merge()  # IO 留在 _lock 之外\n"
+        "            self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）\n"
         "            with self._lock:\n"
         "                if disk is not None:\n"
         "                    self._merge_disk_locked(disk)\n",
+        "            self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）\n"
         "            with self._lock:\n",
         "tests/test_health.py::test_write_merges_records_from_another_process",
     ),
@@ -441,7 +446,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M56 叠加层读取忽略 collaboration.free_nodes_file",
-        "agent/config.py",
+        "agent/config_load.py",
         '    overlay_path = _free_nodes_path(data.get("collaboration") or {})',
         "    overlay_path = _free_nodes_path({})",
         "tests/test_node_discovery.py::test_load_config_applies_overlay_from_the_configured_path",
@@ -510,7 +515,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M65 门外重试环不再重试",
-        "agent/core/orchestrator.py",
+        "agent/core/dispatch.py",
         "            if attempt >= attempts - 1:",
         "            if True:  # mutated: 一次就交回上层，等于派工侧关掉重试",
         "tests/test_audit5_fixes.py::test_backoff_sleep_happens_outside_the_station_gate",
@@ -536,11 +541,74 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "        if timeout is not None:",
         "tests/test_audit5_fixes.py::test_nonpositive_explicit_timeout_falls_back_to_adaptive",
     ),
+    (
+        "M69 兜底未知异常又进当日隔离",
+        "agent/core/dispatch.py",
+        """                    self._record_result(
+                        p.name, ok=False, fatal=not err.retryable and err.error_type != ERR_OTHER
+                    )""",
+        """                    self._record_result(
+                        p.name, ok=False, fatal=not err.retryable
+                    )  # mutated: 未知异常也当日隔离""",
+        "tests/test_audit6_fixes.py::test_unknown_exception_only_cools_not_quarantines",
+    ),
+    (
+        "M70 被移出工人的连接池不回收",
+        "agent/core/orchestrator.py",
+        """        with self._clients_lock:
+            for name in removed:
+                for cache in (self._clients, self._probe_clients):
+                    client = cache.pop(name, None)
+                    if client is not None:
+                        retired.append(client)""",
+        "        retired: list[LLMClient] = []  # mutated: 不回收，连接池挂到进程退出",
+        "tests/test_audit6_fixes.py::test_removed_worker_clients_are_reclaimed",
+    ),
+    (
+        "M71 子进程环境只认分段式密钥名（漏 MYKEY/GHTOKEN）",
+        "agent/tools/builtin.py",
+        """        if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS or any(
+            name.endswith(tail) for tail in SECRET_NAME_TAILS
+        ):""",
+        '        if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS:  # mutated: 只看分段后缀',
+        "tests/test_audit6_fixes.py::test_child_env_strips_compact_secret_names",
+    ),
+    (
+        "M72 探测遇参数不支持不降级（整轮样本丢光）",
+        "agent/core/latency.py",
+        """        if self._latency_probe_max_tokens <= 0 or station in self._probe_no_max_tokens:
+            return False
+        if err.retryable:
+            return False
+        self._probe_no_max_tokens.add(station)
+        return True""",
+        "        return False  # mutated: 不降级，不兼容的网关会让整轮样本丢光",
+        "tests/test_audit6_fixes.py::test_probe_degrades_to_no_max_tokens_per_station",
+    ),
+    (
+        "M73 投票预览长度又写死 80",
+        "agent/core/voting.py",
+        "        preview_chars = self.cfg.vote_preview_chars",
+        "        preview_chars = 80  # mutated: 预览长度写死",
+        "tests/test_audit6_fixes.py::test_vote_preview_length_is_configurable",
+    ),
+    (
+        "M74 MCP 工具调用超时又写死 300",
+        "agent/tools/mcp_client.py",
+        "            result = fut.result(timeout=self._call_timeout)",
+        "            result = fut.result(timeout=300)  # mutated: 超时写死",
+        "tests/test_audit6_fixes.py::test_mcp_tool_timeout_is_configurable",
+    ),
 ]
 
 
-def run_pytest(node: str) -> bool:
-    """返回是否通过。"""
+def run_pytest(node: str) -> int:
+    """跑一个用例节点，返回 pytest 退出码。
+
+    0 全过；1 有用例失败（真断言失败）；2 中断/收集错；3 内部错；4 用法错；5 未收集到用例。
+    返回值必须是退出码本身（而不是布尔）：调用方要靠 0 / 1 / 其它 三分类判定"变异是否
+    真的被用例挡住"——旧写法只判 `!= 0`，把"收集不到用例""语法炸掉"也一并算成有效守卫。
+    """
     proc = subprocess.run(
         [PY, "-m", "pytest", "-q", "-x", node],
         cwd=str(ROOT),
@@ -548,7 +616,7 @@ def run_pytest(node: str) -> bool:
         text=True,
         timeout=600,
     )
-    return proc.returncode == 0
+    return proc.returncode
 
 
 def node_collects(node: str) -> bool:
@@ -570,13 +638,16 @@ def node_collects(node: str) -> bool:
 
 
 # 上一轮被硬杀时可能把源码留在变异态（本项目真发生过，`.tmp_prestore/` 就是那种残留）：
-# 开跑前先扫一遍目标文件，带着 `# mutated:` 标记就拒绝在坏态上继续改。
+# 开跑前先扫全部 agent/ 与 tests/ 源文件，带着 `# mutated:` 标记就拒绝在坏态上继续改。
+# 旧版只扫 MUTATIONS 的目标文件，别的文件被留在坏态不会被发现；本脚本自身要排除——
+# MUTATIONS 里本来就写着 `# mutated:` 字样，不排除会误判。
+_stale_scope = [
+    p
+    for p in list((ROOT / "agent").rglob("*.py")) + list((ROOT / "tests").rglob("*.py"))
+    if p.resolve() != Path(__file__).resolve()
+]
 stale = sorted(
-    {
-        rel
-        for rel in (m[1] for m in MUTATIONS)
-        if "# mutated:" in (ROOT / rel).read_text(encoding="utf-8")
-    }
+    str(p.relative_to(ROOT)) for p in _stale_scope if "# mutated:" in p.read_text(encoding="utf-8")
 )
 if stale:
     print(f"[中止] 这些文件仍带着上次变异留下的 `# mutated:` 标记，先从 git 还原再跑：{stale}")
@@ -592,18 +663,25 @@ for label, rel, old, new, node in MUTATIONS:
     if not node_collects(node):
         rows.append((label, "FAIL", "用例节点不存在（被改名/删除，这条变异已失去守卫）"))
         continue
+    mutated = original.replace(old, new, 1)
     try:
-        path.write_text(original.replace(old, new, 1), encoding="utf-8")
-        passed = run_pytest(node)
+        # 变异体自己就得是合法 Python：否则"用例失败"只是语法/导入错，不能证明断言有效
+        # （审计：旧写法把这种失败也记 OK，等于拿坏源码冒充回归保护）。
+        ast.parse(mutated)
+    except SyntaxError as exc:
+        rows.append((label, "BROKEN", f"变异体语法错误（{exc.msg}）：不能据此判定用例有效性"))
+        continue
+    try:
+        path.write_text(mutated, encoding="utf-8")
+        code = run_pytest(node)
     finally:
         path.write_text(original, encoding="utf-8")
-    rows.append(
-        (
-            label,
-            "OK" if not passed else "TAUTOLOGY",
-            "变异后失败=用例有效" if not passed else "变异后仍通过=恒真用例",
-        )
-    )
+    if code == 0:
+        rows.append((label, "TAUTOLOGY", "变异后仍通过=恒真用例"))
+    elif code == 1:
+        rows.append((label, "OK", "变异后失败=用例有效"))
+    else:
+        rows.append((label, "BROKEN", f"变异后 pytest 退出码 {code}（未真正跑用例，不能判定）"))
 
 print("=" * 78)
 print(f"{'变异':<26}{'结果':<12}说明")

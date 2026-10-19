@@ -62,8 +62,12 @@ class VotingMixin:
         无任何可解析选票（超时/工人都没输出编号）返回 None。
         阈值不在这里判（共识与否由调用方按得票比例决定），故本函数不收阈值参数。
         """
+        # 预览长度可配（collaboration.vote_preview_chars，默认 240）：固定 80 字时，
+        # 长方案之间真正的差异全被截掉，投票人等于只看标题；太长则 N 份候选一起顶爆
+        # 投票 prompt（免费小模型上下文有限）。见 Config.vote_preview_chars。
+        preview_chars = self.cfg.vote_preview_chars
         numbered = [
-            f"[{i}] {w}\n预览：{ans[:80]}".replace("\n", " ")
+            f"[{i}] {w}\n预览：{ans[:preview_chars]}".replace("\n", " ")
             for i, (w, ans) in enumerate(candidates, 1)
         ]
         ballot = "候选方案：\n" + "\n".join(numbered) + "\n\n请只输出你认可方案的编号数字。"
@@ -248,7 +252,10 @@ class VotingMixin:
         ratio = best_n / total
         body = [
             "## 候选方案",
-            *[f"[{i}] {w}：{ans[:96]}…" for i, (w, ans) in enumerate(candidates, 1)],
+            *[
+                f"[{i}] {w}：{ans[: self.cfg.vote_preview_chars]}…"
+                for i, (w, ans) in enumerate(candidates, 1)
+            ],
         ]
         if note:
             body.insert(0, note.rstrip("\n"))

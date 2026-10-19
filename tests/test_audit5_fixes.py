@@ -86,7 +86,7 @@ def test_acquire_group_rebuilds_a_closed_group_instead_of_raising(monkeypatch):
     built = []
 
     class Fresh(mcp_client.McpGroup):
-        def __init__(self, cfgs):
+        def __init__(self, cfgs, call_timeout=300.0):
             super().__init__(cfgs)
             built.append(self)
 

@@ -133,7 +133,7 @@ class ParallelMixin:
         if workers is None:
             return max(1, min(cap, n))
         profiles = getattr(self, "profiles", None) or {}
-        stations = {(p.base_url, p.api_key) for w in workers if (p := profiles.get(w)) is not None}
+        stations = {p.station_key for w in workers if (p := profiles.get(w)) is not None}
         if not stations:
             return max(1, min(cap, n))
         return self._station_parallel_cap(len(stations))

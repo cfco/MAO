@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 from ..config import ROOT, Config  # 统一从 config 拿 ROOT，避免多处重复定义漂移
+from ..core.constants import SECRET_NAME_TAILS  # 凭据词表：与 redact 共用同一份
 from ..core.redact import safe_error_text
 from .base import FunctionTool, ToolRegistry, ToolResult
 from .shell_safety import (  # shell 命令安全扫描，独立模块见 shell_safety.py
@@ -48,8 +49,6 @@ BACKUP_KEEP_DAYS = 30  # 留档保留天数，超期惰性清理
 MAX_BACKUP_BYTES = 1024 * 1024  # 超过该大小不做留档（避免大文件反复整份复制）
 
 
-# 子进程 env 里要剔除的名字后缀：见 _child_env
-_SECRET_ENV_SUFFIXES = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
 # 明确拒绝读取的密钥文件名：`.env` 与其派生（`.env.local`）；模板 `.env.example` 仍可读写
 _SECRET_BASENAMES = (".env",)
 _ENV_EXAMPLE_OK = ".env.example"
@@ -63,20 +62,18 @@ def _child_env() -> dict[str, str]:
     任意 MCP 宿主，且工具输出根本不过 `redact.py` —— 一条 `set` 就能把这台机器的全部
     API key 打包带走（实测子进程确实能看到 `NODE_A_KEY`）。命令黑名单声明过"不是沙箱"，
     但"能执行命令"和"能顺手抄走凭据"是两回事。
-    只按名字后缀剔除，保留 PATH/SystemRoot/ComSpec/TEMP 等功能变量：宁可少拦，也别把
-    cmd 跑坏。名字按 `_` 分段判断，`MONKEY` 这类同尾词不会被误剔。
+    只按名字判断（词表见 core/constants.SECRET_NAME_TAILS，与 redact 脱敏共用一份）：
+    两种命名都要拦——分段式（`NODE_A_KEY` → 末段 `KEY`）与紧凑式（`MYKEY` / `GHTOKEN` /
+    `OPENAIKEY` → 末段就是整名）。紧凑式若只看"末段等于词表"会整类漏掉，而 `.env` 由人
+    维护，加一行这种写法完全可能。
+    这里刻意**宁严勿漏**：误剔一个同尾词（如 `MONKEY`）只是子进程少一个无关变量，
+    漏掉一个密钥则是把整机凭据交给工具输出（展示侧脱敏另按更保守口径，见 redact.py）。
     """
     out: dict[str, str] = {}
     for k, v in os.environ.items():
-        head = k.rsplit("_", 1)[-1].upper() if "_" in k else k.upper()
-        if k.upper().endswith(tuple(f"_{s}" for s in _SECRET_ENV_SUFFIXES)) or head in (
-            "KEY",
-            "TOKEN",
-            "SECRET",
-            "PASSWORD",
-            "PASSWD",
-            "CREDENTIAL",
-            "APIKEY",
+        name = k.upper()
+        if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS or any(
+            name.endswith(tail) for tail in SECRET_NAME_TAILS
         ):
             continue
         out[k] = v
@@ -392,6 +389,10 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
             return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '.')}", ok=False)
         if not p.exists():
             return ToolResult(f"错误：路径不存在：{p}", ok=False)
+        if not p.is_dir():
+            # 对文件调用 list_dir：p.iterdir() 会抛 NotADirectoryError 逃到注册表兜底，
+            # 外部主看到的是一段看不懂的栈。read/write 都先判了类型，这里补上同款友好报错。
+            return ToolResult(f"错误：不是目录（list_dir 只能列目录）：{p}", ok=False)
         try:
             entries = []
             for item in sorted(p.iterdir()):

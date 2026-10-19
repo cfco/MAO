@@ -95,6 +95,24 @@ def _norm_timeout(raw) -> float | None:
     return val
 
 
+def _warn_oversized_named_list(cfg: Config, workers: list[str] | None) -> None:
+    """显式点名超过 max_participants 时提醒一次（stderr，不阻断派工）。
+
+    显式名单按约定不受该上限约束（调用方自己定规模），但"点 40 个 = 40 次真实派工"
+    是额度维度的事实：池大 + 并发低时尾部批次还会撞整体限时被判未完成。
+    这里只如实提示、把决定权留给主——静默放大额度比多一行 stderr 更糟。
+    """
+    if not workers:
+        return
+    cap = cfg.max_participants
+    if cap > 0 and len(workers) > cap:
+        print(
+            f"[bridge] 显式点名 {len(workers)} 个工人，超过 collaboration.max_participants={cap}；"
+            "显式名单不受该上限约束，本次仍按点名全部派工（额度消耗按人数计）",
+            file=sys.stderr,
+        )
+
+
 class Bridge:
     """一个 bridge 连接：共享的注册表 + 技能 + MCP 连接组 + 工人池。"""
 
@@ -111,7 +129,7 @@ class Bridge:
         if cfg.mcp_servers:
             from .tools.mcp_client import acquire_group, register_group_tools
 
-            self.mcp_group = acquire_group(cfg.mcp_servers)
+            self.mcp_group = acquire_group(cfg.mcp_servers, cfg.mcp_tool_timeout)
             self.mcp_status = list(self.mcp_group.status)
             register_group_tools(self.registry, self.mcp_group)
         self.workers = WorkerPool(cfg)
@@ -229,8 +247,10 @@ class Bridge:
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
             # 一次收集，同时回结构化（外部主程序化消费）与文本（人读）
+            named = _norm_workers(req.get("workers"))
+            _warn_oversized_named_list(self.cfg, named)
             recs = self.workers.ask_many_structured(
-                _norm_workers(req.get("workers")) or self.workers.pick(tags=req.get("tags")),
+                named or self.workers.pick(tags=req.get("tags")),
                 prompt,
                 req.get("system"),
                 timeout=_norm_timeout(req.get("timeout")),
@@ -250,9 +270,11 @@ class Bridge:
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
+            named = _norm_workers(req.get("workers"))
+            _warn_oversized_named_list(self.cfg, named)
             v = self.workers.vote(
                 prompt,
-                _norm_workers(req.get("workers")) or None,
+                named or None,
                 req.get("threshold"),
                 timeout=_norm_timeout(req.get("timeout")),
                 master_contribution=req.get("master_contribution"),
@@ -268,7 +290,9 @@ class Bridge:
             if not draft:
                 return {"ok": False, "error": "draft 不能为空（外部主给出初稿，子 AI 只当评审团）"}
             context = str(req.get("context", "")).strip()
-            reviewers = _norm_workers(req.get("workers")) or self.workers.pick(tags=req.get("tags"))
+            named = _norm_workers(req.get("workers"))
+            _warn_oversized_named_list(self.cfg, named)
+            reviewers = named or self.workers.pick(tags=req.get("tags"))
             prompt = (
                 "请作为独立评审，针对下面的稿件给出问题清单与**编号**改进建议，"
                 "直接挑错、给方向，不要客套、不要整段复述原文。\n"
@@ -289,13 +313,10 @@ class Bridge:
         """释放共享工人池与 MCP 连接组引用。"""
         # 工人池持有 httpx 连接池，进程退出前显式释放。
         # MCP 只解除本使用者的引用（引用归零时组内部才真正断开）。
-        for holder in (self.workers,):
-            if holder is None:
-                continue
-            try:
-                holder.close()
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            self.workers.close()
+        except Exception:  # noqa: BLE001 - 收尾失败不影响进程退出
+            pass
         if self.mcp_group is not None:
             from .tools.mcp_client import release_group
 

@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 from .ledger import AtomicJsonLedger, shared_by_path
+from .llm import LLMError
 
 _MAX_SAMPLES = 5  # 每工人保留最近 N 次延迟样本（中位数抗单次抖动）
 _VIEW_KEEP = 500  # 档案最多保留的工人条数（防异常膨胀）
@@ -63,26 +64,36 @@ class LatencyStore(AtomicJsonLedger):
         # _lock / _write_lock / store_path 与落盘口径由基类提供（见 ledger.py）
         super().__init__(store_path)
         self._data: dict[str, dict] | None = None  # 懒加载：首次使用时才读盘
+        self._load_lock = threading.Lock()  # 只护"首次读盘"，与 _lock 分开（见 _ensure_loaded）
+        self._snapshot_cache: dict[str, float] | None = None  # 中位数结果缓存（见 snapshot）
 
     # ---------- 查询 ----------
 
     def get_ms(self, name: str) -> float | None:
         """该工人当前延迟（最近样本中位数，毫秒）；无样本返回 None。只查内存。"""
+        self._ensure_loaded()  # 读盘放在 _lock 之外：载入不在记账锁内碰磁盘
         with self._lock:
-            self._ensure_loaded()
             entry = self._data.get(name) or {}
             return _median(entry.get("samples") or [])
 
     def snapshot(self) -> dict[str, float]:
-        """{worker: 延迟中位数ms}（只含有样本的工人），供 pick 排序与诊断。"""
+        """{worker: 延迟中位数ms}（只含有样本的工人），供 pick 排序与诊断。
+
+        中位数结果带缓存：pick 每次派工都会调它，而样本只有在 record/record_many 时才变
+        （那时缓存随之作废），没必要每次把全池样本重算一遍中位数。返回一份拷贝，
+        调用方可随意读。
+        """
+        if self._snapshot_cache is not None:
+            return dict(self._snapshot_cache)
+        self._ensure_loaded()  # 读盘放在 _lock 之外
         with self._lock:
-            self._ensure_loaded()
             out: dict[str, float] = {}
             for k, v in self._data.items():
                 ms = _median(v.get("samples") or [])
                 if ms is not None:
                     out[k] = ms
-            return out
+            self._snapshot_cache = out
+        return dict(out)
 
     # ---------- 记录 ----------
 
@@ -92,36 +103,59 @@ class LatencyStore(AtomicJsonLedger):
         落盘放在锁外（自带 _write_lock）：get_ms/snapshot 是 pick 热路径，绝不能被磁盘
         写拖住。写入失败只损失持久化，内存账本照常工作。
         """
-        try:
-            value = float(ms)
-        except (TypeError, ValueError):
-            return
-        if value < 0:
-            return
+        self.record_many([(name, ms)])
+
+    def record_many(self, samples: list[tuple[str, float]]) -> None:
+        """批量记一批样本，**只落盘一次**（探测轮用：N 个工人各写一遍整份档案就是 N 次 IO）。
+
+        与 record 同一口径：单条非法值（非数字 / 负数）跳过该条、其余照记；一条都没记成
+        就不落盘。每工人保留最近 _MAX_SAMPLES 条；落盘在锁外（见 ledger.write）。
+        """
+        self._ensure_loaded()  # 读盘放在 _lock 之外
+        added = False
         with self._lock:
-            self._ensure_loaded()
-            entry = self._data.setdefault(name, {})
-            samples = list(entry.get("samples") or [])
-            samples.append(round(value, 1))
-            entry["samples"] = samples[-_MAX_SAMPLES:]
-            entry["updated_at"] = time.time()
-            self._data = _trim(self._data)
-        self.write()  # 快照+落盘都在 _write_lock 内串行，见 ledger.AtomicJsonLedger.write
+            for name, ms in samples:
+                try:
+                    value = float(ms)
+                except (TypeError, ValueError):
+                    continue
+                if value < 0:
+                    continue
+                entry = self._data.setdefault(name, {})
+                arr = list(entry.get("samples") or [])
+                arr.append(round(value, 1))
+                entry["samples"] = arr[-_MAX_SAMPLES:]
+                entry["updated_at"] = time.time()
+                added = True
+            if added:
+                self._data = _trim(self._data)
+                self._snapshot_cache = None  # 样本变了：作废中位数缓存
+        if added:
+            self.write()  # 快照+落盘都在 _write_lock 内串行，见 ledger.AtomicJsonLedger.write
 
     # ---------- 落盘 ----------
 
-    def _ensure_loaded(self) -> None:  # 调用方持锁
+    def _ensure_loaded(self) -> None:
+        """保证内存账本已载入盘上数据。**必须在 _lock 之外调用**（载入要读盘）。
+
+        持 _lock 读盘会把慢盘串进 pick 热路径（ledger.AtomicJsonLedger 的"锁内绝不碰磁盘"
+        口径）。这里不碰 _lock，只用 _load_lock 防并发首查各读一遍盘；已载入的快速路径
+        连 _load_lock 都不取。写盘路径由基类 write() 保证先载入再进 _lock。
+        """
         if self._data is not None:
             return
-        data: dict[str, dict] = {}
-        try:
-            raw = json.loads(self.store_path.read_text(encoding="utf-8"))
-            models = raw.get("models") if isinstance(raw, dict) else None
-            if isinstance(models, dict):
-                data = {k: v for k, v in models.items() if isinstance(v, dict)}
-        except (OSError, ValueError):
-            data = {}  # 缺失/损坏都从空白账本重新开始，不拖垮派工
-        self._data = data
+        with self._load_lock:
+            if self._data is not None:
+                return
+            data: dict[str, dict] = {}
+            try:
+                raw = json.loads(self.store_path.read_text(encoding="utf-8"))
+                models = raw.get("models") if isinstance(raw, dict) else None
+                if isinstance(models, dict):
+                    data = {k: v for k, v in models.items() if isinstance(v, dict)}
+            except (OSError, ValueError):
+                data = {}  # 缺失/损坏都从空白账本重新开始，不拖垮派工
+            self._data = data
 
     def _snapshot_locked(self) -> str:  # 调用方持锁
         """内存账本 → 待写文本。锁内只读内存，不碰磁盘。"""
@@ -235,6 +269,7 @@ class LatencyProber:
         lock = threading.Lock()
         sem = threading.Semaphore(self._concurrency)
         waiters: list[threading.Thread] = []
+        samples: list[tuple[str, float]] = []
 
         def _one(nm: str) -> None:
             with sem:
@@ -242,13 +277,10 @@ class LatencyProber:
                     ms = self._probe_one(nm)
                 except Exception:  # noqa: BLE001 - 单个工人探测异常不影响整轮
                     ms = None
-            if ms is not None:
-                try:
-                    self._store.record(nm, ms)
-                except Exception:  # noqa: BLE001 - 记账失败只丢持久化
-                    pass
             with lock:
                 out[nm] = ms
+                if ms is not None:
+                    samples.append((nm, ms))
 
         for nm in dict.fromkeys(names):  # 去重且保序
             t = threading.Thread(target=_one, args=(nm,), daemon=True)
@@ -256,6 +288,12 @@ class LatencyProber:
             t.start()
         for t in waiters:
             t.join()
+        # 整轮只落盘一次：旧实现每个工人各自 record() 各写一遍整份 JSON（N 工人 = N 次 IO）。
+        if samples:
+            try:
+                self._store.record_many(samples)
+            except Exception:  # noqa: BLE001 - 记账失败只丢持久化
+                pass
         return out
 
     def stats(self) -> dict:
@@ -287,6 +325,11 @@ class LatencyMixin:
         self.latency = latency if latency is not None else get_latency(cfg.model_latency_path)
         self._latency_keep_ratio = cfg.latency_keep_ratio
         self._latency_min_samples = cfg.latency_min_samples
+        # 探测请求输出上限：不带时样本混入"模型爱写多长"，话痨模型会被系统性记慢。<=0 不带。
+        self._latency_probe_max_tokens = cfg.latency_probe_max_tokens
+        # 已探明"不接受 max_tokens 参数"的站（按站键）：免费网关行为不一，遇到参数类
+        # 4xx 就按站降级为不带该参数，而不是让整轮探测连续失败、丢光样本。
+        self._probe_no_max_tokens: set[tuple[str, str]] = set()
         # 探测专用短超时（秒）：探测客户端不沿用真实派工的 llm.timeout（120s）+ 重试，
         # 否则坏节点会把一次测速拖成分钟级、更会挂住同步 probe 整轮（见 _probe_client_for）。
         self._latency_probe_timeout = cfg.latency_probe_timeout
@@ -352,17 +395,54 @@ class LatencyMixin:
         p = self.profiles.get(name)
         if p is None:
             return None
-        gate = self._station_gate((p.base_url, p.api_key))
+        station = p.station_key
+        gate = self._station_gate(station)
         if not gate.acquire(timeout=_PROBE_GATE_WAIT):
             return None  # 该站正在跑真实请求 ⇒ 本轮让路，不污染样本也不挂住探测轮
+        messages = [{"role": "user", "content": _PROBE_PROMPT}]
+        client = self._probe_client_for(p)
         try:
             t0 = time.monotonic()
-            resp = self._probe_client_for(p).chat_once([{"role": "user", "content": _PROBE_PROMPT}])
+            try:
+                resp = client.chat_once(messages, max_tokens=self._probe_max_tokens_for(station))
+            except TypeError:
+                # 自定义/替身客户端可能只接受 messages（max_tokens 是探测的附加项，
+                # 不能因为对方签名旧就让整轮测速全废）；退回标准调用即可。
+                resp = client.chat_once(messages)
+            except LLMError as e:
+                # 该站可能不认 max_tokens（免费网关常回 400/参数错误）：按站降级后重测一次。
+                # 只对"非可重试"的失败降级——429/超时/5xx 与参数无关，重测只是白打一次。
+                if not self._degrade_probe_params(station, e):
+                    return None
+                t0 = time.monotonic()  # 降级重测的耗时才是这一站的真实往返
+                resp = client.chat_once(messages)
             if not str(resp.get("content") or "").strip():
                 return None  # 空回复不算有效往返，避免污染样本
             return (time.monotonic() - t0) * 1000.0
+        except Exception:  # noqa: BLE001 - 单个工人探测异常不影响整轮
+            return None
         finally:
             gate.release()
+
+    def _probe_max_tokens_for(self, station: tuple[str, str]) -> int | None:
+        """本站在探测请求里要不要带 max_tokens（0 / 已探明不支持 ⇒ None=不带）。"""
+        if self._latency_probe_max_tokens <= 0 or station in self._probe_no_max_tokens:
+            return None
+        return self._latency_probe_max_tokens
+
+    def _degrade_probe_params(self, station: tuple[str, str], err: LLMError) -> bool:
+        """遇到"该站不认 max_tokens"类失败时按站降级；返回是否值得不带参数重测一次。
+
+        判据只用"是否可重试"：参数错 4xx 在 llm._once 里归非重试，429/超时/5xx 归可重试
+        ——后者与参数无关，降级重测只是白烧额度。宁可误判成"不支持"（该站之后都不带，
+        样本仍可用），也别让不兼容的网关把整轮探测打成失败、把延迟档案清空。
+        """
+        if self._latency_probe_max_tokens <= 0 or station in self._probe_no_max_tokens:
+            return False
+        if err.retryable:
+            return False
+        self._probe_no_max_tokens.add(station)
+        return True
 
     def _record_latency(self, name: str, ms: float) -> None:
         """把一次真实成功派工的往返耗时写进延迟档案（失败只丢持久化，绝不影响派工）。"""

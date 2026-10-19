@@ -20,7 +20,7 @@ mao = "agent.__main__:main"
 requires = ["uv_build>=0.12.14,<0.13.0"]
 build-backend = "uv_build"
 
-# 打包根目录下的 agent 包（src/mao 只是 uv init 占位，不再打包）
+# 打包根目录下的 agent 包（仓库已无 src/，历史上 uv init 占位目录已移除）
 [tool.uv.build-backend]
 module-root = ""
 module-name = "agent"

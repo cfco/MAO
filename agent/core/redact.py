@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import re
 
+from .constants import SECRET_NAME_TAILS
+
 # URL 的 query 段：凭证最常藏在这里（?key=… / ?api_key=…）
 _URL_QUERY = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+?\?[^\s'\"<>]*")
 # 密钥形态：OpenAI 风格 sk-…、Authorization: Bearer …、以及 key/token=… 参数
@@ -19,19 +21,19 @@ _URL_QUERY = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+?\?[^\s'\"<>]*")
 # 且只在该词是**独立一段**时才算密钥 —— 旧写法用 `\b(key|token|...)=` 匹配，
 # `NODE_A_KEY=sk-xxx`、`CF_API_TOKEN=yyy` 这类下划线后缀名一个都不命中（`_` 与 `K`
 # 之间没有词边界），而本项目的池 key 恰恰全是这种命名。`MONKEY=3` 不该被误抹。
+# **边界**：紧凑写法（`MYKEY=` / `GHTOKEN=`）这里不按名字兜底——按名字后缀兜会连
+# `MONKEY=` 一起误抹正文。这条通道由 builtin._child_env 拦住（子进程根本拿不到这类
+# 变量）；本模块只处理异常文案，值本身若形如 sk-/Bearer 仍会被上面的规则抹掉。
 _SECRET_KV = re.compile(
     r"(?i)\b([A-Za-z0-9_\-]*(?:api[ _\-]?key|key|token|secret|password|passwd|credential))"
     r"(\s*[=:]\s*)([^\s&'\",;]+)"
-)
-_SECRET_NAME_TAILS = frozenset(
-    {"KEY", "APIKEY", "TOKEN", "APITOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"}
 )
 
 
 def _mask_secret_kv(m: re.Match) -> str:
     """命中"名字末段是密钥词"的 KV 才抹值，否则原样返回。"""
     name = m.group(1).upper().replace("-", "_").replace(" ", "_")
-    if name.rsplit("_", 1)[-1] in _SECRET_NAME_TAILS:
+    if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS:
         return f"{m.group(1)}{m.group(2)}****"
     return m.group(0)
 

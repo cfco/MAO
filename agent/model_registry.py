@@ -27,8 +27,12 @@ from .core.ledger import atomic_write_text
 RETIRE_OFFLINED = "offlined"
 RETIRE_ALREADY = "already"
 RETIRE_MISSING = "missing"
-# 什么算"窗口标注"后缀：纯数字、可带 k/K（与 config._split_models 同一条规则）
-_SIZE_SUFFIX = re.compile(r"\d+[kK]?")
+# 内部哨兵：写前发现文件被并发写者改过，整轮重试（不对外暴露）
+_RETIRE_STALE = "stale"
+_RETIRE_RETRIES = 3  # 跨进程 lost update 的重试次数
+# 什么算"窗口标注"后缀：纯数字、可带 k/K。**公开**给 config._split_models 共用
+# （两边各写一份判断时，改一处漏一处 → 同一个模型名在一处算带窗口、另一处不算）。
+WINDOW_SIZE_SUFFIX = re.compile(r"\d+[kK]?")
 
 
 def _split_value_comment(value: str) -> tuple[str, str]:
@@ -39,8 +43,19 @@ def _split_value_comment(value: str) -> tuple[str, str]:
     `m2@256k # 备注` 成为一个条目，`_bare_model` 取不出裸名 `m2`，于是**该行最后一个模型
     永远匹配不上、自动下线对它静默失效**；同一份清单在自动发现的对账里还会被同时算成
     added 和 retired。两侧口径必须收敛到这一个函数。
+
+    引号口径同样对齐 `_load_dotenv`：`KEY="a #b"` 里的 `#` 属于值本身，不能当注释剥掉
+    （旧写法只按 ` #` 切、不认引号，会把引号内的 `#` 静默截断，与 config 侧的"引号优先"
+    规则不一致）。引号内的值原样取出，闭合引号之后的内容（如 ` " # 备注`）视为注释丢弃。
     """
-    head, sep, tail = value.partition(" #")
+    s = value.strip()
+    if s[:1] in ('"', "'"):
+        quote = s[0]
+        end = s.find(quote, 1)
+        if end != -1:
+            return s[1:end].strip(), s[end + 1 :]
+        return s[1:].strip(), ""  # 未闭合：取起始引号之后（与 _load_dotenv 一致）
+    head, sep, tail = s.partition(" #")
     return head.strip(), (sep + tail) if sep else ""
 
 
@@ -82,27 +97,23 @@ def _bare_model(item: str) -> str:
     """
     body = item.lstrip("#")
     name, sep, suffix = body.rpartition("@")
-    bare = name.strip() if sep and _SIZE_SUFFIX.fullmatch(suffix.strip()) else body.strip()
+    bare = name.strip() if sep and WINDOW_SIZE_SUFFIX.fullmatch(suffix.strip()) else body.strip()
     return ("#" if item.startswith("#") else "") + bare
 
 
-def retire_model(path: Path, env_var: str, model: str) -> str:
-    """给 model_registry.txt 中 `env_var=` 这一行的 `model` 加 `#` 下线标记。
+def _retire_once(path: Path, env_var: str, model: str) -> str:
+    """单次尝试：读盘 → 给目标条目加 `#` → 确认无人改写 → 原子写回。
 
-    返回三态（调用方据此拼提示，不必自己再解析一遍文件）：
-    - RETIRE_OFFLINED：本次加上了 #，已原子写回；
-    - RETIRE_ALREADY：该条目已带 #（曾自动下线或人工屏蔽），不动文件；
-    - RETIRE_MISSING：没有该变量行 / 行里没有该模型 / 读写失败（含文件缺失）。
-    删掉 # 即恢复模型（人工 / 手动编辑），符合"标记删除但可手动恢复"的需求。
-    并发安全：进程内按文件串行化（线程锁），写盘临时文件 + os.replace。
+    返回三态，或内部哨兵 `_RETIRE_STALE`（写前发现文件被并发写者改过，交 retire_model 重试）。
     """
     file_path = Path(path)
     lock = _locks.setdefault(str(file_path), threading.Lock())
     with lock:
         try:
-            lines = file_path.read_text(encoding="utf-8").splitlines()
+            raw = file_path.read_text(encoding="utf-8")
         except OSError:
             return RETIRE_MISSING
+        lines = raw.splitlines()
         found = False  # 该变量行里是否出现过这个模型的条目（带不带 # 都算出现）
         changed = False
         for i, line in enumerate(lines):
@@ -125,11 +136,38 @@ def retire_model(path: Path, env_var: str, model: str) -> str:
             break  # 变量名唯一，处理第一处匹配即可
         if not changed:
             return RETIRE_ALREADY if found else RETIRE_MISSING
+        # 写前重读：`_locks` 只在进程内串行，而外部主常并发开多个 `mao call`（各一个新进程、
+        # 互不可见），read→write 之间被别人改写时，本次整篇覆盖会把对方刚加的 `#` 抹掉
+        # （lost update：被抹掉 # 的模型看似永久可用，自动下线静默失效）。发现磁盘内容与
+        # 我们据以计算的版本不一致就整轮重试，绝不硬写回去。
+        try:
+            if file_path.read_text(encoding="utf-8") != raw:
+                return _RETIRE_STALE
+        except OSError:
+            return RETIRE_MISSING
         try:
             atomic_write_text(file_path, "\n".join(lines) + ("\n" if lines else ""))
         except OSError:
             return RETIRE_MISSING  # 写不进去：当作没下线，绝不让 IO 异常炸到派工路径
         return RETIRE_OFFLINED
+
+
+def retire_model(path: Path, env_var: str, model: str) -> str:
+    """给 model_registry.txt 中 `env_var=` 这一行的 `model` 加 `#` 下线标记。
+
+    返回三态（调用方据此拼提示，不必自己再解析一遍文件）：
+    - RETIRE_OFFLINED：本次加上了 #，已原子写回；
+    - RETIRE_ALREADY：该条目已带 #（曾自动下线或人工屏蔽），不动文件；
+    - RETIRE_MISSING：没有该变量行 / 行里没有该模型 / 读写失败（含文件缺失、或反复被并发写者打架）。
+    删掉 # 即恢复模型（人工 / 手动编辑），符合"标记删除但可手动恢复"的需求。
+    并发安全：进程内按文件串行化（线程锁）；跨进程用"写前重读 + 重试"收敛 lost update
+    （多进程同时改写同一清单时，后写者不覆盖先写者的 #）。
+    """
+    for _ in range(_RETIRE_RETRIES):
+        state = _retire_once(path, env_var, model)
+        if state != _RETIRE_STALE:
+            return state
+    return RETIRE_MISSING  # 反复被并发改写：当作写入失败，交调用方按提示人工确认
 
 
 # 每个文件一把线程锁（同一模型清单文件并发改写串行化）

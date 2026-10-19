@@ -66,6 +66,10 @@ collaboration:
   max_per_station: ${COLLAB_MAX_PER_STATION:-1}
   max_participants: ${COLLAB_MAX_PARTICIPANTS:-5}
   vote_threshold: ${COLLAB_VOTE_THRESHOLD:-0.5}
+  # 投票阶段每个候选给投票人看的预览长度（字符，默认 240，夹在 40~2000）。
+  # 太短（曾固定 80）时投票人只能凭开头几十字判断，长方案之间的差异被截掉；
+  # 太长则 N 份候选 × 长度会顶爆投票 prompt（免费小模型上下文有限）。
+  vote_preview_chars: ${COLLAB_VOTE_PREVIEW_CHARS:-240}
   cooldown_fails: ${COLLAB_COOLDOWN_FAILS:-2}
   cooldown_base: ${COLLAB_COOLDOWN_BASE:-10}
   # 冷却指数退避封顶（秒）：连续失败越多、冷却越久（base × 2^n），到顶后恒定不再增长。
@@ -85,6 +89,10 @@ collaboration:
   # 探测专用短超时（秒）：**不**沿用派工的 llm.timeout。坏节点也只拖本值秒、且探测客户端不重试，
   # 免得一次测速被拖成分钟级、或同步 probe（latency probe:true）挂住整轮。
   latency_probe_timeout: ${COLLAB_LATENCY_PROBE_TIMEOUT:-8}
+  # 探测请求的输出上限（token，默认 8，0=不带该参数）。带它是为了不让"话痨模型"
+  # 因输出长而被系统性记成更慢（延迟档案是选路裁剪的排名依据）；免费网关若不认
+  # 该参数（回 4xx），探测会按站自动降级为不带，不会整轮丢样本。
+  latency_probe_max_tokens: ${COLLAB_LATENCY_PROBE_MAX_TOKENS:-8}
   # 只用延迟最低的这部分（默认 0.6 = 弃掉最高延迟的 40%）；小池同样适用
   # （n=5→3、4→3、3→2、2→2），即"可用低于 5 个就用最低的 2~3 个"。
   latency_keep_ratio: ${COLLAB_LATENCY_KEEP_RATIO:-0.6}
@@ -106,6 +114,9 @@ collaboration:
 
 tools:
   shell_timeout: ${TOOLS_SHELL_TIMEOUT:-120}  # 单条命令最长执行秒数
+  # 单次 MCP 工具调用的最长等待（秒，默认 300）。跑测试/等构建这类长事务调大；
+  # 超时只作废这一次调用（session 作废、后台走重连），不会永久摘掉该 server。
+  mcp_tool_timeout: ${TOOLS_MCP_TOOL_TIMEOUT:-300}
   # 额外允许工具访问的工作区目录（相对路径基于项目根，绝对路径原样使用）。
   # 为什么需要：MAO 常被用来驱动**别的项目**（在 MAO 里分析/改造另一个仓库），
   # 但工具层原先把路径硬绑在 MAO 自己的根上，主智能体连目标项目的文件都读不到，

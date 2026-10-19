@@ -79,15 +79,16 @@ class McpConnection:
        - 唤醒（被动断开/主动 stop）后在**同一 task** 里退出 CM → 指数退避 → 重连
     3) stop() 置 _stop 并唤醒 host；收尾清理由后台线程完成
 
-    为什么必须"同 task 进、同 task 出"（审计 P2）：stdio_client/http 的上下文
-    管理器底层是 anyio cancel scope，跨 task 退出会直接抛错。旧实现 enter 在
-    run_until_complete 的 task A、exit 在 host 结束后的 task B，__aexit__ 必然
-    失败又被吞掉——transport/子进程从不真正关闭，每轮重连泄漏一份句柄。
+    为什么必须"同 task 进、同 task 出"（审计 P2）：stdio_client/http 的上下文管理器
+    底层是 anyio cancel scope，跨 task 退出会直接抛错。旧实现 enter 在 task A、
+    exit 在 host 结束后的 task B，__aexit__ 必然失败又被吞——子进程从不真正关闭。
     """
 
-    def __init__(self, name: str, cfg: dict):
+    def __init__(self, name: str, cfg: dict, call_timeout: float = 300.0):
         self.name = name
         self.cfg = cfg
+        # 单次工具调用最长等待：tools.mcp_tool_timeout（原先硬编码 300，长事务会被误杀）。
+        self._call_timeout = max(1.0, float(call_timeout))
         self.loop: asyncio.AbstractEventLoop | None = None
         self.session: ClientSession | None = None
         self._transport_cm: Any = None
@@ -124,10 +125,9 @@ class McpConnection:
                 ready.set()  # 无论首次连接成败，都让 start() 超时逻辑能放行
                 if self._stop.is_set():
                     break  # 主动关闭，不再重连
-                # 连接失败：首连失败直接退出（start() 拿到 error 快速上报，语义不变）；
-                # 曾连上过则说明节点活着过，此后失败属于"断线重连"范畴——免费/不稳节点
-                # 挂了又恢复是常态，必须继续指数退避重试。原实现在这里 break，
-                # 第一次重连失败就把重连线程判死刑，与模块头声明的重连承诺相悖。
+                # 首连失败直接退出（start() 拿到 error 快速上报）；曾连上过则属"断线重连"范畴
+                # ——免费/不稳节点挂了又恢复是常态，必须继续退避重试。旧实现在这里 break，
+                # 第一次重连失败就把线程判死刑，与模块头声明的重连承诺相悖。
                 if not connected and not ever_connected:
                     break
                 ever_connected = True
@@ -151,8 +151,7 @@ class McpConnection:
     async def _connect_and_host(self, ready: threading.Event) -> bool:
         """一次完整的「连接 → 托管 → 清理」：enter 与 exit 恒在同一 task 内（anyio 约束）。
 
-        返回 True 表示本次确实建立过连接（退出时已把 CM 清理完）；
-        False 表示连接失败（_connect_once 内部已完成部分 enter 的回滚）。
+        返回 True=确实建立过连接（CM 已清理）；False=连接失败（_connect_once 已回滚部分 enter）。
         host 阶段 await _host_evt：被 _wake_host 唤醒（被动断线 / 主动 stop）即收尾。
         """
         if not await self._connect_once(ready):
@@ -182,9 +181,8 @@ class McpConnection:
     async def _connect_once(self, ready: threading.Event) -> bool:
         """一次连接尝试。成功返回 True（session 建立、初始化完成）。失败返回 False。
 
-        失败回滚：transport 已 __aenter__ 成功后若 session 建立/初始化失败，
-        必须把已进入的 CM 逆序退出。原实现只记 error 不回滚，每次失败尝试
-        泄漏一个 stdio 子进程/连接句柄——重连改为长期持续后，泄漏会不断累积。
+        失败回滚：transport 已 enter 而 session 失败时必须逆序退出已进入的 CM——
+        旧实现只记 error 不回滚，每次失败泄漏一个 stdio 子进程/句柄，长期重连会累积。
         """
         transport_entered = False
         session_entered = False
@@ -292,10 +290,9 @@ class McpConnection:
             )
         try:
             fut = asyncio.run_coroutine_threadsafe(session.call_tool(remote_name, args or {}), loop)
-            result = fut.result(timeout=300)
+            result = fut.result(timeout=self._call_timeout)
         except Exception as e:  # noqa: BLE001
-            # 调用时异常（session 断了）：作废当前 session 并唤醒 host，
-            # 让后台线程走「同 task 清理 → 退避 → 重连」路径。
+            # 调用时异常（session 断了）：作废 session 并唤醒 host，走「同 task 清理→退避→重连」。
             if not self._stop.is_set():
                 with self._lock:
                     self.session = None
@@ -326,16 +323,18 @@ def connect_and_register(
     registry: ToolRegistry,
     out_conns: list | None = None,
     out_tools: list | None = None,
+    call_timeout: float = 300.0,
 ) -> list[str]:
     """连接全部配置的 MCP server 并注册其工具。返回状态日志行。
 
     out_conns / out_tools 可选：把建立的连接与注册的工具对象一并带出，
     供进程内共享连接组复用（见 acquire_group）。
+    call_timeout：单次工具调用的最长等待（tools.mcp_tool_timeout），默认 300s。
     """
     status: list[str] = []
     for cfg in server_cfgs:
         name = str(cfg.get("name") or cfg.get("command") or cfg.get("url") or "mcp")
-        conn = McpConnection(name, cfg)
+        conn = McpConnection(name, cfg, call_timeout)
         conn.start()
         if out_conns is not None:
             out_conns.append(conn)
@@ -394,8 +393,9 @@ class McpGroup:
     把别的调用方正在用的连接一起掐掉。
     """
 
-    def __init__(self, server_cfgs: list[dict]):
+    def __init__(self, server_cfgs: list[dict], call_timeout: float = 300.0):
         self.server_cfgs = server_cfgs
+        self.call_timeout = max(1.0, float(call_timeout))
         self.conns: list[McpConnection] = []
         self.tools: list[McpTool] = []
         self.status: list[str] = []
@@ -407,7 +407,11 @@ class McpGroup:
         """建立连接并发现工具（只在首次创建该组时调用一次）。"""
         collector = ToolRegistry()
         self.status = connect_and_register(
-            self.server_cfgs, collector, self.conns, out_tools=self.tools
+            self.server_cfgs,
+            collector,
+            self.conns,
+            out_tools=self.tools,
+            call_timeout=self.call_timeout,
         )
 
     def try_acquire(self) -> bool:
@@ -442,17 +446,23 @@ _groups_lock = threading.Lock()
 _groups: dict[str, McpGroup] = {}
 
 
-def _group_key(server_cfgs: list[dict]) -> str:
-    """配置签名：内容一致（含键序无关）即视为同一组，可复用同一批连接。"""
-    return json.dumps(server_cfgs, sort_keys=True, ensure_ascii=False, default=str)
+def _group_key(server_cfgs: list[dict], call_timeout: float = 300.0) -> str:
+    """配置签名：内容一致（含键序无关）即同一组，可复用同一批连接。
+
+    超时也进签名：同配置不同超时不该共用连接，否则先到者的超时悄悄决定后到者。
+    """
+    return (
+        json.dumps(server_cfgs, sort_keys=True, ensure_ascii=False, default=str)
+        + f"|call_timeout={call_timeout}"
+    )
 
 
-def acquire_group(server_cfgs: list[dict]) -> McpGroup:
+def acquire_group(server_cfgs: list[dict], call_timeout: float = 300.0) -> McpGroup:
     """取得（或建立）与配置对应的共享连接组，并登记一个使用者。
 
     建连在全局锁外完成：单个 server 首连最长 90s，占着锁会把别的会话一起堵住。
     """
-    key = _group_key(server_cfgs)
+    key = _group_key(server_cfgs, call_timeout)
     while True:
         with _groups_lock:
             group = _groups.get(key)
@@ -462,7 +472,7 @@ def acquire_group(server_cfgs: list[dict]) -> McpGroup:
                 if group.try_acquire():
                     return group
                 _groups.pop(key, None)  # 已关闭的组不能复用，摘掉后重建
-        fresh = McpGroup(list(server_cfgs))
+        fresh = McpGroup(list(server_cfgs), call_timeout)
         fresh.start()  # 锁外建连（首连可能耗时 90s，绝不占着全局锁）
         with _groups_lock:
             if key not in _groups:  # 并发下别人已建好就用先到的那份
