@@ -1145,15 +1145,16 @@ def test_run_shell_child_env_has_no_secret_vars(monkeypatch, tmp_path):
     seen = {}
 
     class FakeProc:
-        stdout = b"ok"
-        stderr = b""
         returncode = 0
 
-    def fake_run(cmd, **kw):
+        def communicate(self, timeout=None):
+            return (b"ok", b"")
+
+    def fake_popen(cmd, **kw):
         seen["env"] = kw.get("env")
         return FakeProc()
 
-    monkeypatch.setattr(bi.subprocess, "run", fake_run)
+    monkeypatch.setattr(bi.subprocess, "Popen", fake_popen)
     cfg = Config(_interpolate({"tools": {"shell_timeout": 5}}))
     reg = bi.build_builtin_tools(cfg)
     reg.run("run_shell", {"command": "set | find /c KEY"})

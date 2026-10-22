@@ -192,8 +192,12 @@ def test_vote_preview_length_is_configurable(monkeypatch):
     assert big.vote_preview_chars == 2000
 
 
-def test_mcp_tool_timeout_is_configurable():
-    """MCP 工具调用超时读 tools.mcp_tool_timeout，不再硬编码 300s；超时进连接组签名。"""
+def test_mcp_tool_timeout_is_configurable(monkeypatch):
+    """MCP 工具调用超时读 tools.mcp_tool_timeout，不再硬编码 300s；超时进连接组签名。
+
+    调用路径也必须验：只查 cfg/构造签名/group_key 时，`fut.result(timeout=...)`
+    那行被改回写死 300 没有任何断言能发现（M74 变异锚点曾因此报恒真）。
+    """
     from agent.tools import mcp_client
 
     cfg = Config(_interpolate({"tools": {"mcp_tool_timeout": 42}}))
@@ -201,6 +205,36 @@ def test_mcp_tool_timeout_is_configurable():
 
     conn = mcp_client.McpConnection("t", {"name": "t"}, cfg.mcp_tool_timeout)
     assert conn._call_timeout == 42
+
+    # ---- 调用路径：fut.result 必须收到配置值，而不是写死的 300 ----
+    seen: list[float] = []
+
+    class FakeBlock:
+        text = "pong"
+
+    class FakeResult:
+        content = [FakeBlock()]
+
+    class FakeFuture:
+        def result(self, timeout=None):
+            seen.append(timeout)
+            return FakeResult()
+
+    # 绕开真实连接：call_tool 只要求"session/loop 非空 + 能提交协程"
+    # （session.call_tool 的返回值会被交给打桩的 run_coroutine_threadsafe，永不 await，
+    #  所以返回 None 即可——真返回协程反而会触发"从未被 await"的 RuntimeWarning）
+    class FakeSession:
+        def call_tool(self, name, args):
+            return None
+
+    conn.session = FakeSession()
+    conn.loop = object()
+    monkeypatch.setattr(
+        mcp_client.asyncio, "run_coroutine_threadsafe", lambda coro, loop: FakeFuture()
+    )
+    out = conn.call_tool("echo", {"x": 1})
+    assert "pong" in out, out
+    assert seen == [42], f"应把配置的 42s 传给 fut.result，实际 {seen}"
 
     servers = [{"name": "t", "transport": "stdio"}]
     assert mcp_client._group_key(servers, 42) != mcp_client._group_key(servers, 300), (

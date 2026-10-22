@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import os
-import subprocess  # 顶层 import：测试里会 monkeypatch bi.subprocess.run，必须让外部模块能看到
+import signal  # 超时杀进程树：POSIX 侧 killpg 要用
+import subprocess  # 顶层 import：测试里会 monkeypatch bi.subprocess.Popen，必须让外部模块能看到
 import sys
 import threading
 import time
@@ -47,6 +48,50 @@ MAX_WRITE_BYTES = 1024 * 1024  # write_file / append_file 单次最多写 1MB，
 BACKUP_DIR = ROOT / "data" / "backup"  # 覆盖写前的自动留档目录（可回滚）
 BACKUP_KEEP_DAYS = 30  # 留档保留天数，超期惰性清理
 MAX_BACKUP_BYTES = 1024 * 1024  # 超过该大小不做留档（避免大文件反复整份复制）
+
+
+def _shell_flavor() -> str:
+    """run_shell 的"方言"提示词：外部主按工具描述生成命令，一侧写死会让另一侧拿到错误示范。
+
+    实测（2026-10-22 审计）：描述写死 "Windows cmd 语法，如 dir、type" 时，Linux 上
+    外部主被示范 cmd 命令——dir/type 恰巧能跑，copy/del/cls 这类必然失败；反之在
+    Windows 上被示范 ls/cat 同理。按宿主平台取词，两边各得正确指引。
+    做成函数而非模块常量：测试可 monkeypatch sys.platform 在**同一进程**里验证两个
+    分支（常量只能在对应平台上验一半，另一半永远不被测到）。
+    """
+    if sys.platform == "win32":
+        return "Windows cmd 语法，如 dir、type、python、pip"
+    return "POSIX shell 语法（sh/bash），如 ls、cat、grep、python、pip"
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """把超时子进程连同其子孙一起杀掉（跨平台）。
+
+    为什么不能只 proc.kill()：subprocess 的 timeout 只终止**直接**子进程，
+    `sh -c "sleep 60 &"` / `nohup ... &` / `setsid ...` 的孙进程会残留成孤儿继续跑
+    （Linux 上这类写法是常规操作，实测一条超时命令能留下活过数分钟的孙进程）。
+    - POSIX：spawn 时带 start_new_session=True，子进程自成进程组且 pgid==pid，
+      直接 killpg(proc.pid) 全组收。用 pid 而非 getpgid(pid)：直接子进程可能已被
+      回收，但只要组内还有子孙，进程组就仍在，killpg 依然有效；
+    - Windows：taskkill /F /T /PID 按进程树杀（不依赖进程组）。
+    两条路都失败（进程组已不存在等）就退化为 proc.kill()——Popen 内部对已退出
+    进程会短路，不会误杀 pid 回收后同号的新进程。
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 # 明确拒绝读取的密钥文件名：`.env` 与其派生（`.env.local`）；模板 `.env.example` 仍可读写
@@ -231,10 +276,11 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     timeout = cfg.shell_timeout
 
     def run_shell(args: dict) -> str:
-        """在本机执行 shell 命令（Windows cmd 语法）。
+        """在本机执行 shell 命令（Windows 为 cmd，POSIX 为 sh/bash；措辞见 _shell_flavor）。
 
-        安全加固见 shell_safety.py。参数模式（shell=False）优先，
-        有 shell 专有语法（管道/重定向等）或首词是 cmd 内置命令时退回 shell=True。
+        安全加固见 shell_safety.py。参数模式（shell=False）优先，首词是 shell
+        内置命令（cmd 的 echo/dir/type，POSIX 的 cd/export）时退回 shell=True；
+        超时杀整棵进程树（_kill_process_tree），孙进程不留孤儿。
         """
         command = str(args.get("command", "")).strip()
         if not command:
@@ -256,53 +302,69 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         if not cwd.is_dir():
             return ToolResult(f"错误：cwd 不是有效目录：{cwd}", ok=False)
         # ---- shell=True 加固：优先用参数模式（shell=False），不适用时退回 shell=True ----
+        # start_new_session=True 是杀进程树的前提：POSIX 下子进程自成进程组
+        # （pgid==pid），超时一发 killpg 全组收；Windows 下 taskkill /T 按树杀。
+        # 代价：子进程不再随 bridge 的 Ctrl+C 一起中断——长驻服务里这反而更安全
+        # （不会留下半截输出的子进程），且子进程最迟在 shell_timeout 后被收掉。
         proc = None
         args_list = _try_split_args(command)
         try:
             if args_list is not None:
                 try:
                     # 参数模式：shell=False，避免命令拼接注入
-                    proc = subprocess.run(
+                    proc = subprocess.Popen(
                         args_list,
                         shell=False,
                         cwd=cwd,
-                        timeout=timeout,
-                        capture_output=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
                         env=_child_env(),
+                        start_new_session=True,
                     )
                 except FileNotFoundError:
-                    # 首词不是真实可执行文件 → 多半是 cmd 的**内置命令**（echo/dir/type/copy…）。
-                    # 内置命令没有对应 exe，只能由 cmd 解释器执行：参数模式必然 WinError 2
-                    # （实测 `echo` 在中转环境报"系统找不到指定的文件"，而工具描述明确写了支持 dir/type）。
-                    # 该命令已通过黑名单与注入检查，这里退回 shell=True 不降低既有防护强度
-                    # （有 `&`/`|`/`;` 的命令本来也走 shell=True）。
-                    proc = subprocess.run(
+                    # 首词不是真实可执行文件 → 多半是 shell 的**内置命令**（cmd 的
+                    # echo/dir/type；POSIX 的 cd/export 只有内建实现）。内置命令没有
+                    # 对应可执行文件，参数模式必然抛 FileNotFoundError，只能交给 shell
+                    # 解释器执行。该命令已通过黑名单与注入检查，退回 shell=True 不降低
+                    # 既有防护强度（有 `&`/`|`/`;` 的命令本来也走 shell=True）。
+                    proc = subprocess.Popen(
                         command,
                         shell=True,
                         cwd=cwd,
-                        timeout=timeout,
-                        capture_output=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
                         env=_child_env(),
+                        start_new_session=True,
                     )
             else:
                 # 有 shell 专有语法（管道/重定向等），直接用 shell=True
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     command,
                     shell=True,
                     cwd=cwd,
-                    timeout=timeout,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     env=_child_env(),
+                    start_new_session=True,
                 )
-        except subprocess.TimeoutExpired:
-            return ToolResult(f"错误：命令超过 {timeout} 秒未完成，已终止", ok=False)
+            try:
+                out_b, err_b = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # 只杀直接子进程会留下孙进程孤儿（sh -c 'x &' / nohup / setsid 场景），
+                # 必须整棵树收掉、再回收输出，避免僵尸与管道悬挂。
+                _kill_process_tree(proc)
+                try:
+                    proc.communicate(timeout=10)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                return ToolResult(f"错误：命令超过 {timeout} 秒未完成，已终止", ok=False)
         except OSError as e:  # noqa: BLE001 - 目录等系统级错误给友好提示
             return ToolResult(f"错误：无法执行命令：{safe_error_text(e)}", ok=False)
         parts = []
-        if proc.stdout:
-            parts.append(_decode(proc.stdout)[-8000:])
-        if proc.stderr:
-            parts.append("[stderr] " + _decode(proc.stderr)[-4000:])
+        if out_b:
+            parts.append(_decode(out_b)[-8000:])
+        if err_b:
+            parts.append("[stderr] " + _decode(err_b)[-4000:])
         parts.append(f"[exit code] {proc.returncode}")
         # exit code != 0 视为命令执行失败，返回 ToolResult(ok=False) 与既有行为一致。
         # 之前这里返回裸 str——如果调用方解析 stderr 里的错误文本就能判断，但用 ok 标志更明确。
@@ -414,7 +476,7 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         FunctionTool(
             name="run_shell",
             description=(
-                "在本机执行 shell 命令（Windows cmd 语法，如 dir、type、python、pip）。"
+                f"在本机执行 shell 命令（{_shell_flavor()}）。"
                 "适合系统操作、批量文件处理、调用本机程序。返回 stdout/stderr 与退出码。"
                 "注意：内置危险命令拦截（rm/del/format 等，且 python -c / node -e 这类内联代码"
                 "正文也会扫描破坏性调用），但这是命令卫生黑名单、**不是沙箱**；确需的不可逆操作"

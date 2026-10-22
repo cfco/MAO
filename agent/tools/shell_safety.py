@@ -216,13 +216,53 @@ def _check_powershell_encoding(command: str) -> str | None:
 
 
 def _command_heads(command: str) -> list[str]:
-    """把命令按 shell 分隔符切段，返回每段的命令首词（全部要查）。
+    """把命令按 shell 分隔符切段，返回每段"实际被执行"的命令词（全部要查）。
 
     只查整条命令的首词会漏掉串联在后面的危险命令：`echo x & del /s y` 的
     首词是 echo，但真正执行删除的是 del。`&&`/`||` 已被注入模式拦下，
     这里的切段是单 `&`、`|`、`;` 串联场景的兜底。
+
+    每段除首词外还收"命令 Runner"真正执行的词（见 _runner_targets）：
+    `ls | xargs rm -f` 首词是 xargs、`find . -delete` 首词是 find，破坏动作
+    都不在首词位置上——这两类在 Linux 上是常规写法，漏掉等于顶层放行
+    （实测 2026-10-22：`ls | xargs rm -f` 三层防护一层都不触发）。
     """
-    return [h for h in (_head_word(p) for p in _CMD_SEPARATOR.split(command)) if h]
+    words: list[str] = []
+    for seg in _CMD_SEPARATOR.split(command):
+        head = _head_word(seg)
+        if head:
+            words.append(head)
+        words.extend(_runner_targets(seg))
+    return words
+
+
+def _runner_targets(segment: str) -> list[str]:
+    """xargs / find 段里"实际会被执行"的命令词（Runner 自己的参数不算）。
+
+    - xargs：第一个非选项参数即要执行的命令（`-I{} rm` 的 rm 在占位符之后，
+      取第一个非选项词即可；多取一个选项词只是多查一个无害词，不漏判就行）；
+    - find：-exec/-execdir 的后一个词；-delete 等价递归删除，按 rm 同等拦截。
+    """
+    tokens = [_strip_wrapping_quotes(t) for t in _split_tokens(segment)]
+    if not tokens:
+        return []
+    head = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if head == "xargs":
+        for t in tokens[1:]:
+            if t.startswith("-"):
+                continue
+            return [t.replace("\\", "/").rsplit("/", 1)[-1].lower()]
+        return []
+    if head == "find":
+        out: list[str] = []
+        for i, t in enumerate(tokens[1:], start=1):
+            low = t.lower()
+            if low == "-delete":
+                out.append("rm")  # -delete 就是递归删除，按 rm 拦
+            elif low in ("-exec", "-execdir") and i + 1 < len(tokens):
+                out.append(tokens[i + 1].replace("\\", "/").rsplit("/", 1)[-1].lower())
+        return out
+    return []
 
 
 _PS_PATTERNS = [(re.compile(p, re.IGNORECASE), desc) for p, desc in _PS_DANGEROUS]
@@ -266,9 +306,39 @@ _INLINE_CODE_FLAGS = {"-c", "-e", "--eval", "-r", "--rc", "-import", "--import"}
 # 只认单横线，`--norc`（双横线、也以 c 结尾）不会被误当成内联开关。
 _SHELL_CODE_FLAG = re.compile(r"-[a-z]{0,3}c\Z")
 _POSIX_SHELL_INTERP = {"sh", "bash", "zsh", "dash", "ksh"}
-# POSIX 侧破坏性命令（内联代码常调 sh/os.system，补齐 Windows 集合看不到的词）
-_POSIX_DANGEROUS_SET = {"rm", "rmdir", "mkfs", "dd", "shred", "mkfstools", "truncate"}
+# POSIX 侧破坏性命令（内联代码常调 sh/os.system，补齐 Windows 集合看不到的词）。
+# 顶层判定同样用这份集合（见 _check_command_safety）：Linux 上 rm/mkfs/dd 是原生命令，
+# 历史缺口是"只在内联正文里拦、顶层放行"——实测 2026-10-22：顶层 `rm -rf /` 直过，
+# 与 run_shell 描述声明的"rm/del/format 都拦"契约相悖（CI 跑 ubuntu 却没人踩到，
+# 因为测试只覆盖了内联场景）。
+_POSIX_DANGEROUS_SET = {
+    "rm",
+    "rmdir",
+    "mkfs",
+    "dd",
+    "shred",
+    "mkfstools",
+    "truncate",
+    "mkswap",
+    "sfdisk",
+    "parted",
+    "wipefs",
+    "poweroff",
+    "halt",
+}
+# 带工具变体后缀的首词（mkfs.ext4 / mkfs.xfs / mkfs.vfat…）：精确匹配拦不住，按前缀兜。
+# 只放 mkfs——`mk` 开头的 mkdir/mkfifo 是正常命令，绝不能按前缀误伤。
+_POSIX_DANGEROUS_PREFIXES = ("mkfs",)
 _ALL_DANGEROUS_SET = _CMD_DANGEROUS_SET | _POSIX_DANGEROUS_SET
+
+
+def _is_dangerous_word(word: str) -> bool:
+    """该命令词是否破坏性。顶层与内联正文共用同一判定，避免两处口径漂移。"""
+    if word in _ALL_DANGEROUS_SET:
+        return True
+    return any(word.startswith(p) for p in _POSIX_DANGEROUS_PREFIXES)
+
+
 # 内联代码里的"高危 API"：无 shell 对应词、破坏性/绕过黑名单意图明显
 _CODE_HIGH_RISK = [
     (r"\bshutil\s*\.\s*rmtree\b", "shutil.rmtree（递归删除）"),
@@ -330,7 +400,7 @@ def _scan_code_body(body: str) -> str | None:
         if pat.search(body):
             return f"命令拦截：{desc}"
     for h in _command_heads(body):
-        if h in _ALL_DANGEROUS_SET:
+        if _is_dangerous_word(h):
             return f"命令拦截：检测到危险命令 `{h}`"
     for pat, why in _CODE_HIGH_RISK:
         if re.search(pat, body):
@@ -338,7 +408,7 @@ def _scan_code_body(body: str) -> str | None:
     for m in _EMBEDDED_Q.finditer(body):
         inner = m.group(1) or m.group(2) or ""
         for h in _command_heads(inner):
-            if h in _ALL_DANGEROUS_SET:
+            if _is_dangerous_word(h):
                 return f"命令拦截：内联代码里嵌了危险命令 `{h}`"
     danger = _check_redirect_targets(body)
     if danger:
@@ -415,9 +485,13 @@ def _check_command_safety(command: str) -> str | None:
         if danger:
             return danger
     else:
-        # cmd 或裸命令：按每段的命令首词判定（路径/包装/后缀已归一）
+        # cmd 或裸命令：按每段"实际执行的命令词"判定（路径/包装/后缀已归一）。
+        # 用 _ALL_DANGEROUS_SET（Windows + POSIX 合并）而非只看 Windows 词表：
+        # Linux 上 rm/mkfs/dd 是原生命令，顶层放行与工具描述的拦截声明相悖
+        # （2026-10-22 实测顶层 `rm -rf /` 直过；两边词表合并后 Windows 侧
+        # 只是多认几个 Git-Bash/WSL 里可能出现的词，正常开发命令不受影响）。
         for h in heads:
-            if h in _CMD_DANGEROUS_SET:
+            if _is_dangerous_word(h):
                 return f"命令拦截：检测到危险命令 `{h}`"
         # #5：python -c / node -e / perl -e 等"解释器 + 内联代码"绕过点——
         # 首词是解释器、破坏藏在正文里，这里对正文再扫一遍。

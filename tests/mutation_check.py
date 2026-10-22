@@ -2,7 +2,7 @@
 
 用法（不参与 pytest 收集，文件名不以 test_ 开头）：
     uv run python tests/mutation_check.py        # 用当前解释器，Windows/Linux/CI 同一命令
-    ./.venv/Scripts/python.exe tests/mutation_check.py   # 老的写法仍可用
+    ./.venv/bin/python tests/mutation_check.py   # Linux venv 布局（Windows 为 .venv/Scripts/python.exe）
 
 为什么必须做：回归用例如果断言写歪了，无论代码正确与否都会通过，等于没测。
 本工具对每处修复做"反向变异"——撤销修复 → 期望相关用例失败 → 还原源码。
@@ -385,10 +385,28 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "tests/test_core.py::test_successful_dispatch_registers_run_day",
     ),
     (
+        # 锚点必须对准 else 分支（shell=True）那次 Popen：用例命令 "set | find /c KEY"
+        # 含管道，_try_split_args 直接返回 None 走 else，参数模式/FileNotFoundError
+        # 回退那两处被变异不影响本用例。缩进别抄错：另两处的实参缩进多一级。
         "M48 子进程继承全量 env（key 可被 set 抄走）",
         "agent/tools/builtin.py",
-        "                    capture_output=True,\n                    env=_child_env(),\n                )",
-        "                    capture_output=True,\n                )",
+        "                proc = subprocess.Popen(\n"
+        "                    command,\n"
+        "                    shell=True,\n"
+        "                    cwd=cwd,\n"
+        "                    stdout=subprocess.PIPE,\n"
+        "                    stderr=subprocess.PIPE,\n"
+        "                    env=_child_env(),\n"
+        "                    start_new_session=True,\n"
+        "                )",
+        "                proc = subprocess.Popen(\n"
+        "                    command,\n"
+        "                    shell=True,\n"
+        "                    cwd=cwd,\n"
+        "                    stdout=subprocess.PIPE,\n"
+        "                    stderr=subprocess.PIPE,\n"
+        "                    start_new_session=True,\n"
+        "                )",
         "tests/test_core.py::test_run_shell_child_env_has_no_secret_vars",
     ),
     (
@@ -598,6 +616,43 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "            result = fut.result(timeout=self._call_timeout)",
         "            result = fut.result(timeout=300)  # mutated: 超时写死",
         "tests/test_audit6_fixes.py::test_mcp_tool_timeout_is_configurable",
+    ),
+    # ---------------- 第七轮审计（2026-10-22）：Windows/Ubuntu 双平台兼容 ----------------
+    (
+        "M75 POSIX 顶层词表又只剩 Windows 集合",
+        "agent/tools/shell_safety.py",
+        """        for h in heads:
+            if _is_dangerous_word(h):
+                return f"命令拦截：检测到危险命令 `{h}`\"""",
+        """        for h in heads:
+            if h in _CMD_DANGEROUS_SET:  # mutated: 顶层又只看 Windows 词表
+                return f"命令拦截：检测到危险命令 `{h}`\"""",
+        "tests/test_platform_compat.py::test_posix_dangerous_commands_blocked_at_top_level",
+    ),
+    (
+        "M76 超时不杀进程树（孙进程残留）",
+        "agent/tools/builtin.py",
+        "                _kill_process_tree(proc)",
+        "                pass  # mutated: 超时后不杀树，孙进程留成孤儿",
+        "tests/test_platform_compat.py::test_run_shell_timeout_kills_process_tree",
+    ),
+    (
+        "M77 run_shell 风味又写死 Windows cmd",
+        "agent/tools/builtin.py",
+        """    if sys.platform == "win32":
+        return "Windows cmd 语法，如 dir、type、python、pip"
+    return "POSIX shell 语法（sh/bash），如 ls、cat、grep、python、pip\"""",
+        """    if sys.platform == "win32":
+        return "Windows cmd 语法，如 dir、type、python、pip"
+    return "Windows cmd 语法，如 dir、type、python、pip"  # mutated: 又写死 cmd 方言""",
+        "tests/test_platform_compat.py::test_shell_flavor_switches_with_platform",
+    ),
+    (
+        "M78 run_shell 描述不接平台风味",
+        "agent/tools/builtin.py",
+        '                f"在本机执行 shell 命令（{_shell_flavor()}）。"',
+        '                "在本机执行 shell 命令。"  # mutated: 描述丢掉平台风味',
+        "tests/test_platform_compat.py::test_run_shell_description_carries_host_flavor",
     ),
 ]
 

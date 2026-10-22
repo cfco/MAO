@@ -1,0 +1,15 @@
+# 行尾统一 LF：Windows 端若开 core.autocrlf=true，提交会把 CRLF 带进仓库，
+# Linux/macOS clone 后得到 CRLF——Python 源码能跑、splitlines 也兼容，但
+# 跨平台 diff/哈希会因行尾噪音大面积误报。这里显式声明，别依赖各机器的 git 配置。
+* text=auto eol=lf
+
+# 二进制绝不参与行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.pyc binary
+*.pyd binary
+*.so binary

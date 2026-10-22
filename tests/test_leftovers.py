@@ -3,7 +3,7 @@
 覆盖：
 - 连接池释放：LLMClient.close / WorkerPool.close 必须显式释放，不能只靠 GC
   （bridge 常驻会积压废弃连接）。
-- run_shell 参数模式遇 cmd 内置命令（echo/dir/type）失败回退 shell=True；超时不重试。
+- run_shell 参数模式遇 shell 内置命令（cmd 的 echo/dir、POSIX 的 cd）失败回退 shell=True；超时不重试。
 
 （原「默认会话 id 防碰撞」「Agent.close 释放」用例已随内部 Agent / 会话持久化模块移除。）
 """
@@ -67,23 +67,24 @@ def test_worker_pool_close_releases_all_clients():
 
 
 def test_run_shell_falls_back_to_shell_for_builtins(monkeypatch):
-    """参数模式遇 FileNotFoundError（内置命令）时应回退 shell=True 重跑一次。"""
+    """参数模式遇 FileNotFoundError（shell 内置命令）时应回退 shell=True 重跑一次。"""
     import agent.tools.builtin as bi
 
     calls: list[tuple] = []
 
     class FakeProc:
-        stdout = b"ok"
-        stderr = b""
         returncode = 0
 
-    def fake_run(cmd, **kw):
+        def communicate(self, timeout=None):
+            return (b"ok", b"")
+
+    def fake_popen(cmd, **kw):
         calls.append((cmd, kw.get("shell")))
         if kw.get("shell") is False:
             raise FileNotFoundError("[WinError 2] 系统找不到指定的文件。")
         return FakeProc()
 
-    monkeypatch.setattr(bi.subprocess, "run", fake_run)
+    monkeypatch.setattr(bi.subprocess, "Popen", fake_popen)
     reg = bi.build_builtin_tools(Config(_interpolate({"agents": []})))
     out = reg.execute("run_shell", {"command": "echo hi"})
 
@@ -93,21 +94,34 @@ def test_run_shell_falls_back_to_shell_for_builtins(monkeypatch):
 
 
 def test_run_shell_timeout_does_not_retry(monkeypatch):
-    """只有"文件找不到"才回退；超时不重试（别把一次挂死变成两次）。"""
+    """只有"文件找不到"才回退；超时不重试（别把一次挂死变成两次），且必须杀进程树。"""
     import agent.tools.builtin as bi
 
-    calls: list = []
+    calls: list[bool] = []
+    killed: list[object] = []
 
-    def fake_run(cmd, **kw):
+    class FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise bi.subprocess.TimeoutExpired("sleep 999", timeout)
+            return (b"", b"")
+
+    def fake_popen(cmd, **kw):
         calls.append(kw.get("shell"))
-        raise bi.subprocess.TimeoutExpired(cmd, 1)
+        return FakeProc()
 
-    monkeypatch.setattr(bi.subprocess, "run", fake_run)
+    monkeypatch.setattr(bi.subprocess, "Popen", fake_popen)
+    # 杀树本身另有真实子进程用例（tests/test_platform_compat.py），这里只验"调了"
+    monkeypatch.setattr(bi, "_kill_process_tree", lambda proc: killed.append(proc))
+
     reg = bi.build_builtin_tools(Config(_interpolate({"agents": []})))
     out = reg.execute("run_shell", {"command": "sleep 999"})
 
     assert "超过" in out and "未完成" in out
     assert len(calls) == 1, f"超时不应重试，实际 {calls}"
+    assert len(killed) == 1, "超时后必须杀进程树（孙进程不留孤儿）"
 
 
 def test_run_shell_real_cmd_builtins():
