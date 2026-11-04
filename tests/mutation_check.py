@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -128,16 +129,19 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M17 档案落盘 IO 拉回锁内",
         "agent/core/ledger.py",
-        """                text = self._snapshot_locked()
+        """                    text = self._snapshot_locked()
+                if raw is None or self._read_disk_text() == raw:
+                    break
+                disk, raw = self._disk_for_merge()  # 被对端改过：拿新的一份重合并
             try:
-                atomic_write_text(self.store_path, text)
-            except OSError:
-                pass  # 档案写不进去只损失持久化，内存账本照常工作""",
-        """                text = self._snapshot_locked()
-                try:  # mutated: 落盘 IO 回到记账锁内
-                    atomic_write_text(self.store_path, text)
-                except OSError:
-                    pass""",
+                atomic_write_text(self.store_path, text)""",
+        """                    text = self._snapshot_locked()
+                    atomic_write_text(self.store_path, text)  # mutated: 落盘 IO 回到记账锁内
+                if raw is None or self._read_disk_text() == raw:
+                    break
+                disk, raw = self._disk_for_merge()
+            try:
+                pass""",
         "tests/test_audit2_fixes.py::test_persist_does_not_block_quarantine_queries",
     ),
     (
@@ -232,13 +236,11 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "tests/test_latency.py::test_bridge_latency_command_reports_and_refreshes",
     ),
     # ---------------- 第四轮审计（2026-10-09）新增 ----------------
-    (
-        "M30 POSIX shell 家族不进内联扫描",
-        "agent/tools/shell_safety.py",
-        '    "sh",\n    "bash",\n    "zsh",\n    "dash",\n    "ksh",\n}',
-        "}",
-        "tests/test_core.py::test_posix_shell_inline_guard_blocks_bypass",
-    ),
+    # 注：原 M30「POSIX shell 家族不进内联扫描」已撤下锚点（2026-10-29 第八轮）：
+    # `sh -c "rm -rf x"` 现在是**双层**拦截——_INTERP_INLINE 的内联正文扫描 + _RUNNER_HEADS
+    # 的包装展开，单点变异任意一层另一层都仍拦住，留着只会记成 TAUTOLOGY 误报恒真。
+    # 该用例（test_posix_shell_inline_guard_blocks_bypass）的载荷性由 M31（-lc 短选项簇）
+    # 与 M82（Runner 正文不展开）指向同一/同源节点证明。编号按仓库惯例留空号不重排。
     (
         "M31 shell 短选项簇 -lc 不认",
         "agent/tools/shell_safety.py",
@@ -258,19 +260,9 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "M33 取快照挪到写锁之外",
         "agent/core/ledger.py",
         """        with self._write_lock:
-            disk = self._disk_for_merge()  # IO 留在 _lock 之外
-            self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）
-            with self._lock:
-                if disk is not None:
-                    self._merge_disk_locked(disk)
-                text = self._snapshot_locked()""",
-        """        disk = self._disk_for_merge()  # mutated: 快照在写锁外取，写盘顺序可能反于快照顺序
-        self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）
-        with self._lock:
-            if disk is not None:
-                self._merge_disk_locked(disk)
-            text = self._snapshot_locked()
-        with self._write_lock:""",
+            disk, raw = self._disk_for_merge()  # IO 留在 _lock 之外""",
+        """        with threading.Lock():  # mutated: 每次现造一把锁＝写盘之间不再串行，快照顺序可能反于写盘顺序
+            disk, raw = self._disk_for_merge()""",
         "tests/test_audit4_fixes.py::test_snapshot_is_taken_inside_the_write_lock[health]",
     ),
     (
@@ -366,13 +358,12 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M46 账本写盘不并对方进程记录（互相覆盖）",
         "agent/core/ledger.py",
-        "            disk = self._disk_for_merge()  # IO 留在 _lock 之外\n"
-        "            self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）\n"
-        "            with self._lock:\n"
-        "                if disk is not None:\n"
-        "                    self._merge_disk_locked(disk)\n",
-        "            self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）\n"
-        "            with self._lock:\n",
+        "                with self._lock:\n"
+        "                    if disk is not None:\n"
+        "                        self._merge_disk_locked(disk)\n"
+        "                    text = self._snapshot_locked()\n",
+        "                with self._lock:\n"
+        "                    text = self._snapshot_locked()  # mutated: 不并对端记录，整篇覆盖\n",
         "tests/test_health.py::test_write_merges_records_from_another_process",
     ),
     (
@@ -475,9 +466,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         # 该 parametrize 用例的载荷性由 M58 / M59 / M60 指向同一节点来证明。
         "M57 首词不剥 cmd 的 ^ 转义",
         "agent/tools/shell_safety.py",
-        r'    low = parts[0].replace("^", "").replace("\\", "/").rsplit("/", 1)[-1].lower()'
-        "  # 去路径前缀",
-        '    low = parts[0].replace("\\\\", "/").rsplit("/", 1)[-1].lower()  # mutated: de^l 放行',
+        '    low = _strip_wrapping_quotes(raw).replace("^", "")',
+        "    low = _strip_wrapping_quotes(raw)  # mutated: de^l 放行",
         "tests/test_audit5_fixes.py::test_shell_safety_blocks_the_six_bypasses",
     ),
     (
@@ -513,8 +503,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M62 整体限时不算重试与退避",
         "agent/core/parallelism.py",
-        "        worst = worst_case_per_request(per_call, max_retries)",
-        "        worst = per_call  # mutated: 只按单次 timeout 折算，尾部批次被误判未完成",
+        "        worst = worst_case_per_request(self._llm_timeout, self._max_retries)",
+        "        worst = self._llm_timeout  # mutated: 只按单次 timeout 折算，尾部批次被误判未完成",
         "tests/test_audit_fixes.py::test_effective_timeout_scales_with_batches_and_respects_explicit",
     ),
     (
@@ -654,7 +644,246 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         '                "在本机执行 shell 命令。"  # mutated: 描述丢掉平台风味',
         "tests/test_platform_compat.py::test_run_shell_description_carries_host_flavor",
     ),
+    # ---------------- 第八轮审计（2026-10-29）：工具层密钥外流与 shell 包装绕过 ----------------
+    (
+        "M79 run_shell 输出不再过凭证掩码",
+        "agent/tools/builtin.py",
+        "            parts.append(mask_secrets(_decode(out_b))[-8000:])",
+        "            parts.append(_decode(out_b)[-8000:])  # mutated: stdout 原样外发",
+        "tests/test_audit8_security.py::test_run_shell_output_masks_secret_shaped_lines",
+    ),
+    (
+        "M80 shell 不再拦密钥文件读取",
+        "agent/tools/shell_safety.py",
+        """        if _is_secret_basename(name):
+            return f"命令拦截：`{name}` 是密钥文件，工具层不通过 shell 外发其内容，已拒绝\"""",
+        """        if False:  # mutated: `type .env` 又能整份读出
+            return f"命令拦截：`{name}` 是密钥文件，工具层不通过 shell 外发其内容，已拒绝\"""",
+        "tests/test_audit8_security.py::test_secret_file_via_shell_blocked",
+    ),
+    (
+        "M81 write_file 又允许覆写 .env",
+        "agent/tools/builtin.py",
+        """        if _is_secret_file(p):
+            # 覆写 .env = 把 endpoint/key 改成外部地址，下一次加载会把全部凭据发往那里；""",
+        """        if False:  # mutated: 写入侧不设守卫
+            # 覆写 .env = 把 endpoint/key 改成外部地址，下一次加载会把全部凭据发往那里；""",
+        "tests/test_audit8_security.py::test_write_and_append_tools_refuse_secret_files",
+    ),
+    (
+        "M82 Runner 包装正文不再展开",
+        "agent/tools/shell_safety.py",
+        """        if _head_word(seg) not in _RUNNER_HEADS:
+            continue""",
+        """        if True:  # mutated: 只扫外层命令词，`"cmd" /c "del x"` 重新放行
+            continue""",
+        "tests/test_audit8_security.py::test_wrapped_dangerous_command_blocked",
+    ),
+    (
+        "M83 重定向检查又要求操作符前有空白",
+        "agent/tools/shell_safety.py",
+        '    r"(?<![<>=!])"  # 排除 => / >= / -> 这类比较与箭头运算符粘在操作符前的写法',
+        '    r"(?:^|\\s)"  # mutated: `echo a>..\\..\\evil` 少一个空格即写出项目根',
+        "tests/test_audit8_security.py::test_redirect_without_space_still_checked",
+    ),
+    (
+        "M84 异常文案不抹 URL userinfo",
+        "agent/core/redact.py",
+        '    (_URL_USERINFO, lambda m: m.group(1) + "****@" + m.group(2)),\n',
+        "    # mutated: 无 query 段的 https://user:pass@host 整段外流\n",
+        "tests/test_audit8_security.py::test_safe_error_text_masks_url_userinfo",
+    ),
+    # ---------------- 第八轮审计（2026-10-29）：状态一致性与契约（P1/P2） ----------------
+    (
+        "M85 下线写失败也落 disabled 标记",
+        "agent/core/health.py",
+        """            notice, retired_ok = self._notice_and_retire(name, model, models_env)
+            if retired_ok:""",
+        """            notice, retired_ok = self._notice_and_retire(name, model, models_env)
+            if True:  # mutated: 先落标记再看不下线成没成 → 该模型永久不再重试下线""",
+        "tests/test_audit8_fixes.py::test_disabled_flag_is_only_set_when_registry_write_landed",
+    ),
+    (
+        "M86 落盘前不做写前重读比对（跨进程覆盖）",
+        "agent/core/ledger.py",
+        "                if raw is None or self._read_disk_text() == raw:",
+        "                if True:  # mutated: 读盘与落盘之间被对端插队也照样整篇覆盖",
+        "tests/test_audit8_fixes.py::test_write_remerges_when_peer_wrote_after_our_read",
+    ),
+    (
+        "M87 档案落盘失败又静默吞掉",
+        "agent/core/ledger.py",
+        "                _warn_write_failed(self.store_path, e)",
+        "                pass  # mutated: 一声不吭，档案从此不再更新没人知道",
+        "tests/test_audit8_fixes.py::test_write_failure_is_reported_once_on_stderr",
+    ),
+    (
+        "M88 健康账本键数不封顶（只增不减）",
+        "agent/core/health.py",
+        "        self._trim_models_locked()",
+        "        pass  # mutated: 不裁剪，自动发现天天造的新键永久堆积",
+        "tests/test_audit8_fixes.py::test_health_model_keys_are_capped",
+    ),
+    (
+        "M89 并盘时不校验对端 fail_dates 元素类型",
+        "agent/core/health.py",
+        '                    | {d for d in (entry.get("fail_dates") or []) if isinstance(d, str)}',
+        '                    | set(entry.get("fail_dates") or [])  # mutated: 整数日期混进来 → sorted() TypeError',
+        "tests/test_audit8_fixes.py::test_non_string_fail_dates_are_dropped_on_load",
+    ),
+    (
+        "M90 发现器不校验本站归属",
+        "agent/core/node_discovery.py",
+        '            if not _owns_station(adapter, info["base_url"]):',
+        "            if False:  # mutated: 任何站都套用适配器写死的那份全局清单",
+        "tests/test_audit8_fixes.py::test_discovery_skips_station_that_does_not_belong_to_adapter",
+    ),
+    (
+        "M91 免费清单把付费条目判成下架",
+        "agent/core/node_discovery.py",
+        "        if m not in live_bare and (adapter is None or _manages(adapter, m))",
+        "        if m not in live_bare  # mutated: 免费清单里没有的一律判下架",
+        "tests/test_audit8_fixes.py::test_paid_entries_are_not_retired_by_a_free_only_list",
+    ),
+    (
+        "M92 不可信远端 id 不清洗就进叠加层",
+        "agent/core/node_discovery.py",
+        "            live = _clean_models(live)",
+        "            live = list(live)  # mutated: 含逗号的 id 进 env 等于注入多条模型",
+        "tests/test_audit8_fixes.py::test_dirty_remote_ids_never_reach_the_overlay",
+    ),
+    (
+        "M93 回退选路在判定与取值之间读两次池子",
+        "agent/core/dispatch.py",
+        """            if n not in tried and profiles.get(n) is not None and self._skip_reason(n) is None
+        ]
+        for name in self._latency_sorted(same):
+            prof = profiles.get(name)""",
+        """            if n not in tried and n in self.profiles and self._skip_reason(n) is None
+        ]
+        for name in self._latency_sorted(same):
+            prof = self.profiles[name]  # mutated: 热同步换掉整本池子时 KeyError 穿出派工接口""",
+        "tests/test_audit8_fixes.py::test_fallback_target_survives_profiles_being_swapped",
+    ),
+    (
+        "M94 平票由完成先后而非候选编号决定",
+        "agent/core/voting.py",
+        "        best_idx, best_n = max(tally.items(), key=lambda kv: (kv[1], -kv[0]))",
+        "        best_idx, best_n = max(tally.items(), key=lambda kv: kv[1])  # mutated: 平票取先出现者",
+        "tests/test_audit8_fixes.py::test_ballot_tie_is_broken_by_candidate_number_not_completion_order",
+    ),
+    (
+        "M95 select_best 的阈值只写进摘要不参与判定",
+        "agent/core/voting.py",
+        "        if best_n / total < th:\n            return None",
+        "        if False:  # mutated: 未过半也当胜出方案返回\n            return None",
+        "tests/test_audit8_fixes.py::test_select_best_honours_threshold_and_skips_empty_candidates",
+    ),
+    (
+        "M96 select_best 空候选仍广播一轮投票",
+        "agent/core/voting.py",
+        "        if not candidates:\n            return None",
+        "        if False:  # mutated: 空候选照样发一轮投票，白烧额度\n            return None",
+        "tests/test_audit8_fixes.py::test_select_best_honours_threshold_and_skips_empty_candidates",
+    ),
+    (
+        "M97 空正文以哨兵混进候选池",
+        "agent/core/dispatch.py",
+        '                "answer": str(resp.get("content") or ""),',
+        '                "answer": resp.get("content", "") or "(空回复)",  # mutated: 真值过滤永不生效',
+        "tests/test_audit8_fixes.py::test_empty_answer_stays_out_of_vote_candidates",
+    ),
+    (
+        "M98 workers 显式传空被折叠成全池派工",
+        "agent/bridge.py",
+        """    if not names:
+        return (
+            None,
+            "workers 显式传空：要么点名，要么省略该字段让池子自动挑（不能既写空又指望全池）",
+        )""",
+        """    if not names:
+        return None, None  # mutated: 与"没点名"无法区分 → pick() 全池派工""",
+        "tests/test_audit8_fixes.py::test_explicit_empty_workers_errors_instead_of_pool_wide_dispatch",
+    ),
+    (
+        "M99 工具/技能出口不掩码就外发给外部主",
+        "agent/bridge.py",
+        '            text = mask_secrets(res["result"])',
+        '            text = res["result"]  # mutated: 正文原样进 stdout 行协议',
+        "tests/test_audit8_fixes.py::test_tool_and_skill_exits_are_masked_in_bridge",
+    ),
+    (
+        "M100 MCP 外壳单条指令失败不带走整个会话",
+        "agent/mcp_server.py",
+        "        except Exception as e:  # noqa: BLE001 - 单条工具调用失败不能拖垮 MCP 会话",
+        "        except KeyboardInterrupt as e:  # mutated: 常态异常不再兜底",
+        "tests/test_audit8_fixes.py::test_mcp_shell_turns_a_handler_crash_into_ok_false",
+    ),
+    (
+        "M101 call 单发模式崩了不回 JSON 行",
+        "agent/__main__.py",
+        "        except Exception as e:  # noqa: BLE001 - 单发模式同样必须回一行 JSON，不能只留崩栈",
+        "        except KeyboardInterrupt as e:  # mutated: 异常直接冒泡，stdout 只剩空行",
+        "tests/test_audit8_fixes.py::test_call_mode_still_prints_one_json_line_when_handler_raises",
+    ),
+    (
+        "M102 探测先拿门再建客户端（构造抛错漏一格）",
+        "agent/core/latency.py",
+        """        try:
+            client = self._probe_client_for(p)
+        except Exception:  # noqa: BLE001 - 建不出探测客户端就跳过这个工人
+            return None
+        if not gate.acquire(timeout=_PROBE_GATE_WAIT):""",
+        """        if not gate.acquire(timeout=_PROBE_GATE_WAIT):
+            return None
+        try:
+            client = self._probe_client_for(p)
+        except Exception:  # mutated: 门已拿到，抛在这里就永不 release""",
+        "tests/test_audit8_fixes.py::test_probe_client_construction_failure_does_not_leak_station_slot",
+    ),
+    (
+        "M103 stop_all 不等后台线程收尾（留孤儿子进程）",
+        "agent/tools/mcp_client.py",
+        "            thread.join(timeout=max(0.0, deadline - time.monotonic()))",
+        "            pass  # mutated: 只叫醒不等收完，进程退出时子进程成孤儿",
+        "tests/test_audit8_fixes.py::test_stop_all_waits_for_the_worker_threads_to_finish",
+    ),
+    (
+        "M104 ${VAR} 解析为空不在加载时点名",
+        "agent/config.py",
+        '            _warn_empty_ref(station, "base_url", raw_station_item.get("base_url"), base_url)',
+        "            pass  # mutated: 拖到运行期变成整站 401，再放大成清单自动下线",
+        "tests/test_audit8_fixes.py::test_empty_reference_is_named_by_station_and_field",
+    ),
+    (
+        "M105 discovery 又取插值前的占位符",
+        "agent/config.py",
+        '            discovery = str(item.get("discovery") or "").strip()',
+        '            discovery = str(raw_station_item.get("discovery") or "").strip()  # mutated: ${VAR} 原样当适配器名',
+        "tests/test_audit8_fixes.py::test_discovery_is_read_after_interpolation",
+    ),
+    (
+        "M106 小写 .env 变量名不再补大写别名",
+        "agent/config_load.py",
+        "                if not upper_from_shell:\n"
+        "                    os.environ[upper] = val\n"
+        "                    _dotenv_keys.add(upper)",
+        "                if False:  # mutated: 不补大写别名（Windows 巧合可用、Linux/CI 静默失效）\n"
+        "                    pass",
+        "tests/test_audit8_fixes.py::test_lowercase_dotenv_key_gets_upper_alias",
+    ),
 ]
+
+
+def _child_env() -> dict:
+    """子进程统一按 UTF-8 收发：Windows 上 `text=True` 默认按本地代码页（cp936）解码，
+    而 pytest 的输出里带着中文用例名/断言文本——2026-10-29 那次就跑出了
+    `UnicodeDecodeError: 'gbk' codec can't decode byte 0x80`（崩在 subprocess 的 reader
+    线程里）。指定 encoding 之外再把 PYTHONIOENCODING 钉住，两侧行为一致。
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 def run_pytest(node: str) -> int:
@@ -669,6 +898,9 @@ def run_pytest(node: str) -> int:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_child_env(),
         timeout=600,
     )
     return proc.returncode
@@ -687,6 +919,9 @@ def node_collects(node: str) -> bool:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_child_env(),
         timeout=300,
     )
     return proc.returncode == 0

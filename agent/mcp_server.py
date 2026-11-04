@@ -18,6 +18,7 @@ from typing import Any
 from . import __version__
 from .bridge import Bridge
 from .config import Config
+from .core.redact import safe_error_text
 
 _SERVER_INSTRUCTIONS = (
     "MAO：外部主 AI 的执行器 + 免费模型工人池。工具均无状态，历史上下文由调用方自持。"
@@ -42,7 +43,16 @@ def build_server(cfg: Config) -> tuple[Any, Bridge]:
     app = MCPServer(name="MAO", version=__version__, instructions=_SERVER_INSTRUCTIONS)
 
     def _h(req: dict) -> dict:
-        return bridge.handle(req)
+        """一条指令的失败不外抛。
+
+        bridge 的 serve 循环对每条请求都有 try/except，MCP 这层过去没有：宿主并发发多个
+        工具调用时，一个未预期异常会带着整个 server 的连接走（宿主侧表现为工具集体失联），
+        而外部主本该只看到这一条 `ok:false`。口径与 bridge 一致：错误文案先脱敏。
+        """
+        try:
+            return bridge.handle(req)
+        except Exception as e:  # noqa: BLE001 - 单条工具调用失败不能拖垮 MCP 会话
+            return {"ok": False, "error": f"{type(e).__name__}: {safe_error_text(e)}"}
 
     @app.tool(name="ping", description="探活：返回版本与池内智能体名")
     def ping() -> dict:

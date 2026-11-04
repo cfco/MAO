@@ -115,14 +115,24 @@ def test_ruff_extends_default_excludes_instead_of_replacing():
 
     用 `exclude` 会把 ruff 默认排除表整体替换掉，.venv 等目录重新被扫描，
     于是 lint 的通过与否取决于 .gitignore 是否写对——这种隐性耦合不能再留。
-    """
-    tomllib = pytest.importorskip("tomllib")  # Python 3.11+；本项目开发解释器为 3.14
-    ruff_cfg = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["ruff"]
 
-    assert "exclude" not in ruff_cfg, (
+    解析走行级正则而不是 tomllib：tomllib 是 3.11+，而 requires-python 下限是 3.10，
+    旧写法 `pytest.importorskip("tomllib")` 让 CI 的 3.10 腿**整条静默跳过**这条守卫
+    （本地 3.14 全绿、下限那条腿从没守过），与同文件 test_version_is_declared_consistently
+    用行级正则的理由一致。
+    """
+    text = PYPROJECT.read_text(encoding="utf-8")
+    section = re.search(r"^\[tool\.ruff\]$\n(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    assert section, "找不到 [tool.ruff] 段（配置搬家了就同步改这条守卫）"
+    body = section.group(1)
+
+    assert not re.search(r"^\s*exclude\s*=", body, re.M), (
         "请用 extend-exclude：exclude 会顶掉 ruff 默认排除表，让 .venv/.git 等重新被扫描"
     )
-    assert "data" in ruff_cfg.get("extend-exclude", []), (
+    line = re.search(r"^\s*extend-exclude\s*=\s*\[(.*)\]", body, re.M)
+    assert line, "找不到 extend-exclude 那行"
+    entries = [v.strip().strip("\"'") for v in line.group(1).split(",") if v.strip()]
+    assert "data" in entries, (
         "隔离区/运行时产物 data/ 必须显式排除，否则 data/trash 里的文件会被 lint"
     )
 

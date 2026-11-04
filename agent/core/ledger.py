@@ -18,8 +18,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from pathlib import Path
+
+from .redact import safe_error_text
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -59,7 +62,7 @@ class AtomicJsonLedger:
         raise NotImplementedError
 
     def _disk_for_merge(self):
-        """写盘前重读磁盘，返回对端进程已落盘的数据；None=不合并（默认）。
+        """写盘前重读磁盘，返回对端进程已落盘的 (数据, 原始文本)；(None, None)=不合并。
 
         为什么需要：`shared_by_path` 与 `_write_lock` 的串行只在**进程内**有效。外部主常
         并发跑多个 `mao call`（每次一个新进程），各进程的内存账本互不可见，`write()` 又是
@@ -67,28 +70,69 @@ class AtomicJsonLedger:
         当日隔离记录被抹掉等于坏节点当天被反复派工，属于状态损坏而不只是"少一条样本"，
         所以需要合并；延迟账本样本会不断重测、丢一两个无害，且合并会与 `_trim` 的裁剪
         互相打架（被裁掉的样本每次又被并回来 → 档案不降反增），故保持整篇覆盖。
+
+        第二个返回值（我们据以合并的那份原始文本）给 `write()` 做"写前重读比对"：
+        读盘与落盘之间对端又写过一次的话，我们手里的快照已经过时，直接写就会把它抹掉
+        （同仓 `model_registry.retire_model` 用同一招封口，这里补齐第三处）。
         """
-        return None
+        return None, None
 
     def _merge_disk_locked(self, disk) -> None:  # 调用方持 _lock
         """把 `_disk_for_merge` 读到的对端记录并进内存账本。子类实现，只读内存。"""
+
+    def _read_disk_text(self) -> str | None:
+        """只读回磁盘文本本身（给写前重读比对用）；读不到返回 None。"""
+        try:
+            return self.store_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
 
     def write(self) -> None:
         """取快照并原子落盘（在 _lock 之外调用）。落盘失败只丢持久化，不外抛。
 
         顺序固定：读盘（锁外 IO）→ 合并 + 取快照（锁内纯内存）→ 落盘。
+        合并过的账本在落盘前再重读一次：与合并依据不一致就整轮重来（最多 `_CAS_RETRIES`
+        次），绝不拿过时快照硬覆盖对端进程刚写的记录。
         """
         with self._write_lock:
-            disk = self._disk_for_merge()  # IO 留在 _lock 之外
+            disk, raw = self._disk_for_merge()  # IO 留在 _lock 之外
             self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）
-            with self._lock:
-                if disk is not None:
-                    self._merge_disk_locked(disk)
-                text = self._snapshot_locked()
+            for _ in range(_CAS_RETRIES):
+                with self._lock:
+                    if disk is not None:
+                        self._merge_disk_locked(disk)
+                    text = self._snapshot_locked()
+                if raw is None or self._read_disk_text() == raw:
+                    break
+                disk, raw = self._disk_for_merge()  # 被对端改过：拿新的一份重合并
             try:
                 atomic_write_text(self.store_path, text)
-            except OSError:
-                pass  # 档案写不进去只损失持久化，内存账本照常工作
+            except OSError as e:
+                # 写不进去只损失持久化，内存账本照常工作；但**不能一声不吭**：
+                # Windows 上 os.replace 撞目标被占用是常态（杀毒/索引/另一个进程开着），
+                # 静默 pass 等于档案从此不再更新而没人知道。
+                _warn_write_failed(self.store_path, e)
+
+
+_CAS_RETRIES = 3
+
+# 落盘失败按路径各提示一次：长驻 bridge 里每 10 分钟一轮探测，每次都刷一行 stderr 会盖掉
+# 真正的诊断（外部主读 stderr 的能力有限），但完全不报又会让"档案从此不再更新"静默发生。
+_write_warned: set[str] = set()
+_write_warned_lock = threading.Lock()
+
+
+def _warn_write_failed(path: Path, err: OSError) -> None:
+    key = str(path)
+    with _write_warned_lock:
+        if key in _write_warned:
+            return
+        _write_warned.add(key)
+    print(
+        f"[档案] {key} 落盘失败（{type(err).__name__}: {safe_error_text(err)}）；"
+        "内存账本照常工作，但这次起的改动不会持久化（Windows 上常见原因是文件被别的进程占用）",
+        file=sys.stderr,
+    )
 
 
 def shared_by_path(registry: dict[Path, object], lock: threading.Lock, key: Path, make) -> object:

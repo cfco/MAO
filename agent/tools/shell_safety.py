@@ -50,8 +50,14 @@ _CMD_DANGEROUS = [
 ]
 _CMD_DANGEROUS_SET = frozenset(_CMD_DANGEROUS)
 
-# cmd /c、cmd /k 包装前缀：剥掉后，被包装的真实命令词才落到首词位置
-_CMD_WRAPPER = re.compile(r"^\s*cmd(?:\.exe)?\s*/[ck]\s+", re.IGNORECASE)
+# 命令 Runner 的"正文开关"：这些包装把真正的命令藏在参数里执行，只归一外层命令词
+# 等于放行内层（`cmd /c "del /f /q x"` 的首词变成 cmd）。cmd 用斜杠开关，shell 家族
+# 用 `-c`（含 `-lc` 这类短选项簇，见 _SHELL_CODE_FLAG）。
+_RUNNER_HEADS = {"cmd", "comspec", "sh", "bash", "zsh", "dash", "ksh"}
+_RUNNER_FLAGS = {
+    "cmd": frozenset({"/c", "/k"}),
+    "shell": frozenset({"-c"}),
+}
 # Windows 可执行后缀：format.com / del.exe 等真实二进制要归一到命令词再比对
 _EXE_SUFFIXES = (".exe", ".com")
 # 命令分隔符：一次请求里可能串多条命令（echo x & del /s y），每段的首词都要查。
@@ -119,7 +125,7 @@ def _mask_quoted(command: str) -> str:
 # 用于检测「echo x > ..\..\etc\passwd」这类通过重定向绕过 cwd 限制的写越界。
 # 目标捕获：引号包裹的串 或 不含空白/特殊符号的 token。
 _REDIRECT_RE = re.compile(
-    r"(?:^|\s)"  # 开头或空白分隔
+    r"(?<![<>=!])"  # 排除 => / >= / -> 这类比较与箭头运算符粘在操作符前的写法
     r"(?:\d*&?)?"  # 可选 fd 前缀：1/2/&（1>, 2>>, &>）
     r"(?:>>|>|<)"  # 操作符：>> 优先于 > 匹配
     r"\s*"
@@ -166,16 +172,59 @@ def _check_redirect_targets(command: str) -> str | None:
     return None
 
 
+def _norm_head(raw: str) -> str:
+    """把 token 归一为可比较的命令词：剥包裹引号、cmd 的 `^` 转义与 `%VAR%` 两侧百分号，
+    取 basename、去 exe 后缀。
+
+    归一不做全的话，`"del" /s x`、`C:\\...\\format.com`、`de^l /f x`、`%COMSPEC% /c del x`
+    这类写法各自逃过一张词表里的某一条。
+    """
+    low = _strip_wrapping_quotes(raw).replace("^", "")
+    low = low.replace("\\", "/").rsplit("/", 1)[-1].strip("%").lower()
+    for suf in _EXE_SUFFIXES:
+        if low.endswith(suf):
+            return low[: -len(suf)]
+    return low
+
+
+def _wrapped_payload(tokens: list[str]) -> str:
+    """取 `cmd /c <正文>` / `sh -c <正文>` 这类包装里的正文；不是包装则返回空串。
+
+    为什么必须单独取：包装的外层词（cmd/sh）不在危险词表里，旧写法只剥 `cmd /c` 的裸
+    拼写，于是引号（`"cmd" /c "del x"`）、全路径（`C:\\Windows\\System32\\cmd.exe /c del x`）、
+    `%COMSPEC%`、POSIX 的 `sh -c "rm -rf x"` 都把内层破坏命令留在原地不被扫描——整条黑名单
+    形同虚设。这里按归一后的命令词判定，再按开关（cmd 用 /c /k、shell 用 -c / -lc）取正文。
+    """
+    if not tokens:
+        return ""
+    head = _norm_head(_strip_wrapping_quotes(tokens[0]))
+    flags = (
+        _RUNNER_FLAGS["cmd"]
+        if head in ("cmd", "comspec")
+        else _RUNNER_FLAGS["shell"]
+        if head in _RUNNER_HEADS
+        else None
+    )
+    if flags is None:
+        return ""
+    for i, tok in enumerate(tokens[1:], start=1):
+        flag = _strip_wrapping_quotes(tok).strip().lower()
+        if flag in flags or (head in _RUNNER_HEADS and _SHELL_CODE_FLAG.fullmatch(flag)):
+            return " ".join(_strip_wrapping_quotes(t) for t in tokens[i + 1 :])
+        if flag.startswith("-") or flag.startswith("/"):
+            continue
+        return ""  # 开关还没出现就来了位置参数（`cmd /d something`）：没有正文可扫
+    return ""
+
+
 def _head_word(segment: str) -> str:
     """取一段命令中"实际被执行"的命令首词（小写）。
 
-    归一化四件事，避免用拼写差异绕过首词匹配：
-    - 剥掉 `cmd /c`、`cmd /k` 包装前缀；
-    - 剥掉包裹引号（`"del" /s x` 的引号不改变它是 del 命令）；
-    - 只取首词（`"format D:"` 剥引号后含空格，要再切一次才拿到 format）；
-    - 去掉路径前缀与 .exe/.com 后缀（`C:\\...\\format.com` → `format`）。
+    归一化见 _norm_head（剥引号、去 cmd 的 `^` 转义与 `%…%`、取 basename、去 .exe/.com 后缀）。
+    `cmd /c` 这类包装不在这里剥：它的首词就是 cmd 本身，被包装的正文由 _command_heads
+    递归扫描（见 _wrapped_payload 的四个绕过点）。
     """
-    s = _CMD_WRAPPER.sub("", segment.strip())
+    s = segment.strip()
     if not s:
         return ""
     tokens = _split_tokens(s) or [s]  # 拆词统一走 _split_tokens：ValueError 已兜成空列表
@@ -183,17 +232,99 @@ def _head_word(segment: str) -> str:
         return ""
     # 剥引号后可能仍带空格（整个命令被一对引号包住），取第一个词才是命令词
     parts = _strip_wrapping_quotes(tokens[0]).strip().split()
-    if not parts:
-        return ""
-    # 剥 cmd 的 `^` 转义符：cmd 执行时 `de^l` 会还原成 del，而原先首词按 `de^l` 比对，黑名单形同虚设
-    low = parts[0].replace("^", "").replace("\\", "/").rsplit("/", 1)[-1].lower()  # 去路径前缀
-    for suf in _EXE_SUFFIXES:
-        if low.endswith(suf):
-            return low[: -len(suf)]
-    return low
+    return _norm_head(parts[0]) if parts else ""
+
+
+def _unwrap_runners(command: str, _depth: int = 0) -> list[str]:
+    """把命令连同**每一层 Runner 包装的正文**一起展开（深度限 4 层）。
+
+    Runner = `cmd /c`、`cmd.exe /k`、`%COMSPEC% /c`、`sh/bash/zsh/dash/ksh -c`。它们的
+    破坏动作都藏在正文里，展开一次就等于给内层再走一遍全部扫描（危险词、内联代码、
+    重定向越界）。递归而非"只剥一层"的理由见 _wrapped_payload。
+    """
+    out = [command]
+    if _depth >= 4:
+        return out
+    for seg in _CMD_SEPARATOR.split(command):
+        if _head_word(seg) not in _RUNNER_HEADS:
+            continue
+        # cmd 执行前会还原 `^` 转义，正文里留着转义符就扫不到真实命令词
+        payload = _wrapped_payload(_split_tokens(seg.strip())).replace("^", "")
+        if payload:
+            out.extend(_unwrap_runners(payload, _depth + 1))
+    return out
+
+
+def _command_heads(command: str) -> list[str]:
+    """把命令按 shell 分隔符切段，返回每段"实际被执行"的命令词（全部要查）。
+
+    只查整条命令的首词会漏掉串联在后面的危险命令：`echo x & del /s y` 的
+    首词是 echo，但真正执行删除的是 del。`&&`/`||` 已被注入模式拦下，
+    这里的切段是单 `&`、`|`、`;` 串联场景的兜底。
+
+    每段除首词外还收两类"真正会被执行、但不在首词位置"的词，漏掉等于顶层放行
+    （实测 2026-10-22：`ls | xargs rm -f` 三层防护一层都不触发）：
+    - xargs / find 的目标命令（_runner_targets）；
+    - Runner 包装正文里的命令词（_unwrap_runners 展开后各自再切段一次）。
+    """
+    words: list[str] = []
+    for text in _unwrap_runners(command):
+        for seg in _CMD_SEPARATOR.split(text):
+            head = _head_word(seg)
+            if head:
+                words.append(head)
+            words.extend(_runner_targets(seg))
+    return words
 
 
 _UNQUOTE_CHARS = re.compile(r'["\']')
+
+# ==============================================================
+# 密钥文件访问拦截：read_file 有守卫，但 `type .env` / `cat .env` 走 run_shell
+# 就能整份读出（首词既不在 cmd 也不在 POSIX 危险词表里），而工具输出是直接外发给
+# 外部主的。文件名口径与 builtin._is_secret_file 共用 _is_secret_basename。
+# ==============================================================
+
+
+def _is_secret_basename(name: str) -> bool:
+    """该文件名是否属于"工具不得外发内容"的密钥文件（模板 .env.example 除外）。
+
+    只认**开头**是 secret/credential 的名字：用 `in` 判定会把 `NODE_A_KEY=super…` 这类
+    参数值一并误拦（实测：`python -c "print('...supersecretvalue...')"` 整条命令被拒）。
+    名字里带 `.example` 的一律放行：模板及其备份（`.env.example.bak`）不含凭据，
+    而文档正是教人从模板复制。
+    """
+    n = name.strip().lower().lstrip("<>;&|")
+    if not n or ".example" in n:
+        return False
+    return n == ".env" or n.startswith(".env.") or n.startswith(("secret", "credential"))
+
+
+# `.env` 及其派生名（`.env.local`），前后不能粘字母数字（避开 `myenv`、`.environment`、
+# 以及可读写、也可安全外发的模板 `.env.example`）；`%`/`$`/`{`/`}` 也要排除，否则
+# Windows 的 `%comspec%` 这类变量名尾部会被当成 `.env` 误拦。
+_DOTENV_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_%${])\.env(\.[A-Za-z0-9_-]+)?(?![A-Za-z0-9])", re.IGNORECASE
+)
+
+
+def _check_secret_file_access(command: str) -> str | None:
+    """命令正文里出现密钥文件名一律拒绝（读写方向都拦：写入等于把 key 换到外部端点）。
+
+    两条判定合成一处：token 走 basename 比对（`cat /etc/paid-secrets.json`），整串正则
+    走 dotenv 形态（`echo x>.env` 这种重定向不留空格时 shlex 给出 `x>.env`，basename
+    比对看不见）。`.env` 就躺在项目根，能读它的命令不需要越界，故按名字一律拦。
+    """
+    for raw in _split_tokens(command):
+        name = _strip_wrapping_quotes(raw).replace("\\", "/").rsplit("/", 1)[-1]
+        if _is_secret_basename(name):
+            return f"命令拦截：`{name}` 是密钥文件，工具层不通过 shell 外发其内容，已拒绝"
+    for m in _DOTENV_TOKEN_RE.finditer(_strip_wrapping_quotes(command)):
+        # 命中形态还要过一遍名字判定：`.env.example`（模板）也会被这条正则扫到，
+        # 但它不含凭据、且是文档里教人复制的来源，不能拦。
+        if _is_secret_basename(m.group(0)):
+            return f"命令拦截：`{m.group(0)}` 是密钥文件，工具层不通过 shell 外发其内容，已拒绝"
+    return None
 
 
 def _check_powershell_encoding(command: str) -> str | None:
@@ -213,27 +344,6 @@ def _check_powershell_encoding(command: str) -> str | None:
             if t.startswith("-") and _is_encoded_cmd_flag(t):
                 return "命令拦截：PowerShell -EncodedCommand 可能掩盖危险操作，拒绝执行"
     return None
-
-
-def _command_heads(command: str) -> list[str]:
-    """把命令按 shell 分隔符切段，返回每段"实际被执行"的命令词（全部要查）。
-
-    只查整条命令的首词会漏掉串联在后面的危险命令：`echo x & del /s y` 的
-    首词是 echo，但真正执行删除的是 del。`&&`/`||` 已被注入模式拦下，
-    这里的切段是单 `&`、`|`、`;` 串联场景的兜底。
-
-    每段除首词外还收"命令 Runner"真正执行的词（见 _runner_targets）：
-    `ls | xargs rm -f` 首词是 xargs、`find . -delete` 首词是 find，破坏动作
-    都不在首词位置上——这两类在 Linux 上是常规写法，漏掉等于顶层放行
-    （实测 2026-10-22：`ls | xargs rm -f` 三层防护一层都不触发）。
-    """
-    words: list[str] = []
-    for seg in _CMD_SEPARATOR.split(command):
-        head = _head_word(seg)
-        if head:
-            words.append(head)
-        words.extend(_runner_targets(seg))
-    return words
 
 
 def _runner_targets(segment: str) -> list[str]:
@@ -453,6 +563,13 @@ def _check_command_safety(command: str) -> str | None:
             snippet = stripped[m.start() : m.end()]
             return f"命令拦截：检测到 shell 拼接模式 `{snippet}`，存在命令注入风险"
 
+    # ---- 1.2 密钥文件访问：`type .env` / `cat .env` / `echo k>>.env` 一律拒 ----
+    # read_file 早就拦了 .env，但 shell 侧的内置命令（type/cat/more）首词都不在两张
+    # 危险词表里，一条命令就能把全部 key 读进 stdout 外发给外部主。
+    secret_danger = _check_secret_file_access(stripped)
+    if secret_danger:
+        return secret_danger
+
     # ---- 1.5 重定向目标越界检查 ----
     # cwd 只限制命令本身的工作目录，重定向目标不受 cwd 约束，
     # 必须单独拦截（echo x > ..\..\etc\passwd 会写出项目根）。
@@ -467,9 +584,10 @@ def _check_command_safety(command: str) -> str | None:
 
     # ---- 2. 危险命令匹配 ----
     heads = _command_heads(stripped)
-    head = heads[0] if heads else ""
 
-    if head in ("powershell", "pwsh"):
+    # 按"任意一段的命令词"识别 PowerShell，而不是只看 heads[0]：`cmd /c powershell -c …`
+    # 的外层词是 cmd，只看首词会让 PS 正文整段不扫。
+    if any(h in ("powershell", "pwsh") for h in heads):
         # PowerShell 模式：跳过 powershell.exe [-nop] [-command] 包裹，检查 -Command 后的正文
         tokens = _split_tokens(stripped) or [stripped]
         body_start = 0
@@ -494,12 +612,14 @@ def _check_command_safety(command: str) -> str | None:
             if _is_dangerous_word(h):
                 return f"命令拦截：检测到危险命令 `{h}`"
         # #5：python -c / node -e / perl -e 等"解释器 + 内联代码"绕过点——
-        # 首词是解释器、破坏藏在正文里，这里对正文再扫一遍。
-        _interp, code = _extract_inline_code(_split_tokens(stripped))
-        if code:
-            danger = _scan_code_body(code)
-            if danger:
-                return danger
+        # 首词是解释器、破坏藏在正文里，这里对正文再扫一遍。逐层展开 Runner 包装，
+        # 否则 `cmd /c "python -c …"` 的外层词是 cmd，内联正文永远进不了这条扫描。
+        for text in _unwrap_runners(stripped):
+            _interp, code = _extract_inline_code(_split_tokens(text))
+            if code:
+                danger = _scan_code_body(code)
+                if danger:
+                    return danger
 
     return None
 

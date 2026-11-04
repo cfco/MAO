@@ -28,6 +28,8 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}")
 _missing_logged: set[str] = set()
 # 已警告过的"类型写错"配置项，避免同一 key 每次读取都刷屏
 _bad_value_logged: set[str] = set()
+# 已点名过的"引用环境变量却解析为空"的站+字段（见 _warn_empty_ref）
+_empty_ref_logged: set[str] = set()
 # 免费节点叠加层默认路径（自动发现的增量写这里，绝不碰 git 跟踪的 model_registry.txt）
 _DEFAULT_OVERLAY = "data/free_nodes.json"
 
@@ -125,6 +127,28 @@ def _split_models(raw: Any) -> list[tuple[str, int]]:
         if name:
             out.append((name, ctx_len))
     return out
+
+
+def _warn_empty_ref(station: str, field: str, raw_value: Any, value: str) -> None:
+    """`${VAR}` 引用解析成空串时点名"哪个站的哪个字段"（只报名字，绝不回显值）。
+
+    为什么要在加载时就点名：变量名打错或 `.env` 里留成 `KEY=`（空值）时，插值只报一行
+    "变量未定义"、Config 也不校验，症状要等到第一次派工才现形（整站 401/连不上）；而
+    认证类失败是**终态不可重试**，会计入健康连击，攒够 `retire_days` 天就自动去给 git 跟踪的
+    model_registry.txt 加 `#` —— 一个笔误被放大成清单改动。
+    没引用环境变量的空串不点名：本地站（ollama）`api_key: ""` 是合法写法。
+    """
+    if not isinstance(raw_value, str) or "${" not in raw_value or value.strip():
+        return
+    key = f"{station}.{field}"
+    if key in _empty_ref_logged:
+        return
+    _empty_ref_logged.add(key)
+    print(
+        f"[配置警告] 站 '{station}' 的 {field} 引用了环境变量，但解析结果为空："
+        "检查 .env 里对应变量名是否拼对、是否写成了 `KEY=`（空值会顶掉 config.yaml 的 :-默认值）",
+        file=sys.stderr,
+    )
 
 
 def _free_nodes_path(collab_cfg: dict) -> Path:

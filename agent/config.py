@@ -33,6 +33,7 @@ from .config_util import (  # noqa: F401
     _split_models,
     _warn_bad_bool,
     _warn_bad_value,
+    _warn_empty_ref,
 )
 from .profiles import DEFAULT_CONTEXT, AgentProfile  # noqa: F401
 
@@ -66,17 +67,25 @@ class Config:
             station = str(item["name"])  # 站名（唯一）
             base_url = str(item.get("base_url", ""))
             api_key = str(item.get("api_key", ""))
+            raw_station_item = raw_items.get(station) or {}
+            # 引用了环境变量却解析成空 = 变量名拼错或 .env 没填值。当场点名（只报字段名，
+            # 绝不回显值）：留到运行期就是"整站 401/连接失败"，再叠加终态失败连击 7 天
+            # 会自动去给 git 里的 model_registry.txt 加 `#`，把一个配置笔误放大成清单改动。
+            _warn_empty_ref(station, "base_url", raw_station_item.get("base_url"), base_url)
+            _warn_empty_ref(station, "api_key", raw_station_item.get("api_key"), api_key)
             # 兼容新结构 models（一站多模型）与旧结构 model（单模型）
             models = item.get("models") or item.get("model")
             model_list = _split_models(models)
             if not model_list:
                 continue
             # models 字段插值前形如 ${NODE_A_MODELS} → 提取变量名 NODE_A_MODELS
-            raw_item = raw_items.get(station) or {}
+            raw_item = raw_station_item
             raw_models = str(raw_item.get("models") or raw_item.get("model") or "")
             m = _ENV_PATTERN.search(raw_models)
             models_env = m.group(1) if m else ""
-            discovery = str(raw_item.get("discovery") or "").strip()
+            # discovery 与 note/tags 同一口径：都取**插值后**的值。旧写法取插值前的 raw，
+            # 于是 `discovery: ${NODE_B_DISCOVERY}` 会把占位符原样当适配器名，静默永不发现。
+            discovery = str(item.get("discovery") or "").strip()
             for mi, ctx_len in model_list:
                 # 一站单模型保留站名（简洁），多模型加模型后缀保证可识别
                 pname = station if len(model_list) == 1 else f"{station}:{mi}"

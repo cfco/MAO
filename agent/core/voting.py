@@ -41,9 +41,10 @@ class VotingMixin:
 
         成败只认 status，绝不回头解析回答文本里的「错误：」字样——单一事实源：
         ask()/ask_many 的人读文本都由这里生成，内部判定一律走 ask_result 的结构。
+        空正文在这里才变成人读占位符（结构化 answer 保持真空串，collect/投票据此把它排除）。
         """
         if r["status"] == ST_OK:
-            return r["answer"]
+            return r["answer"] or "（该工人返回空正文）"
         return f"错误：{r['error']}"
 
     # ---------- 投票核心 ----------
@@ -98,7 +99,7 @@ class VotingMixin:
         tally: dict[int, int] = {}
         for v in valid:
             tally[v] = tally.get(v, 0) + 1
-        best_idx, best_n = max(tally.items(), key=lambda kv: kv[1])
+        best_idx, best_n = max(tally.items(), key=lambda kv: (kv[1], -kv[0]))
         return best_idx, tally, total, best_n, invalid
 
     def _vote_threshold(self, threshold: float | None) -> float:
@@ -130,7 +131,9 @@ class VotingMixin:
     ) -> tuple[str, str, str] | None:
         """对已有候选方案投票择优（复用两步投票的第二步，不重复收集阶段）。
 
-        返回 (胜出工人名, 胜出全文, 票况摘要)；无解析选票返回 None。
+        返回 (胜出工人名, 胜出全文, 票况摘要)；**没有候选 / 无投票人 / 无解析选票 /
+        未达阈值**都返回 None——调用方拿到的只有"达共识的胜出方案"，不会把
+        "3 票里勉强 2 票、阈值却要 60%"这种半吊子结果当成胜出方案用。
         供调用方「候选已就绪、只想复用投票择一」的场景（程序化公共 API，见 WorkerPool 类文档）。
         voters 缺省取 pick() 的可用工人子集（受 collaboration.max_participants 约束）。
         主参与（方案 A）：`master_contribution` 作为追加候选（"@master"）参与择优，
@@ -141,6 +144,10 @@ class VotingMixin:
             master_text = master_contribution.strip()
             if master_text:
                 candidates = [*candidates, ("@master", master_text)]
+        # 空候选要在这里就回 None：否则照样给全体投票人发一轮"候选方案：(空)"的表决，
+        # 白烧 N 份免费额度，回来的编号还全是废票。
+        if not candidates:
+            return None
         th = self._vote_threshold(threshold)
         pool = self._voter_pool(voters)
         if not pool:
@@ -148,11 +155,17 @@ class VotingMixin:
         result = self._run_ballot(candidates, pool, timeout)
         if result is None:
             return None
-        best_idx, tally, total, best_n, _invalid = result
-        winner = candidates[best_idx - 1]
+        best_idx, tally, total, best_n, invalid = result
         summary = f"投票 {best_n}/{total} 票（阈值 {th:.0%}）；票况：" + ", ".join(
             f"[{i}]={tally.get(i, 0)}" for i in range(1, len(candidates) + 1)
         )
+        if invalid:
+            summary += f"；另有 {invalid} 张废票（投了不存在的编号，已按有效票口径排除）"
+        # 阈值必须真的参与判定：旧写法把 th 只拼进摘要字符串，调用方看到的"最高票"
+        # 可能是 1/3 这种远未过半的结果，却与过半胜出拿同一个返回形态，无从区分。
+        if best_n / total < th:
+            return None
+        winner = candidates[best_idx - 1]
         return winner[0], winner[1], summary
 
     def vote(
@@ -168,7 +181,8 @@ class VotingMixin:
         投票规则：
         1) 并行收集各工人对同一任务的目标作答（成功结果才进入候选池），
            候选顺序按入参工人顺序排列（编号确定性，重跑不互换）。
-        2) 把候选方案编号（附 80 字符预览）重新发给全体工人，每人选一个编号。
+        2) 把候选方案编号（附 `collaboration.vote_preview_chars`，默认 240 字符预览）
+           重新发给全体工人，每人选一个编号。
         3) 统计得票：最高票数 / 总票数 >= 阈值（默认 collaboration.vote_threshold，
            通常取 0.5，即过半共识）则宣布达成共识，否则列出票况请主智能体裁决。
 

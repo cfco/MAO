@@ -156,15 +156,11 @@ class ParallelMixin:
             return float(timeout)
         # timeout<=0（含显式 0）不按"限时 0 秒"处理：那会让 `wait()` 立即返回、全员被判
         # "未完成"，额度照烧、结果全丢。调用方要给上界就传正数，否则回到自适应口径。
-        per_call = self.cfg.as_float(
-            self.cfg.llm_cfg.get("timeout", 120) or 120, "llm.timeout", 120.0, minimum=1.0
-        )
-        max_retries = self.cfg.as_int(
-            self.cfg.llm_cfg.get("max_retries", 2), "llm.max_retries", 2, minimum=0
-        )
-        # 每批按"一次派工的最坏墙钟"折算（含重试与退避），不是单次 timeout：
-        # 见 llm.worst_case_per_request 的原因说明。
-        worst = worst_case_per_request(per_call, max_retries)
+        # 单请求时长与重试次数直接用池上已解析好的那份（orchestrator.__init__），
+        # 不在这里再 as_float/as_int 一遍：两处各解析各的时，容错口径（`or` 兜空值、
+        # 下限钳制）会漂移，同一份 config.yaml 在"建客户端"和"折算限时"两条路上
+        # 读出不同的 timeout。
+        worst = worst_case_per_request(self._llm_timeout, self._max_retries)
         concurrency = self._batch_concurrency(max(1, n), workers)
         batches = max(1, -(-max(1, n) // concurrency))
         return batches * worst + 30.0

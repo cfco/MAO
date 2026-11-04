@@ -37,8 +37,9 @@ MAO/
 │   │   └── constants.py    # 状态码等共享常量
 │   └── tools/
 │       ├── base.py         # 工具基类 + 注册表
-│       ├── builtin.py      # 内置工具（shell/文件；覆盖前留档可回滚）
-│       ├── shell_safety.py # 黑名单 + 注入拦截 + 解释器内联代码扫描（含 POSIX shell）
+│       ├── builtin.py      # 内置工具（shell/文件；覆盖前留档可回滚；读写两侧都拒密钥文件、命令输出过掩码）
+│       ├── shell_safety.py # 黑名单 + 注入拦截 + 解释器内联代码扫描（含 POSIX shell）；
+│       │                   #   `cmd /c` / `sh -c` 这类包装的正文递归再扫一遍
 │       └── mcp_client.py   # MCP 接入层（stdio/HTTP，进程内共享 + 引用计数）
 ├── skills/                 # 技能目录（example_hello 是示例）
 ├── tests/                  # 全离线测试（无 key/无网络）+ mutation_check.py 变异门禁
@@ -55,7 +56,7 @@ MAO/
 | [REQUIREMENTS.md](REQUIREMENTS.md) | 当前已实现的行为基准（配置项、协作语义、质量门禁、安全边界） |
 | [docs/架构方案.md](docs/架构方案.md) | 系统整体架构设计 |
 | [docs/外部主接入指南.md](docs/外部主接入指南.md) | 外部智能体（TRAE 等）通过 bridge 协议当主智能体的接入教程 |
-| `docs/YYYY-MM-DD-工作记录.md` | 各轮审计/重构的过程记录（发现的问题、修法、回归用例编号） |
+| `docs/YYYY-MM-DD-…md` | 各轮审计/重构的过程记录（发现的问题、修法、回归用例编号；如 `2026-10-29-第八轮审计-工具层与状态一致性.md`） |
 
 ## 快速开始
 
@@ -110,8 +111,8 @@ MAO/
 
 **第 1 步：配置（写进 `.env`，不进 git）**
 
-全部配置值都写在 `.env`（端点 / KEY / LLM 与协作参数）。仓库已带一份可直接改的 `.env`
-(随时更新并保持进 git 之外)。只需要确认四行真实密钥：
+全部配置值都写在 `.env`（端点 / KEY / LLM 与协作参数）。仓库**不带** `.env`（它不进 git），
+带的是全注释模板 `.env.example`，所以第一次配置要自己复制一份再填四行真实密钥：
 
 新环境没有 `.env` 时：`cp .env.example .env`，把要用的那几行的行首 `#` 去掉再填值。
 模板只列**变量名**、值一律留空（别留成 `KEY=` 空串——空串会顶掉 `config.yaml` 的 `:-默认值`）；

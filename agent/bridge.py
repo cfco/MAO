@@ -44,7 +44,7 @@ import sys
 from . import __version__
 from .config import Config
 from .core.orchestrator import WorkerPool
-from .core.redact import safe_error_text
+from .core.redact import mask_secrets, safe_error_text
 from .skills_manager import SkillManager, register_skill_tools
 from .tools.base import ToolRegistry
 from .tools.builtin import build_builtin_tools
@@ -55,13 +55,30 @@ REVIEW_SYSTEM = (
 )
 
 
-def _norm_workers(raw) -> list[str] | None:
-    """把请求里的 workers 字段规范成列表；缺省 None（用 pick() 的可用工人）。"""
-    if not raw:
-        return None
+def _norm_workers(raw) -> tuple[list[str] | None, str | None]:
+    """把请求里的 workers 字段规范成 (名单, 错误)。
+
+    三种入参必须区分开，否则"调用方明确不要任何人"会被当成"没点名"：
+    - 字段缺失/为 None → (None, None)：走 `pick()` 的自动选路；
+    - 显式空名单（`[]` / `""` / `"  "`）→ (None, 错误文案)：直接报错。旧写法在这里
+      折叠成 None，于是 `{"workers": []}` 变成"全池轮转派工"，与调用方意图相反，
+      还白烧一整轮额度（vote 更是要收集 + 表决两轮）；
+    - 非空名单 → (名单, None)。
+    """
+    if raw is None:
+        return None, None
     if isinstance(raw, str):
-        return [w.strip() for w in raw.split(",") if w.strip()] or None
-    return [str(w) for w in raw if str(w).strip()] or None
+        names = [w.strip() for w in raw.split(",") if w.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        names = [str(w).strip() for w in raw if str(w).strip()]
+    else:
+        return None, "workers 必须是字符串或字符串列表"
+    if not names:
+        return (
+            None,
+            "workers 显式传空：要么点名，要么省略该字段让池子自动挑（不能既写空又指望全池）",
+        )
+    return names, None
 
 
 def _parse_economy(raw) -> bool | None:
@@ -197,25 +214,31 @@ class Bridge:
         if cmd == "call_tool":
             name = str(req.get("name", ""))
             res = self.registry.run(name, req.get("args") or {})
-            out = {"ok": res["ok"], "result": res["result"]}
+            # 工具正文（成功与失败同一份）在这里进 stdout 行协议 → 外发给另一个模型。
+            # run_shell 已在源头掩码，这一层是**所有**工具的公共出口（MCP 远程工具、
+            # 技能脚本、read_file 读到的配置文件正文都可能带 key），不逐个源头补。
+            text = mask_secrets(res["result"])
+            out = {"ok": res["ok"], "result": text}
             if not res["ok"]:
-                out["error"] = res["error"]
+                out["error"] = text
             return out
         if cmd == "load_skill":
             content = self.skills.load_full(str(req.get("name", "")))
             ok = bool(getattr(content, "ok", True))
-            out = {"ok": ok, "content": str(content)}
+            text = mask_secrets(str(content))
+            out = {"ok": ok, "content": text}
             if not ok:
-                out["error"] = str(content)
+                out["error"] = text
             return out
         if cmd == "run_skill_script":
             res = self.skills.run_script(
                 str(req.get("skill", "")), str(req.get("script", "")), req.get("args") or {}
             )
             ok = bool(getattr(res, "ok", True))
-            out = {"ok": ok, "result": str(res)}
+            text = mask_secrets(str(res))
+            out = {"ok": ok, "result": text}
             if not ok:
-                out["error"] = str(res)
+                out["error"] = text
             return out
         if cmd == "ask":
             prompt = str(req.get("prompt", "")).strip()
@@ -247,17 +270,19 @@ class Bridge:
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
             # 一次收集，同时回结构化（外部主程序化消费）与文本（人读）
-            named = _norm_workers(req.get("workers"))
+            named, workers_err = _norm_workers(req.get("workers"))
+            if workers_err:
+                return {"ok": False, "error": f"ask_many：{workers_err}"}
             _warn_oversized_named_list(self.cfg, named)
             recs = self.workers.ask_many_structured(
-                named or self.workers.pick(tags=req.get("tags")),
+                named if named is not None else self.workers.pick(tags=req.get("tags")),
                 prompt,
                 req.get("system"),
                 timeout=_norm_timeout(req.get("timeout")),
             )
             text = "\n\n".join(
                 f"### 工人 {r['worker']} 的结果\n"
-                + (r["answer"] if r["ok"] else f"（{r['status']}）")
+                + ((r["answer"] or "（空正文）") if r["ok"] else f"（{r['status']}）")
                 for r in recs
             )
             # #2：外层 ok = 至少一个工人成功；全失败/无可用工人 → ok:false
@@ -270,11 +295,13 @@ class Bridge:
             prompt = str(req.get("prompt", "")).strip()
             if not prompt:
                 return {"ok": False, "error": "prompt 不能为空"}
-            named = _norm_workers(req.get("workers"))
+            named, workers_err = _norm_workers(req.get("workers"))
+            if workers_err:
+                return {"ok": False, "error": f"ask_vote：{workers_err}"}
             _warn_oversized_named_list(self.cfg, named)
             v = self.workers.vote(
                 prompt,
-                named or None,
+                named,
                 req.get("threshold"),
                 timeout=_norm_timeout(req.get("timeout")),
                 master_contribution=req.get("master_contribution"),
@@ -290,9 +317,11 @@ class Bridge:
             if not draft:
                 return {"ok": False, "error": "draft 不能为空（外部主给出初稿，子 AI 只当评审团）"}
             context = str(req.get("context", "")).strip()
-            named = _norm_workers(req.get("workers"))
+            named, workers_err = _norm_workers(req.get("workers"))
+            if workers_err:
+                return {"ok": False, "error": f"run_review：{workers_err}"}
             _warn_oversized_named_list(self.cfg, named)
-            reviewers = named or self.workers.pick(tags=req.get("tags"))
+            reviewers = named if named is not None else self.workers.pick(tags=req.get("tags"))
             prompt = (
                 "请作为独立评审，针对下面的稿件给出问题清单与**编号**改进建议，"
                 "直接挑错、给方向，不要客套、不要整段复述原文。\n"
@@ -331,10 +360,14 @@ def reconfigure_streams() -> None:
     而配置警告等诊断走 stderr，外部驱动方按 UTF-8 解码 stderr 时会直接
     UnicodeDecodeError。CLI 单独跑无碍，但协议模式下必须归一。
     由 main()（bridge 子命令、load_config 之前）与 serve() 双入口调用。
+
+    `errors="backslashreplace"` 同样关键：只设 encoding 不设错误策略时，Windows 的
+    stderr 默认 errors=strict，一条含 emoji/生僻字的诊断（模型回答里很常见）就会抛
+    UnicodeEncodeError，把"写一行日志"变成"整条派工被判失败"。
     """
     for stream in (sys.stdout, sys.stdin, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except Exception:  # noqa: BLE001 - 老版本 Python 或非 tty 场景尽力而为
             pass
 
@@ -377,7 +410,17 @@ def serve(cfg: Config) -> None:
             except Exception as e:  # noqa: BLE001 - 单条指令失败不能拖垮协议循环
                 # 这一行会直接写进 stdout 的 JSON 行协议，异常原文可能带 endpoint，先脱敏
                 resp = {"ok": False, "error": f"{type(e).__name__}: {safe_error_text(e)}"}
-            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            try:
+                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+            except OSError as e:
+                # 写不出这一行 = 宿主已经把管道关了/磁盘错误。静默崩栈会让"外部主为什么
+                # 突然收不到回包"无从排查，故走 stderr 留一行再退出循环（bridge.close 照跑）。
+                print(
+                    f"[bridge] stdout 写入失败，协议循环退出："
+                    f"{type(e).__name__}: {safe_error_text(e)}",
+                    file=sys.stderr,
+                )
+                break
     finally:
         bridge.close()

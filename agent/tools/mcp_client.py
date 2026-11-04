@@ -14,6 +14,7 @@ import json
 import random
 import re
 import threading
+import time
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
@@ -370,11 +371,23 @@ def connect_and_register(
 
 
 def stop_all(conns: list) -> None:
+    """叫醒所有连接后台线程收尾，并等它们真的收完（上限 5s，全体共用一份预算）。
+
+    `stop()` 只是置停止位 + 唤醒 host，退出 stdio 子进程与关 loop 都在后台线程里做。
+    不 join 就返回的话，调用方（bridge.close / 组引用归零）随即走到进程退出，daemon 线程
+    被硬杀 ⇒ 第三方 MCP server 的子进程留成孤儿（还占着 stdin/stdout 与端口）。
+    先逐个 stop 再统一 join，多个 server 不会各自等满 5s。
+    """
     for c in conns:
         try:
             c.stop()
         except Exception:  # noqa: BLE001
             pass
+    deadline = time.monotonic() + 5.0
+    for c in conns:
+        thread = getattr(c, "_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 # ---------- 进程内共享连接组（按 servers 配置签名复用） ----------

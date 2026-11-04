@@ -27,10 +27,11 @@ from pathlib import Path
 
 from ..config import ROOT, Config  # 统一从 config 拿 ROOT，避免多处重复定义漂移
 from ..core.constants import SECRET_NAME_TAILS  # 凭据词表：与 redact 共用同一份
-from ..core.redact import safe_error_text
+from ..core.redact import mask_secrets, safe_error_text
 from .base import FunctionTool, ToolRegistry, ToolResult
 from .shell_safety import (  # shell 命令安全扫描，独立模块见 shell_safety.py
     _check_command_safety,
+    _is_secret_basename,
     _try_split_args,
 )
 
@@ -94,9 +95,9 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
             pass
 
 
-# 明确拒绝读取的密钥文件名：`.env` 与其派生（`.env.local`）；模板 `.env.example` 仍可读写
-_SECRET_BASENAMES = (".env",)
-_ENV_EXAMPLE_OK = ".env.example"
+# 明确拒绝读写的密钥文件名口径在 shell_safety._is_secret_basename（`.env` 与其派生、
+# 名字含 secret/credential 的文件；模板 `.env.example` 仍可读写），文件与 shell 两条
+# 通道共用一份，免得加一类名字时漏改一侧。
 
 
 def _child_env() -> dict[str, str]:
@@ -109,7 +110,7 @@ def _child_env() -> dict[str, str]:
     但"能执行命令"和"能顺手抄走凭据"是两回事。
     只按名字判断（词表见 core/constants.SECRET_NAME_TAILS，与 redact 脱敏共用一份）：
     两种命名都要拦——分段式（`NODE_A_KEY` → 末段 `KEY`）与紧凑式（`MYKEY` / `GHTOKEN` /
-    `OPENAIKEY` → 末段就是整名）。紧凑式若只看"末段等于词表"会整类漏掉，而 `.env` 由人
+    `OPENAIKEY` → 整名以密钥词结尾）。紧凑式若只看"末段等于词表"会整类漏掉，而 `.env` 由人
     维护，加一行这种写法完全可能。
     这里刻意**宁严勿漏**：误剔一个同尾词（如 `MONKEY`）只是子进程少一个无关变量，
     漏掉一个密钥则是把整机凭据交给工具输出（展示侧脱敏另按更保守口径，见 redact.py）。
@@ -126,11 +127,13 @@ def _child_env() -> dict[str, str]:
 
 
 def _is_secret_file(p: Path) -> bool:
-    """该路径是否是本工具应当拒绝读出的密钥文件（`.env` 及其派生，模板除外）。"""
-    name = p.name.lower()
-    if name == _ENV_EXAMPLE_OK:
-        return False
-    return any(name == b or name.startswith(b + ".") for b in _SECRET_BASENAMES)
+    """该路径是否是本工具应当拒绝读写的密钥文件（`.env` 及其派生，模板除外）。
+
+    文件名口径与 shell 侧的 `_check_secret_file_access` 共用 `_is_secret_basename`：
+    写入侧同样要拦——覆写 `.env` 等于把 endpoint/key 改成外部地址，下一次加载会把
+    全部凭据发往那个端点，比读出来更隐蔽。
+    """
+    return _is_secret_basename(p.name)
 
 
 def _decode(b: bytes) -> str:
@@ -361,10 +364,14 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         except OSError as e:  # noqa: BLE001 - 目录等系统级错误给友好提示
             return ToolResult(f"错误：无法执行命令：{safe_error_text(e)}", ok=False)
         parts = []
+        # 输出必须过一遍凭证掩码：`.env` 的 key 全部注入了 os.environ，而 `_child_env`
+        # 只挡住"名字是密钥形态"的变量——`type .env` / `cat /etc/app/config` / 任何把
+        # 凭据打印到 stdout 的命令都绕得过它，而这段文本是**原样外发给外部主**（另一个
+        # 模型）的。shell_safety 已按名字拦下直接读 .env，这里是第二层：不依赖文件名判定。
         if out_b:
-            parts.append(_decode(out_b)[-8000:])
+            parts.append(mask_secrets(_decode(out_b))[-8000:])
         if err_b:
-            parts.append("[stderr] " + _decode(err_b)[-4000:])
+            parts.append("[stderr] " + mask_secrets(_decode(err_b))[-4000:])
         parts.append(f"[exit code] {proc.returncode}")
         # exit code != 0 视为命令执行失败，返回 ToolResult(ok=False) 与既有行为一致。
         # 之前这里返回裸 str——如果调用方解析 stderr 里的错误文本就能判断，但用 ok 标志更明确。
@@ -413,6 +420,12 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         p = _resolve(str(args.get("path", "")))
         if p is None:
             return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '')}", ok=False)
+        if _is_secret_file(p):
+            # 覆写 .env = 把 endpoint/key 改成外部地址，下一次加载会把全部凭据发往那里；
+            # 而 _backup_before_overwrite 又故意不给密钥文件留档，等于不可回滚。
+            return ToolResult(
+                f"错误：{p.name} 是密钥文件，工具层不写入（要改请在终端自己编辑）", ok=False
+            )
         if p.is_dir():
             # 不前置判断的话，IsADirectoryError 会逃到上层通用兜底，模型看到的是
             # "工具执行出错：IsADirectoryError: [Errno 21]..." 而不是人话（read_file 已有同款）
@@ -433,6 +446,11 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         p = _resolve(str(args.get("path", "")))
         if p is None:
             return ToolResult(f"错误：路径非法或超出项目根目录：{args.get('path', '')}", ok=False)
+        if _is_secret_file(p):
+            # 与 write_file 同一口径：追加一行 key 到 .env 与整份覆写同样能把凭据送到外部端点
+            return ToolResult(
+                f"错误：{p.name} 是密钥文件，工具层不写入（要改请在终端自己编辑）", ok=False
+            )
         if p.is_dir():
             return ToolResult(f"错误：{p} 是目录，append_file 只能追加到文件", ok=False)
         content = str(args.get("content", ""))

@@ -1,6 +1,6 @@
 [project]
 name = "mao"
-version = "0.4.0"
+version = "0.5.0"
 description = "自研多智能体协作系统：多个免费/较弱模型分工协作（三个臭皮匠顶个诸葛亮）"
 readme = "README.md"
 authors = [
@@ -15,6 +15,17 @@ dependencies = [
 
 [project.scripts]
 mao = "agent.__main__:main"
+
+# 依赖索引在项目里钉死，不跟随各机器的 uv 全局配置（本机 uv.toml 默认走清华镜像）。
+# 为什么：uv.lock 里记录的是**具体下载 URL**，锁文件用镜像生成、CI 在 GitHub runner 上
+# 就照着镜像 URL 拉全树（境外访问国内镜像，慢且不稳）；反过来锁在 PyPI、本地一跑
+# `uv sync` 又会把 URL 翻回镜像 —— 两份锁来回打架，diff 噪音之外还让 CI 时好时坏。
+# 代价：本机装依赖走 pypi.org，比国内镜像慢（只在依赖变化时付一次）。
+# 想换回镜像：删掉本段并 `uv lock`（CI 那侧则改成锁镜像 URL）。
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
 
 [build-system]
 requires = ["uv_build>=0.12.14,<0.13.0"]

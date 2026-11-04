@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from ..model_registry import load_model_registry
-from .ledger import atomic_write_text
+from .ledger import _warn_write_failed, atomic_write_text
 
 _DEFAULT_OVERLAY = "data/free_nodes.json"
 
@@ -134,19 +134,54 @@ def _http_get_json(url: str, api_key: str, timeout: float) -> Any | None:
 # ---------- 适配器（每站一个，知道怎么拉+怎么解析） ----------
 
 
+# 远端模型 id 的可接受字符：只认"看着像模型名"的串。
+# 逗号是清单的分隔符（`_split_items` 按它切），空白会顶坏 `name@ctx` 的拆分 ——
+# 一个含逗号的远端 id 写进叠加层就等于往 env 里注入多条模型（下游按条建 worker）。
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,119}$")
+
+
 class Adapter:
-    """发现适配器协议：fetch 返回在线免费模型列表；返回 None=失败/跳过。"""
+    """发现适配器协议：fetch 返回在线免费模型列表；返回 None=失败/跳过。
+
+    `host` 是本站必须落在的域：适配器写死自己那个公开网关时，若不给站加归属校验，
+    任何标了该适配器名的站都会把**别人的清单**叠进自己的 env（跑一轮就派工到本站
+    根本没有的模型）。`free_marker` 限定"哪些条目归本适配器管"：叠加层的 retired
+    只能作用于免费档条目，否则人工加进 registry 的付费模型会因为"不在线"被下架。
+    """
 
     name = "base"
+    host = ""
+    free_marker = ""
 
     def fetch(self, base_url: str, api_key: str, timeout: float) -> list[FreeModel] | None:
         raise NotImplementedError
+
+
+# 两个校验都做成模块函数并按属性读取：调用方（含测试里的假适配器）常常不继承 Adapter，
+# 走 `adapter.owns_station(...)` 会对这类对象抛 AttributeError，把整轮发现打成 fetch_failed。
+def _owns_station(adapter: Any, base_url: str) -> bool:
+    """本站端点是否属于该适配器（`host` 子串比对；未声明 host 的适配器不受限）。"""
+    host = getattr(adapter, "host", "") or ""
+    return not host or host.lower() in (base_url or "").lower()
+
+
+def _manages(adapter: Any, model_id: str) -> bool:
+    """该 registry 条目是否归本适配器对账（免费档标记为空 = 全部归它管）。"""
+    marker = getattr(adapter, "free_marker", "") or ""
+    return not marker or model_id.endswith(marker)
+
+
+def _clean_models(live: list[FreeModel]) -> list[FreeModel]:
+    """丢掉不可信远端清单里"不像一个模型名"的条目（见 _MODEL_ID_RE 的注入面）。"""
+    return [m for m in live if _MODEL_ID_RE.fullmatch(m.model or "")]
 
 
 class KiloAdapter(Adapter):
     """kilo.ai 公开网关：无需登录即可列全部模型，`:free` 后缀即免费档。"""
 
     name = "kilo"
+    host = "api.kilo.ai"
+    free_marker = ":free"
 
     def fetch(self, base_url: str, api_key: str, timeout: float) -> list[FreeModel] | None:
         data = _http_get_json("https://api.kilo.ai/api/gateway/models", "", timeout)
@@ -158,7 +193,7 @@ class KiloAdapter(Adapter):
             if not isinstance(it, dict):
                 continue
             mid = it.get("id") or it.get("name")
-            if not mid or not str(mid).endswith(":free"):
+            if not mid or not str(mid).endswith(self.free_marker):
                 continue
             out.append(FreeModel(str(mid), _as_int(it.get("context_length"))))
         return out or None
@@ -177,11 +212,15 @@ def load_overlay(path: Path) -> dict:
 
 
 def save_overlay(path: Path, data: dict) -> None:
-    """原子写叠加层（临时文件 + os.replace），IO 失败只丢持久化、不炸调用方。"""
+    """原子写叠加层（临时文件 + os.replace），IO 失败只丢持久化、不炸调用方。
+
+    失败要如实报一行 stderr（同 ledger 口径）：叠加层是"哪些免费模型上新/下架"的唯一
+    落盘处，静默失败会让人以为发现轮跑了却没结果，而实际什么都没存下来。
+    """
     try:
         atomic_write_text(Path(path), json.dumps(data, ensure_ascii=False, indent=2))
-    except OSError:
-        pass
+    except OSError as e:
+        _warn_write_failed(path, e)
 
 
 def merge_delta(base: str, delta: dict) -> str:
@@ -228,20 +267,28 @@ def apply_overlay(overlay_path: Path) -> None:
 # ---------- 发现器（含懒式调度，复用 LatencyProber 思路） ----------
 
 
-def _reconcile(registry_line: str, live: list[FreeModel]) -> dict:
+def _reconcile(registry_line: str, live: list[FreeModel], adapter: Adapter | None = None) -> dict:
     """相对 registry 原始行计算增量（幂等）：added / retired。
 
     比较一律用"去 # 的裸名"：`_bare` 保留屏蔽标记（`_bare("#m2")` → `#m2`），
     而在线清单是裸名，直接比会把人工屏蔽的模型当成"registry 里没有"塞进 added ——
     落盘侧 merge_delta 有 lstrip 兜住，热同步侧（sync_free_nodes 只看当前池里的
     profile，被屏蔽模型根本没有 profile）兜不住，屏蔽会被悄悄复活。
+
+    retired 只认**归本适配器管**的条目（见 _manages）：免费清单里没有的条目
+    不等于"已下架"——人工加进 registry 的付费模型从来不会出现在免费清单里，按旧写法
+    每轮都会被判成 retired、被从 env 与运行池里摘掉，且要连续 7 天才会被标 `#`。
     """
     items = _split_items(registry_line)
     registry_active = {_bare(i).lstrip("#") for i in items if not i.startswith("#")}
     registry_all = {_bare(i).lstrip("#") for i in items}
     live_bare = {m.model for m in live}
     added = [_format_model(m) for m in live if m.model not in registry_all]
-    retired = [m for m in registry_active if m not in live_bare]
+    retired = [
+        m
+        for m in registry_active
+        if m not in live_bare and (adapter is None or _manages(adapter, m))
+    ]
     return {"added": added, "retired": retired}
 
 
@@ -345,6 +392,10 @@ class FreeNodeDiscoverer:
             adapter = self.adapters.get(info["discovery"])
             if adapter is None:
                 continue
+            if not _owns_station(adapter, info["base_url"]):
+                # 站不属于这个适配器 ⇒ 它那份清单对本站毫无意义（派工到本站不存在的模型）
+                report["stations"][env_var] = {"status": "skip", "reason": "host_mismatch"}
+                continue
             registry_line = registry.get(env_var, "")
             try:
                 live = adapter.fetch(info["base_url"], info["api_key"], self._timeout)
@@ -353,7 +404,12 @@ class FreeNodeDiscoverer:
             if live is None:
                 report["stations"][env_var] = {"status": "skip", "reason": "fetch_failed"}
                 continue
-            delta = _reconcile(registry_line, live)
+            # 远端字符串先清洗再对账：含逗号/空白的 id 进叠加层等于往 env 注入多条模型
+            live = _clean_models(live)
+            if not live:
+                report["stations"][env_var] = {"status": "skip", "reason": "no_valid_models"}
+                continue
+            delta = _reconcile(registry_line, live, adapter)
             prev = overlay.get(env_var)
             if prev != delta:
                 overlay[env_var] = delta

@@ -27,14 +27,15 @@
 # ============================================
 
 # ---------- 站点 A：router.bynara 免费中转（主站） ----------
-# 2026-10-14 对齐线上免费档（共 5 个）：agnes-2.5-flash(Vision)、jev、laguna-s-2.1、
-# nemotron-3-ultra-free、nemotron-3.5-lightning-free。其余原本挂的（ling-3.0-flash-*
-# 三项 / nemotron-3-super-free / nex-n2.5-pro）已不在 bynara 免费档，先行 # 屏蔽下线
-# （删掉 # 即恢复）。node-a 未接自动发现，此处需人工跟线上变化。
-# 注：窗口取自 bynara 免费档页面 MAX CONTEXT 列（2026-10-14 截图）：agnes 512K、jev 32K、
-# laguna 262K、两个 nemotron 各 1M。laguna 线上显示 262K，即 262144=256k，按本项目 k=×1024
+# 2026-10-23 对齐线上免费档（共 3 个）：laguna-s-2.1、minimax-m3.1-flash:free(Vision)、
+# nemotron-3.5-lightning-free。agnes-2.5-flash 已转付费档（入 Rp100/1M），jev 与
+# nemotron-3-ultra-free 已不在线上列表，连同原屏蔽的 ling-3.0-flash-* 三项 /
+# nemotron-3-super-free / nex-n2.5-pro 一并保持 # 屏蔽（删掉 # 即恢复）。
+# node-a 未接自动发现，此处需人工跟线上变化。
+# 注：窗口取自 bynara 页面 MAX CONTEXT 列（2026-10-23 截图）：laguna 262K、minimax 1M、
+# nemotron-3.5 1M。laguna 线上显示 262K，即 262144=256k，按本项目 k=×1024
 # 约定写作 @256k（数值等价，不虚高预算）。
-NODE_A_MODELS=agnes-2.5-flash@512k,jev@32k,laguna-s-2.1@256k,nemotron-3-ultra-free@1024k,nemotron-3.5-lightning-free@1024k,#ling-3.0-flash-fin-free@256k,#ling-3.0-flash-sante-free@256k,#ling-3.0-flash-vl-free@256k,#nemotron-3-super-free@256k,#nex-n2.5-pro@256k
+NODE_A_MODELS=laguna-s-2.1@256k,minimax-m3.1-flash:free@1024k,nemotron-3.5-lightning-free@1024k,#agnes-2.5-flash@512k,#jev@32k,#nemotron-3-ultra-free@1024k,#ling-3.0-flash-fin-free@256k,#ling-3.0-flash-sante-free@256k,#ling-3.0-flash-vl-free@256k,#nemotron-3-super-free@256k,#nex-n2.5-pro@256k
 
 # ---------- 站点 B：kilo.ai 网关（免费模型 id 都带 :free 后缀） ----------
 # 区分方法：kilo 的模型列表是公开接口，浏览器/curl 打开

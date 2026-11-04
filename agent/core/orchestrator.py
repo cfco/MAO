@@ -134,12 +134,14 @@ class WorkerPool(
         # 并发安全：ask_many/vote 用线程池并发调用 ask，健康状态与客户端缓存
         # （_clients）都需加锁保护。（历史上此处还有 LRU 答案缓存与并发在飞去重，
         # 已随「单一 bridge 路线」简化移除——外部主按需发话，命中率极低。）
-        # 派工的单请求时长与重试次数：客户端构造与门外重试环共用同一份，别两处各解析各的
+        # 派工的单请求时长与重试次数：客户端构造、门外重试环、批量限时折算共用同一份，
+        # 别两处各解析各的（口径漂移过一次：批量侧自己再 as_float 一遍，`or` 兜底写在
+        # 那侧，两边对"空值/非法值"的容错就不一致了）。`or` 兜 YAML 里留空 (`timeout:`)。
         self._llm_timeout = self.cfg.as_float(
-            self.cfg.llm_cfg.get("timeout", 120), "llm.timeout", 120.0, minimum=1.0
+            self.cfg.llm_cfg.get("timeout", 120) or 120, "llm.timeout", 120.0, minimum=1.0
         )
         self._max_retries = self.cfg.as_int(
-            self.cfg.llm_cfg.get("max_retries", 2), "llm.max_retries", 2, minimum=0
+            self.cfg.llm_cfg.get("max_retries", 2) or 2, "llm.max_retries", 2, minimum=0
         )
         self._lock = threading.Lock()
         # 按 profile.name 缓存 LLMClient，避免每次派工都重建连接池
@@ -223,9 +225,12 @@ class WorkerPool(
             if need:
 
                 def _has_tags(name: str) -> bool:
+                    # 用 .get()：`sync_free_nodes` 会整本换掉 self.profiles，
+                    # 按名字下标取会在"列表推导已经过了那一步"之后 KeyError
+                    prof = self.profiles.get(name)
                     have = {
                         t.strip()
-                        for t in str(getattr(self.profiles[name], "tags", "") or "").split(",")
+                        for t in str(getattr(prof, "tags", "") or "").split(",")
                         if t.strip()
                     }
                     return need <= have
@@ -286,7 +291,7 @@ class WorkerPool(
     def _skip_reason(self, name: str) -> str | None:
         """该工人当前不可派工的原因（'冷却中' / '当日失败隔离'），None=可派。
 
-        缓存命中不受此限制（ask 里先查缓存），这里服务 ask_many/collect 的预过滤。
+        这里服务 pick / ask_many / collect / vote 的预过滤，点名直派（ask_result）也查同一份。
         """
         if self._is_in_cooldown(name):
             return "冷却中"

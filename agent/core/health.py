@@ -47,6 +47,10 @@ from .ledger import AtomicJsonLedger, shared_by_path
 
 _MAX_DATES_KEPT = 30
 _MAX_ACTIVE_KEPT = 60
+# 档案里的模型键数上限：fail_dates 有裁剪但**键**没有，免费节点自动发现会不断造出新的
+# "站:模型"键（下线又复活、清单天天换），健康档案于是只增不减（对照 latency.py 的 _trim）。
+# 超出时按"最近一次失败日"最旧的先淘汰；已标 disabled 的不淘汰（那是下线的唯一凭据）。
+_MAX_MODEL_KEYS = 512
 
 
 def _today() -> str:
@@ -97,22 +101,31 @@ class ModelHealth(AtomicJsonLedger):
         """
         day = day or _today()
         notice: str | None = None
-        disabled_now = False
+        need_retire = False
         self._ensure_loaded()  # 读盘放在 _lock 之外
         with self._lock:
             self._mark_active_locked(day)  # 有失败记账 ⇒ 当天必然是运行日
             entry = self._data.setdefault(name, {})
             dates = sorted(set(entry.get("fail_dates") or []) | {day})
             entry["fail_dates"] = dates[-_MAX_DATES_KEPT:]
-            if not entry.get("disabled") and self._streak_full_locked(entry["fail_dates"]):
-                entry["disabled"] = day
-                disabled_now = True  # registry 改写是 IO，放锁外做（理由同写盘）
+            # 这里只"判定"，不"落 disabled 标记"：见下方 retired_ok 分支
+            need_retire = not entry.get("disabled") and self._streak_full_locked(
+                entry["fail_dates"]
+            )
         # 文件 IO 放锁外：quarantined() 是派工热路径，持锁写会把 health 锁串到
         # pool 锁、卡住全进程派工。快照与落盘都在 _write_lock 内串行（见 ledger.py），
         # 这里只负责记账完就通知落盘。
         self.write()
-        if disabled_now:
-            notice = self._notice_and_retire(name, model, models_env)
+        if need_retire:
+            notice, retired_ok = self._notice_and_retire(name, model, models_env)
+            if retired_ok:
+                # 只有 # 真的写进 registry（或本来就在）才落 disabled 标记。
+                # 旧写法先落标记再去改文件，而 retire_model 遇 OSError / 并发写者打架
+                # 耗尽重试会返回 RETIRE_MISSING ⇒ 标记说"已下线"、清单里模型照旧在派工，
+                # 且 `if not entry.get("disabled")` 让这个模型**永远不再重试下线**。
+                with self._lock:
+                    self._data.setdefault(name, {})["disabled"] = day
+                self.write()
         return notice
 
     def note_active(self, day: str | None = None) -> None:
@@ -130,6 +143,22 @@ class ModelHealth(AtomicJsonLedger):
 
     # ---------- 运行日连击判定 ----------
 
+    def _trim_models_locked(self) -> None:  # 调用方持锁
+        """账本条目数封顶：只增不减的健康档案迟早变成几千个键的大文件。
+
+        淘汰口径按"最近一次失败日"最旧的先走，同一天再按名字定序（重跑结果一致）。
+        被淘汰的模型若之后又失败，会重新建条目、从头攒连击 —— 比"档案无限膨胀"划算：
+        真要下线的是持续失败的模型，长期不失败的条目本来就没有判定价值。
+        """
+        if len(self._data) <= _MAX_MODEL_KEYS:
+            return
+        ranked = sorted(
+            self._data.items(),
+            key=lambda kv: (max(kv[1].get("fail_dates") or [""], default=""), kv[0]),
+        )
+        for name, _entry in ranked[: len(self._data) - _MAX_MODEL_KEYS]:
+            self._data.pop(name, None)
+
     def _streak_full_locked(self, fail_dates: list[str]) -> bool:
         """最近 retire_days 个运行日是否全部落在该模型的失败日里。
 
@@ -145,20 +174,26 @@ class ModelHealth(AtomicJsonLedger):
 
     # ---------- 自动下线改写（model_registry.txt 加 #） ----------
 
-    def _notice_and_retire(self, name: str, model: str, models_env: str) -> str:
-        """达阈值后：在 registry 给模型加 # 下线，并拼装 stderr 提示文本。"""
+    def _notice_and_retire(self, name: str, model: str, models_env: str) -> tuple[str, bool]:
+        """达阈值后：在 registry 给模型加 # 下线，返回 (stderr 提示文本, 是否真的下线了)。
+
+        第二个返回值决定 `record_failure` 要不要落 `disabled` 标记：写失败时不能落，
+        否则这条自动下线机制对该模型一次性永久失效（见 record_failure 的注释）。
+        """
         hit = self._retire_in_registry(model, models_env)
         if hit:
             return (
                 f"[模型健康] '{name}' 已连续 {self.retire_days} 个运行日调用失败"
                 "（未启动的日子不计入、也不打断），"
                 f"模型 '{model}' 已在 model_registry.txt 的 {hit} 行标 # 下线；"
-                f"确认恢复免费额度/仍想使用时删掉 # 即可。"
+                f"确认恢复免费额度/仍想使用时删掉 # 即可。",
+                True,
             )
         return (
             f"[模型健康] '{name}' 已连续 {self.retire_days} 个运行日调用失败，已记入档案，"
             f"但在 model_registry.txt 的 {models_env or '对应'} 行未找到模型 '{model}' "
-            "对应条目（或写入失败），请手动确认清单。"
+            "对应条目（或写入失败），请手动确认清单。",
+            False,
         )
 
     def _retire_in_registry(self, model: str, models_env: str) -> str | None:
@@ -198,13 +233,28 @@ class ModelHealth(AtomicJsonLedger):
                 raw = json.loads(self.store_path.read_text(encoding="utf-8"))
                 models = raw.get("models") if isinstance(raw, dict) else None
                 if isinstance(models, dict):
-                    data = {k: v for k, v in models.items() if isinstance(v, dict)}
+                    # fail_dates 也要按元素验类型（原先只验 active_dates）：手工写成整数
+                    # 日期就会在 `sorted(set(...) | {day})` 处抛 TypeError，而调用方
+                    # （orchestrator._record_result）整段吞异常 ⇒ 隔离与连击静默失效。
+                    data = {
+                        k: {
+                            **v,
+                            "fail_dates": sorted(
+                                {d for d in (v.get("fail_dates") or []) if isinstance(d, str)}
+                            )[-_MAX_DATES_KEPT:],
+                        }
+                        for k, v in models.items()
+                        if isinstance(v, dict)
+                    }
                 if isinstance(raw, dict):
                     active = [d for d in (raw.get("active_dates") or []) if isinstance(d, str)]
             except (OSError, ValueError):
                 data = {}  # 缺失/损坏都从空白账本重新开始，不拖垮派工
-            self._data = data
+            # 发布顺序：_active 先、_data 最后。快路径（_ensure_loaded 首行）只看
+            # `_data is not None` 判"载入完成"，反过来发布会让并发首读拿到空 _active，
+            # 于是 `_streak_full_locked` 的 `len(_active) < retire_days` 误判一次不降级。
             self._active = sorted(set(active))[-_MAX_ACTIVE_KEPT:]
+            self._data = data
         # 注意：这里**不**把今天预记为运行日。运行日由记账决定——record_failure /
         # note_active 记哪一天，哪一天才算运行日（"没运行项目的那天不计入"）。
         # 若加载即预记今天，窗口会混入"今天还没机会失败"的日子：测试注入历史失败日
@@ -213,17 +263,31 @@ class ModelHealth(AtomicJsonLedger):
         # 「连续 7 个实际工作日都失败 → 标 # 下线」的意图。
 
     def _snapshot_locked(self) -> str:  # 调用方持锁
-        """把当前内存账本序列化成待写文本。锁内调用，只读内存、不碰磁盘。"""
+        """把当前内存账本序列化成待写文本。锁内调用，只读内存、不碰磁盘。
+
+        裁剪放在这里（`write()` 里"合并对端记录 → 取快照"是同一次持锁）：既封顶内存，
+        也封顶落盘文本 —— 只在记账处裁剪会被下一步的并盘重新灌满。
+        """
+        self._trim_models_locked()
         payload = {"version": 2, "active_dates": list(self._active), "models": self._data}
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _disk_for_merge(self):
-        """写盘前重读档案，供 `_merge_disk_locked` 并上别的进程写的记录。"""
+        """写盘前重读档案，返回 (对端数据, 用于写前比对的原始文本)。
+
+        `raw` 用空串表示"文件还不存在"而不是 None：None 在基类里意味着"这个账本不做
+        写前重读"（延迟档案就是这么定的）。首次落盘恰恰是最容易被并发覆盖的一刻——
+        两个 `mao call` 同时启动、各自建空账本、各自写第一版，后写的整篇抹掉前者的记录。
+        """
         try:
-            raw = json.loads(self.store_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        return raw if isinstance(raw, dict) else None
+            text = self.store_path.read_text(encoding="utf-8")
+        except OSError:
+            return None, ""  # 还没有档案文件：仍要做写前重读比对
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            return None, text  # 损坏：不合并，但仍按这份文本判断对端有没有动过
+        return (raw if isinstance(raw, dict) else None), text
 
     def _merge_disk_locked(self, disk: dict) -> None:  # 调用方持 _lock
         """把对端进程已落盘的记录并进内存账本（并集，不做时间仲裁）。
@@ -241,8 +305,11 @@ class ModelHealth(AtomicJsonLedger):
                 if not isinstance(entry, dict):
                     continue
                 mine = self._data.setdefault(name, {})
+                # 两侧都要按元素验类型：对端文件里的整数日期会让 sorted() 抛
+                # TypeError（str 与 int 不可比），而调用方整段吞异常 ⇒ 隔离静默失效。
                 dates = sorted(
-                    set(mine.get("fail_dates") or []) | set(entry.get("fail_dates") or [])
+                    {d for d in (mine.get("fail_dates") or []) if isinstance(d, str)}
+                    | {d for d in (entry.get("fail_dates") or []) if isinstance(d, str)}
                 )
                 mine["fail_dates"] = dates[-_MAX_DATES_KEPT:]
                 days = [d for d in (entry.get("disabled"), mine.get("disabled")) if d]

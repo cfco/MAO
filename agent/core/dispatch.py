@@ -107,15 +107,23 @@ class DispatchMixin:
         候选内部再按延迟升序（问题5「优先选择延迟低的可用模型」）：同站/跨站各自排序后
         取首个；无延迟样本时排序是恒等变换，回退行为与旧版逐字一致。
         无候选返回 None（调用方不再回退）。
+
+        池子快照只取一次：`sync_free_nodes` 会整本换掉 `self.profiles`（free_nodes.py），
+        旧写法先 `n in self.profiles` 再 `self.profiles[name]`，两次取值之间被热同步插队
+        就 KeyError —— 而本函数在 `_call_result` 的兜底 except 里也会被调，抛出即逃出一个
+        声明"永不抛异常"的派工接口。
         """
+        profiles = self.profiles
         # 1) 同站优先
         same = [
             n
             for n in (self._station_models.get(p.station_key) or ())
-            if n not in tried and n in self.profiles and self._skip_reason(n) is None
+            if n not in tried and profiles.get(n) is not None and self._skip_reason(n) is None
         ]
         for name in self._latency_sorted(same):
-            prof = self.profiles[name]
+            prof = profiles.get(name)
+            if prof is None:  # 快照之后被热同步移出池
+                continue
             if memo is not None and memo.is_dead(prof.station_key):
                 continue  # 该站本批次已判死，不再重复撞（抑制额度放大）
             return prof
@@ -124,13 +132,15 @@ class DispatchMixin:
             return None
         cross = [
             n
-            for n, prof in self.profiles.items()
+            for n, prof in profiles.items()
             if n not in tried
             and self._skip_reason(n) is None
             and not (memo is not None and memo.is_dead(prof.station_key))
         ]
-        if cross:
-            return self.profiles[self._latency_sorted(cross)[0]]
+        for name in self._latency_sorted(cross):
+            prof = profiles.get(name)
+            if prof is not None:
+                return prof
         return None
 
     def _call_result(
@@ -236,7 +246,11 @@ class DispatchMixin:
                 "worker": p.name,
                 "ok": True,
                 "status": ST_OK,
-                "answer": resp.get("content", "") or "(空回复)",
+                # 空正文原样带回，不再替换成 "(空回复)" 哨兵：内部判定一律只看 status，
+                # 而 collect() 的"空回复工人不进结果"靠的是 answer 真值——哨兵让它永远
+                # 为真，于是空答复会作为候选进入投票、还能被投票选中（与文档承诺相反）。
+                # 人读文案的空提示挪到 render_answer（展示层）。
+                "answer": str(resp.get("content") or ""),
                 "error": "",
             }
         except Exception as e:  # noqa: BLE001 - 连取 client 都失败，也不让派工崩（只冷却）

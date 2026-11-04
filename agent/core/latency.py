@@ -397,10 +397,16 @@ class LatencyMixin:
             return None
         station = p.station_key
         gate = self._station_gate(station)
+        messages = [{"role": "user", "content": _PROBE_PROMPT}]
+        # 客户端必须在**拿门之前**建好：_probe_client_for 会构造 httpx/OpenAI 客户端
+        # （非法端点、SSL 上下文失败都会抛），抛在 acquire 与 try 之间就等于漏掉一格站门
+        # ——该站此后永远少一路并发，真实派工排在门上被永久饿死。
+        try:
+            client = self._probe_client_for(p)
+        except Exception:  # noqa: BLE001 - 建不出探测客户端就跳过这个工人
+            return None
         if not gate.acquire(timeout=_PROBE_GATE_WAIT):
             return None  # 该站正在跑真实请求 ⇒ 本轮让路，不污染样本也不挂住探测轮
-        messages = [{"role": "user", "content": _PROBE_PROMPT}]
-        client = self._probe_client_for(p)
         try:
             t0 = time.monotonic()
             try:

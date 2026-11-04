@@ -38,7 +38,7 @@ def main() -> None:
     p_call = sub.add_parser("call", help="单发一条指令即退出（脚本接入用）")
     p_call.add_argument(
         "cmd",
-        help="指令名：ping/list_agents/health/latency/set_economy/"
+        help="指令名：ping/list_agents/health/latency/set_economy/refresh_nodes/"
         "list_tools/call_tool/load_skill/run_skill_script/"
         "ask/ask_many/ask_vote/run_review",
     )
@@ -86,7 +86,12 @@ def main() -> None:
 
     bridge = Bridge(load_config())
     try:
-        resp = bridge.handle(payload)
+        try:
+            resp = bridge.handle(payload)
+        except Exception as e:  # noqa: BLE001 - 单发模式同样必须回一行 JSON，不能只留崩栈
+            # bridge 的长驻循环对每条指令都有兜底；call 是"一次调用一行回包"的契约，
+            # 抛出去就只剩 stderr 的栈，脚本按 stdout 解析 JSON 的调用方会拿到空行。
+            resp = {"ok": False, "error": f"{type(e).__name__}: {safe_error_text(e)}"}
     finally:
         bridge.close()
     print(json.dumps(resp, ensure_ascii=False))

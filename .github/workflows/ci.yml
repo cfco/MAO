@@ -11,6 +11,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# 仓库是公开的、CI 只需要读代码：把 token 显式收到最小。不写这段时 GITHUB_TOKEN 的权限
+# 取决于仓库设置（Settings → Actions → 默认读写），一旦设置是"读写"，任何能通过 PR 进来的
+# 恶意依赖就能在工作流里改写仓库内容或开 issue。本流水线全程只读，收紧没有任何副作用。
+permissions:
+  contents: read
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
@@ -36,7 +42,9 @@ jobs:
         run: uv python install ${{ matrix.python }}
 
       - name: Sync dependencies (incl. dev)
-        run: uv sync --python ${{ matrix.python }}
+        # --frozen：只照锁装，绝不就地重写 uv.lock。少了这个旗标，锁与 pyproject 不一致时
+        # CI 会"顺手修好"然后继续跑绿，依赖漂移就永远不会有人发现。
+        run: uv sync --frozen --python ${{ matrix.python }}
 
       # 格式门禁放在 lint 之前：它失败是"风格没统一"，不该和真正的 lint 报错混在一起
       # 让人猜。本地对应命令：uv run ruff format .（写回）/ --check（只看）。
@@ -64,8 +72,8 @@ jobs:
         uses: astral-sh/setup-uv@v3
 
       - name: Sync dependencies (incl. dev)
-        # 版本仍由 .python-version 决定（不在这里重复写死版本号）
-        run: uv sync
+        # 版本仍由 .python-version 决定（不在这里重复写死版本号）；--frozen 同上
+        run: uv sync --frozen
 
       - name: Mutation check
         run: uv run python tests/mutation_check.py

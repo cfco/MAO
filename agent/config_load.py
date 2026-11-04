@@ -87,8 +87,28 @@ def _load_dotenv(path: Path, into: set[str] | None = None) -> list[str]:
             # （后者规则同时保证分层顺序：先读 model_registry.txt 后读 .env，.env 覆盖 registry）
             if key in os.environ and key not in _dotenv_keys:
                 continue  # shell 里已有，尊重 shell 的值
+            # Windows 的 os.environ 键名大小写不敏感，Linux 敏感：`.env` 里写小写变量名
+            # 在本机"看起来能用"，一到 CI/Ubuntu 就静默取不到（config.yaml 的 ${UPPER}
+            # 引用一律是大写）。这里同时补一个大写别名并点名一次，两边行为才一致。
+            # "shell 是否已提供大写形态"必须**在写入小写名之前**判断：Windows 上写完再判
+            # 永远命中（大小写不敏感），别名分支会被跳过 ⇒ 两个平台的登记状态不一致，
+            # 连变异门禁都咬不动这条（本轮实测踩过）。
+            upper = key.upper()
+            upper_from_shell = upper != key and upper in os.environ and upper not in _dotenv_keys
             os.environ[key] = val
             _dotenv_keys.add(key)
+            if upper != key:
+                if not upper_from_shell:
+                    os.environ[upper] = val
+                    _dotenv_keys.add(upper)
+                if key not in _lowercase_warned:
+                    _lowercase_warned.add(key)
+                    print(
+                        f"[配置警告] .env 里的变量名 `{key}` 不是大写形式："
+                        "Windows 能用、Linux/CI 取不到（config.yaml 的 ${...} 全按大写引用），"
+                        "已临时按同名大写注入，请把 .env 里的名字改成大写",
+                        file=sys.stderr,
+                    )
             if into is not None:
                 into.add(key)
     except OSError:
@@ -219,3 +239,4 @@ _cfg_cache_dotenv_mtime: float = 0.0  # .env 的 mtime，变化即重载
 _cfg_cache_registry_mtime: float = 0.0  # model_registry.txt 的 mtime，变化即重载
 _cfg_cache_overlay_mtime: float = 0.0  # data/free_nodes.json 的 mtime，变化即重载
 _dotenv_keys: set[str] = set()  # 由 dotenv 文件注入的变量名（热加载时需更新）
+_lowercase_warned: set[str] = set()  # 已点名过的小写变量名（每个名字只警告一次）
