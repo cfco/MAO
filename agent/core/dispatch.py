@@ -302,7 +302,7 @@ class DispatchMixin:
         # getattr 兜底：替身客户端（测试 FakeClient 等）可能没有 call_span，
         # 此时退回无上下文——只影响测试替身，真实 LLMClient 恒有该方法。
         span_factory = getattr(client, "call_span", None)
-        with (span_factory() if callable(span_factory) else nullcontext()):
+        with span_factory() if callable(span_factory) else nullcontext():
             for attempt in range(attempts):
                 resp, err, elapsed_ms = self._chat_gated(client, station, messages)
                 if err is None:

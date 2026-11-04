@@ -16,22 +16,20 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
-import signal  # 超时杀进程树：POSIX 侧 killpg 要用
+import hashlib  # noqa: F401 - 留档命名哈希已随 backup.py，保留给 run_shell 之外的潜在用途
 import subprocess  # 顶层 import：测试里会 monkeypatch bi.subprocess.Popen，必须让外部模块能看到
 import sys
-import threading
-import time
 from pathlib import Path
 
 from ..config import ROOT, Config  # 统一从 config 拿 ROOT，避免多处重复定义漂移
-from ..core.constants import (  # 凭据词表：与 redact 共用同一份
-    SECRET_NAME_SUBSTRINGS,
-    SECRET_NAME_TAILS,
-)
 from ..core.redact import mask_secrets, safe_error_text
+from .backup import (  # noqa: F401 - re-export：历史导入面不变（实现见 backup.py）
+    BACKUP_KEEP_DAYS,
+    MAX_BACKUP_FILES,
+    MAX_BACKUP_TOTAL_BYTES,
+)
 from .base import FunctionTool, ToolRegistry, ToolResult
+from .shell_rules import _child_env, _decode, _kill_process_tree  # noqa: F401 - re-export
 from .shell_safety import (  # shell 命令安全扫描，独立模块见 shell_safety.py
     _check_command_safety,
     _is_secret_basename,
@@ -50,10 +48,7 @@ DEFAULT_READ_LIMIT = 2000
 MAX_READ_BYTES = 64 * 1024  # read_file 单次最多读 64KB，防超长单行/超大文件
 MAX_WRITE_BYTES = 1024 * 1024  # write_file / append_file 单次最多写 1MB，防误操作占满磁盘
 BACKUP_DIR = ROOT / "data" / "backup"  # 覆盖写前的自动留档目录（可回滚）
-BACKUP_KEEP_DAYS = 30  # 留档保留天数，超期惰性清理
 MAX_BACKUP_BYTES = 1024 * 1024  # 超过该大小不做留档（避免大文件反复整份复制）
-MAX_BACKUP_FILES = 300  # 留档目录文件数上限：高频覆盖场景每个 .bak 都不重名，
-MAX_BACKUP_TOTAL_BYTES = 256 * 1024 * 1024  # 30 天内可无限堆积，这里按总量兜底
 
 
 def _shell_flavor() -> str:
@@ -70,68 +65,13 @@ def _shell_flavor() -> str:
     return "POSIX shell 语法（sh/bash），如 ls、cat、grep、python、pip"
 
 
-def _kill_process_tree(proc: subprocess.Popen) -> None:
-    """把超时子进程连同其子孙一起杀掉（跨平台）。
-
-    为什么不能只 proc.kill()：subprocess 的 timeout 只终止**直接**子进程，
-    `sh -c "sleep 60 &"` / `nohup ... &` / `setsid ...` 的孙进程会残留成孤儿继续跑
-    （Linux 上这类写法是常规操作，实测一条超时命令能留下活过数分钟的孙进程）。
-    - POSIX：spawn 时带 start_new_session=True，子进程自成进程组且 pgid==pid，
-      直接 killpg(proc.pid) 全组收。用 pid 而非 getpgid(pid)：直接子进程可能已被
-      回收，但只要组内还有子孙，进程组就仍在，killpg 依然有效；
-    - Windows：taskkill /F /T /PID 按进程树杀（不依赖进程组）。
-    两条路都失败（进程组已不存在等）就退化为 proc.kill()——Popen 内部对已退出
-    进程会短路，不会误杀 pid 回收后同号的新进程。
-    """
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
-        else:
-            os.killpg(proc.pid, signal.SIGKILL)
-    except (OSError, subprocess.SubprocessError):
-        try:
-            proc.kill()
-        except OSError:
-            pass
+# _kill_process_tree / _child_env / _decode 已拆到 shell_rules（2026-11-04），
+# 顶部 re-export 供历史导入面与测试使用。
 
 
 # 明确拒绝读写的密钥文件名口径在 shell_safety._is_secret_basename（`.env` 与其派生、
 # 名字含 secret/credential 的文件；模板 `.env.example` 仍可读写），文件与 shell 两条
 # 通道共用一份，免得加一类名字时漏改一侧。
-
-
-def _child_env() -> dict[str, str]:
-    """给子进程一份**剔掉密钥形态变量**的环境副本。
-
-    为什么需要：`config._load_dotenv` 把 `.env` 的全部值注入 `os.environ`（含
-    `NODE_*_KEY` / `*_API_TOKEN`），而 `run_shell` 会把命令 stdout 原样带回给外部主 /
-    任意 MCP 宿主，且工具输出根本不过 `redact.py` —— 一条 `set` 就能把这台机器的全部
-    API key 打包带走（实测子进程确实能看到 `NODE_A_KEY`）。命令黑名单声明过"不是沙箱"，
-    但"能执行命令"和"能顺手抄走凭据"是两回事。
-    只按名字判断（词表见 core/constants 的 SECRET_NAME_TAILS / SECRET_NAME_SUBSTRINGS，
-    与 redact 脱敏共用一份）：三种命名都要拦——
-    - 分段式（`NODE_A_KEY` → 末段 `KEY`）；
-    - 紧凑式（`MYKEY` / `GHTOKEN` / `OPENAIKEY` → 整名以密钥词结尾）；
-    - 中段式（`AWS_ACCESS_KEY_ID` / `AUTH_TOKEN_V2` / `CREDENTIALS` → 密钥词在名字
-      中段、末段是 ID/V2/S 这类后缀）。2026-11-04 审计实测第三类整类漏掉，
-      一条 `set`/`env` 就能把值原样带进工具输出，故补子串级判定。
-    这里刻意**宁严勿漏**：误剔一个同形词（如 `MONKEY`）只是子进程少一个无关变量，
-    漏掉一个密钥则是把整机凭据交给工具输出（展示侧脱敏现已同口径，见 redact.py）。
-    """
-    out: dict[str, str] = {}
-    for k, v in os.environ.items():
-        name = k.upper()
-        if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS or any(
-            word in name for word in SECRET_NAME_SUBSTRINGS
-        ):
-            continue
-        out[k] = v
-    return out
 
 
 def _is_secret_file(p: Path) -> bool:
@@ -142,16 +82,6 @@ def _is_secret_file(p: Path) -> bool:
     全部凭据发往那个端点，比读出来更隐蔽。
     """
     return _is_secret_basename(p.name)
-
-
-def _decode(b: bytes) -> str:
-    """命令输出解码：优先 utf-8，失败退 gbk（Windows 中文环境），再不行丢字符。"""
-    for enc in ("utf-8", "gbk"):
-        try:
-            return b.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return b.decode("utf-8", errors="replace")
 
 
 def set_workspace_roots(extra: list[str] | None = None) -> tuple[Path, ...]:
@@ -213,97 +143,29 @@ def _resolve(p: str) -> Path | None:
 
 
 def _purge_old_backups() -> None:
-    """清理留档目录（惰性调用，不额外起线程）。
+    """薄包装：每次读取 builtin 模块全局（测试可 patch BACKUP_DIR）再委托 backup 模块。"""
+    from .backup import purge_old_backups
 
-    三道闸按序执行：① 超过保留期（30 天）的删掉；② 仍超文件数/总字节上限时，
-    按 mtime 从最旧开始删到限额以内。旧实现只有第①道且**只在下一次覆盖写时触发**
-    ——系统长期不覆盖文件时过期留档（含历史明文 .env 备份）会无限期躺着
-    （实测 43 天未清）。除"每次覆盖写"外，build_builtin_tools 建池时也调一次，
-    让清理不依赖"恰好又有覆盖写"这个低频事件。
-    """
-    try:
-        if not BACKUP_DIR.is_dir():
-            return
-        cutoff = time.time() - BACKUP_KEEP_DAYS * 86400
-        kept: list[tuple[float, Path]] = []
-        total = 0
-        for p in BACKUP_DIR.glob("*.bak"):
-            try:
-                mtime = p.stat().st_mtime
-            except OSError:
-                continue
-            if mtime < cutoff:
-                p.unlink(missing_ok=True)
-                continue
-            kept.append((mtime, p))
-            try:
-                total += p.stat().st_size
-            except OSError:
-                pass
-        if len(kept) <= MAX_BACKUP_FILES and total <= MAX_BACKUP_TOTAL_BYTES:
-            return
-        kept.sort()  # 最旧的先删
-        while kept and (len(kept) > MAX_BACKUP_FILES or total > MAX_BACKUP_TOTAL_BYTES):
-            _mtime, p = kept.pop(0)
-            try:
-                total -= p.stat().st_size
-            except OSError:
-                pass
-            p.unlink(missing_ok=True)
-    except OSError:
-        pass
+    purge_old_backups(BACKUP_DIR)
 
 
 def _backup_before_overwrite(path: Path) -> str | None:
-    """覆盖已有文件前先留档到 data/backup/，返回留档路径；无需/无法留档返回 None。
+    """薄包装：委托 backup.backup_before_overwrite，参数取调用时的模块全局。
 
-    为什么：write_file 是静默覆盖、不可逆，而项目规范要求不可逆操作可恢复
-    （"删除重要文件先隔离"在覆盖场景的等价物）。工具层不引入交互式确认——
-    工具调用是同步的，模型等不了人工回话；改为"自动留一份 + 如实告知位置"，
-    既可回滚又不卡流程。
+    拆分说明（2026-11-04）：实现迁到 backup.py，函数全部显式收参——本包装每次
+    读取模块全局（BACKUP_DIR / _WORKSPACE_ROOTS / ROOT_RESOLVED / MAX_BACKUP_BYTES）
+    再传参，测试 patch builtin 命名空间的语义与拆分前逐字一致。
     """
-    try:
-        import shutil  # 延后 import：只有真正写文件才会用到
+    from .backup import backup_before_overwrite
 
-        if not path.is_file():
-            return None
-        if _is_secret_file(path):
-            return None  # 密钥文件不留档：否则 .env 的明文 key 会长期躺在 data/backup/ 里
-        if path.stat().st_size > MAX_BACKUP_BYTES:
-            return None
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        _purge_old_backups()
-        # 留档名 = 「根名前缀 + 相对路径」：分隔符换成 __ 保留层级且仍是合法文件名。
-        # 外部工作区必须加根名前缀，否则不同项目里的同名文件（README.md）会在
-        # data/backup/ 里互相覆盖，回滚时拿错版本。
-        rel = None
-        for root in _WORKSPACE_ROOTS:
-            try:
-                rel_path = path.relative_to(root)
-            except ValueError:
-                continue
-            if root == ROOT_RESOLVED:
-                prefix = ""
-            else:
-                # 前缀 =「根名 + 根路径短哈希」：两个不同目录若恰好同名
-                # （如 D:/a/project 与 C:/b/project 都叫 project），仅靠 root.name
-                # 会生成同名留档互相覆盖、回滚时拿错版本；加 6 位哈希确保唯一。
-                h = hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:6]
-                prefix = f"{root.name}_{h}__"
-            rel = prefix + rel_path.as_posix().replace("/", "__")
-            break
-        if rel is None:
-            return None
-        # 路径本身再压一个短哈希：`a/b.md` 与根下真实存在的 `a__b.md` 会被上面的替换
-        # 归一成同一个留档名而互相覆盖（回滚时拿错版本）；时间戳只到毫秒，MCP 宿主
-        # 并发写同一文件也可能撞同一秒同名，故一并带上 pid/线程号。
-        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]
-        stamp = time.strftime("%Y%m%d-%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
-        dest = BACKUP_DIR / f"{rel}.{digest}.{stamp}.{os.getpid()}-{threading.get_ident()}.bak"
-        shutil.copy2(path, dest)
-        return str(dest)
-    except (OSError, ValueError):
-        return None  # 留档失败不阻断写入（写入本身是可用的），但不谎报已备份
+    return backup_before_overwrite(
+        path,
+        backup_dir=BACKUP_DIR,
+        workspace_roots=_WORKSPACE_ROOTS,
+        root_resolved=ROOT_RESOLVED,
+        is_secret_fn=_is_secret_file,
+        max_bytes=MAX_BACKUP_BYTES,
+    )
 
 
 def build_builtin_tools(cfg: Config) -> ToolRegistry:

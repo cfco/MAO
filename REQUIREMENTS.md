@@ -36,7 +36,7 @@
 
 ### 2.3 bridge：外部智能体当主（一条内核，三种外壳）
 
-`python -m agent bridge`，stdin 每行一个 JSON 请求、stdout 每行一个 JSON 响应（UTF-8），启动即发 ready 事件。诊断/警告一律走 stderr，stdout 只放 JSON 行。为驱动者（外部主）提供：本地工具执行（`call_tool`）、Skill 加载与脚本（`load_skill`/`run_skill_script`）、池内模型当纯文本子 AI（`ask`/`ask_many` 结构化/`ask_vote`）、评审团（`run_review`）、可用性预检（`health` 含延迟字段、`list_agents` 含能力标签）、延迟档案（`latency`，`probe:true` 时可先同步探测一轮全部节点）、免费节点自动发现（`refresh_nodes`：拉各站在线免费清单与 registry 对账、写叠加层并热同步进当前池）。**对外清单一律读活池**：`ping`/`list_agents`/`ready` 与 `health`、真实派工看的是同一份 `WorkerPool.profiles`，热同步的新增/移出立刻可见（旧写法读静态 `cfg.agent_profiles`，`refresh_nodes` 之后主会点到已不存在的名字）。派工类指令（`ask`/`ask_many`/`ask_vote`/`run_review`）接受内核本就支持的 `tags`（按能力标签选路，仅在未点名 workers 时生效）与 `timeout`（`0`/负数/非数字一律警告后回退自适应限时——把 `0` 当"不限"会让全员被判未完成）。响应 `ok` 反映真实成败：`call_tool`/`ask` 失败即 `ok:false`，派工类失败带稳定 `status` 码（`ok|error|cooldown|quarantined|missing|timeout`，全内核统一、不翻译成中文），成败判断靠字段而非解析文本前缀。
+`python -m agent bridge`，stdin 每行一个 JSON 请求、stdout 每行一个 JSON 响应（UTF-8），启动即发 ready 事件。诊断/警告一律走 stderr，stdout 只放 JSON 行。为驱动者（外部主）提供：本地工具执行（`call_tool`）、Skill 加载与脚本（`load_skill`/`run_skill_script`）、池内模型当纯文本子 AI（`ask`/`ask_many` 结构化/`ask_vote`）、评审团（`run_review`）、可用性预检（`health` 含延迟字段、`list_agents` 含能力标签）、延迟档案（`latency`，`probe:true` 时可先同步探测一轮全部节点）、免费节点自动发现（`refresh_nodes`：拉各站在线免费清单与 registry 对账、写叠加层并热同步进当前池）。**对外清单一律读活池**：`ping`/`list_agents`/`ready` 与 `health`、真实派工看的是同一份 `WorkerPool.profiles`，热同步的新增/移出立刻可见（旧写法读静态 `cfg.agent_profiles`，`refresh_nodes` 之后主会点到已不存在的名字）。派工类指令接受内核本就支持的 `tags`（按能力标签选路，仅在未点名 workers 时生效；`ask`/`ask_many`/`run_review` 支持，`ask_vote` 的投票人池**不**支持 tags——第九轮核实四层均未实现，旧文档曾夸大）与 `timeout`（`0`/负数/非数字一律警告后回退自适应限时——把 `0` 当"不限"会让全员被判未完成）。响应 `ok` 反映真实成败：`call_tool`/`ask` 失败即 `ok:false`，派工类失败带稳定 `status` 码（`ok|error|cooldown|quarantined|missing|timeout`，全内核统一、不翻译成中文），成败判断靠字段而非解析文本前缀。
 
 同一 `Bridge` 内核另有两种外壳，行为与逐字契约和裸协议一致（外壳只做参数拼装/透传，不复制业务逻辑）：
 
@@ -138,11 +138,39 @@ MAO 侧**无状态**：不再持久化会话、不再有 JSONL 落盘 / 会话 i
 - MAO 不再对外开任何网络端口（Web 入口已移除）；`run_shell` 等价于把本机命令权交给主智能体（黑名单+注入拦截兜底）。
 - bridge 通过本地 stdin/stdout 通信，等价于把本机工具权交给驱动它的外部智能体，只给你信任的智能体用。
 - `.env`、key、健康档案均在本地，不出本机（MAO 不持久化会话历史）。
-- **工具层不往外送凭据**（2026-10-16 起从"约定"变成"代码"）：`run_shell` 与技能脚本的子进程环境按名字末段剔除 `*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` 等密钥形态变量（保留 PATH/SystemRoot/ComSpec 等功能变量，宁可少拦也别把 cmd 跑坏）——此前 `set` 一条命令就能把 `.env` 注入 `os.environ` 的全部池 key 打印进工具结果，而工具输出不过脱敏层；`read_file` 拒绝读出 `.env` 与 `.env.*`（`.env.example` 仍可），覆盖留档也跳过密钥文件，免得 `.env` 的明文躺在 `data/backup/` 里。**代价**：技能脚本若确实需要这类变量，必须显式传参，不再能从环境里继承。
+- **工具层不往外送凭据**（2026-10-16 起，2026-11-04 第九轮加严）：`run_shell` 与技能脚本的子进程环境剔除**密钥形态变量**——判定口径为"末段是密钥词 **或** 密钥词作为子串出现在名字里"（`AWS_ACCESS_KEY_ID`/`AUTH_TOKEN_V2`/`CREDENTIALS` 这类中段命名第九轮之前整类漏掉，一条 `set`/`env` 就能把值带走）。子串判定的代价是 `MONKEY` 这类同形词也被剔——子进程少一个无关变量，换的是不漏真密钥（**宁严勿漏**）。保留 PATH/SystemRoot/ComSpec 等功能变量；`read_file` 拒绝读出 `.env` 与 `.env.*`（`.env.example` 仍可），覆盖留档也跳过密钥文件，免得 `.env` 的明文躺在 `data/backup/` 里。**代价**：技能脚本若确实需要这类变量，必须显式传参，不再能从环境里继承。
+- **展示侧掩码与子进程侧同口径**（第九轮）：`mask_secrets`/`safe_error_text` 的 KV 判定同样放开到"名字含密钥词（含 KEY_ID/TOKEN_V2 等后缀形态）"以及 dict/JSON repr 形态（`'NODE_A_KEY': '…'`）；URL userinfo 掩码不再限定 http(s)/ws(s)——`postgres://u:p@h/…` 连接串里的密码同样抹掉。`MONKEY=3` 这类同形词现在**会被一起抹**：漏抹是把凭据送进第三方上下文，误抹只是少看一段调试文本。
 - **文件与 shell 两条通道共用一份"密钥文件"口径**（2026-10-29 第八轮）：文件名判定收在 `shell_safety._is_secret_basename`（`.env`/`.env.*` + 以 `secret`/`credential` 开头；模板 `.env.example` 与其备份除外），`read_file`/`write_file`/`append_file` 与 `run_shell` 都调它。此前只有读侧拦 `.env`，于是一条 `type .env`（Windows shell 内置命令，首词不在任何危险词表里、又必然回落 `shell=True`）就能把整份 key 读进 stdout 外发；写入侧原先完全不设防，而"覆写 `.env`"比"读出来"更隐蔽——下一次加载就把全部凭据发往被改过的端点，且留档机制故意不给密钥文件留底，等于不可回滚。
 - **run_shell 的 stdout/stderr 也过掩码**（第八轮）：`_child_env` 只挡"名字是密钥形态"的环境变量，挡不住命令把凭据打印出来（`type .env` 已被名字拦截，但 `cat /etc/app/config`、脚本回显配置这类写法仍在）。现在命令输出先 `mask_secrets` 再截 8000/4000 字符；`mask_secrets` 与 `safe_error_text` 共用同一份掩码规则，区别只在**截不截断**（错误文案 200 字符，工具正文不能砍）。
-- **命令 Runner 的内层正文也参与扫描**（第八轮）：危险词判定改为先按 shell 分隔符切段、再把 `cmd /c`、`cmd.exe /c`、`%COMSPEC% /c`、`sh/bash/zsh/dash/ksh -c`（含 `-lc` 短选项簇）包装里的正文**递归展开**成一段段命令再查（深度限 4）。旧写法只认 `cmd /c` 的裸拼写，于是引号（`"cmd" /c "del x"`）、全路径（`C:\Windows\System32\cmd.exe /c del x`）、`%COMSPEC%` 与 POSIX 的 `sh -c "rm -rf x"` 全部把破坏动作留在内层放行——整条黑名单形同虚设；PowerShell 分支同样改成"任一段的命令词是 powershell/pwsh 就走正文扫描"，不再只看 `heads[0]`（`cmd /c powershell -c …` 原先整段不扫）。重定向越界检查也去掉了"操作符前必须有空白"的前提（`echo a>..\..\evil` 少一个空格原本不匹配，而 `>` 会真走 `shell=True` 写盘）。
+- **命令 Runner 的内层正文也参与扫描**（第八轮，第九轮加严）：危险词判定改为先按 shell 分隔符切段、再把 `cmd /c`、`cmd.exe /c`、`%COMSPEC% /c`、`sh/bash/zsh/dash/ksh -c`（含 `-lc` 短选项簇）包装里的正文**迭代展开**成一段段命令再查。第九轮把"深度限 4"改成**总量预算**（展开文本数 ≤64、累计字符 ≤64KB，触顶整条拒绝）——旧深度上限本身成了绕过点（`cmd /c `×5 + `del` 实测放行）；正文每剥一层严格变短，展开天然终止，预算只为防 O(n²) 极端构造。旧写法只认 `cmd /c` 的裸拼写，于是引号、全路径、`%COMSPEC%` 与 POSIX 的 `sh -c "rm -rf x"` 全部把破坏动作留在内层放行。**危险首词黑名单与内联扫描对所有 heads 无条件生效**（第九轮 P0）：旧实现 heads 里出现 powershell 就只扫 PS 正文，`del /f /q x & powershell -c "1"` 的 del 排在 PS 段之前整条放行。重定向越界检查也去掉了"操作符前必须有空白"的前提，并补上 `>|`（POSIX clobber）与 `<>`——旧操作符表让 `echo x >| /etc/evil` 整条 match 失败、越界检查落空。
 - **错误文案出口脱敏**（`agent/core/redact.py`）：任何会进 stdout JSON 行协议、工具结果或模型上下文的异常文本都先掩码（URL 的 query 段 → `?<query 已隐去>`、URL 的 `user:pass@` 段 → `scheme://****@host`（第八轮补：旧写法要求有 `?` 才命中，`https://user:pwd@host/v1` 整段原样外流，而"异常里回显请求 URL"正是这条通道的主要来源）、`sk-…`/`Bearer …`/`key|token|secret|password=…` → `****`，并截断长度）。KV 那条按**名字末段**判定：旧写法 `\b(key|token|…)=` 里 `_` 与 `K` 之间没有词边界，对本项目真实的 `NODE_A_KEY=` / `CF_API_TOKEN=` 一个都不命中；`MONKEY=3` 这种同尾词则不该抹也不抹（展示侧按末段、子进程 env 侧按"末段或整名后缀"的更保守口径，两处各自的代价不同，见 `redact.py`/`builtin._child_env` 注释）。协议循环里单条指令失败只回 `{ok:false,error:类型名+脱敏文案}`，绝不把带 endpoint/key 的原文透传出去——外部主那一侧通常是另一个模型，泄漏等于把 key 写进第三方上下文。
 - **三外壳共用同一个兜底形状**（第八轮）：`bridge` 的 serve 循环、`mcp` 的 `_h`、`call` 的单发模式现在都对"单条指令的未预期异常"兜底成 `{ok:false,error:类型名+脱敏文案}`。此前只有 bridge 有：MCP 宿主可并发发工具调用，一条指令抛异常会带走整个会话（宿主侧表现为工具集体失联）；`mao call` 抛出去则 stdout 只剩崩栈、按行解析 JSON 的脚本拿到空行。bridge 的工具/技能出口（`call_tool`/`load_skill`/`run_skill_script`）也统一过 `mask_secrets`，覆盖 MCP 远程工具与技能脚本这些"不在源头掩码"的正文。
 - **解释器内联代码一律扫描**：首词是 `python/node/pwsh` 之外，`sh/bash/zsh/dash/ksh` 同样进内联检查，且认短选项簇（`bash -lc "..."` 与 `-c` 同口径）；`--norc` 这类双横线开关不误伤。免费池不控命令内容，这层是 `run_shell` 唯一的破坏性兜底。
 - **单文件失败不炸启动**：技能扫描逐条容错（坏编码/权限不足只 stderr 警告并跳过该技能），配置缺省层可缺（registry 文件缺失＝空清单），档案写不进去只损失持久化（内存账本照常工作）。
+
+## 11. 第九轮审计（2026-11-04）：安全补漏 + 配置失真 + 内核可靠性
+
+本轮明细见 `docs/2026-11-04-工作记录.md`；与既有章节冲突时以本节为准。
+
+**安全层**
+- 内联代码"拼接读密钥文件 + 编码外带"整类拦截：`open('.en'+'v')`（拼接绕过 `.env` 文件名识别）与"同一正文里 `open(` + `base64/codecs`"的组合一律拒绝（此前 `python -c` 一条命令即可把整份 .env base64 后带走，掩码三层全部失效）。
+- `>|`（POSIX clobber）与 `<>` 重定向目标纳入越界检查；危险首词黑名单与内联扫描对**全部**命令段无条件生效（powershell 分流不再短路黑名单，PS 分支只保留正文扫描这层增量防护）；Runner 包装展开改"总量预算 + 触顶整条拒绝"，第 5 层起不再放行。
+- 密钥名词表子串化（见 §10），展示掩码与子进程 env 同口径。
+
+**配置层**
+- 配置不完整的站打 `broken` 标记：base_url 为空、或 api_key 引用 `${VAR}` 解析为空的站照常入池（分层契约与诊断视图依赖 profile），但 `pick`/派工/回退/`health` 一律按不可用处理（`available:false` + `broken` 原因字段）——此前空端点站照常入池且 health 全报可用，派工必败并污染冷却/延迟档案，空 key 的 401 连击 7 个运行日会误改 git 里的 model_registry.txt。字面空串 `api_key: ""`（本地 Ollama）不受影响。
+- `as_int`/`as_float` 拒绝非有限值（yaml 写 `.inf` 曾让 `int(inf)` 抛 OverflowError 崩启动）。
+- 配置契约测试改对照进 git 的 `.env.example` 恒断言：旧写法依赖本地 `.env`，CI 干净克隆恒 skip、本机精简配置必红。
+
+**内核**
+- `close_when_idle` 的"在飞"改为**整条重试链**粒度（`LLMClient.call_span`）：退避间隙被热同步回收不再当场关连接池。
+- 免费节点叠加层写盘前**重读合并**（跨进程 lost update 修复）；增量比较按集合签名（顺序抖动不再触发无意义重写）。
+- 健康档案并盘/读盘按元素验类型（`disabled` 混入整数曾让 `min()` 抛 TypeError 被吞、当日隔离静默失效）。
+- 批量派工整体限时按**整条回退链**折算（`×(1+fallback_models)`）；延迟探测改固定线程槽（不再一人一线程）；自定义 `latency_keep_ratio` 的浮点截断 off-by-one 修复。
+- `mcp_client`：`call_tool` 超时补 `fut.cancel()`；host 唤醒改为**当场捕获事件对象**（旧的"回调里回读 `_host_evt`"存在丢唤醒竞态，可致连接永久僵死）；`start()` 90s 超时写 error 持锁；连接判失败的分支显式 `stop()` 不留活连接空转。
+
+**结构与数据**
+- 6 个超 500 行的生产文件全部拆分（shell_rules / backup / latency_store / mcp_group / discovery_adapters / config_util 承接，原模块保留 re-export，导入面不变）。
+- 留档目录三道清理闸（30 天 + 文件数 ≤300 + 总字节 ≤256MB），建池时也触发；历史明文 `.env` 备份（2026-09-22 遗留）已随清理销毁；无状态架构后的历史会话 JSONL 归档到 `data/trash/`。
+- `mao call` 的构造失败（`load_config`/`Bridge`）也回一行 `ok:false` JSON（契约："一次调用一行回包"）。
+- 变异锚点扩至 M119（新增 M107–M119 守本轮修复；M21/M49 锚点补上下文消除多义匹配）。

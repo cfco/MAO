@@ -198,7 +198,7 @@ def test_mcp_tool_timeout_is_configurable(monkeypatch):
     调用路径也必须验：只查 cfg/构造签名/group_key 时，`fut.result(timeout=...)`
     那行被改回写死 300 没有任何断言能发现（M74 变异锚点曾因此报恒真）。
     """
-    from agent.tools import mcp_client
+    from agent.tools import mcp_client, mcp_group
 
     cfg = Config(_interpolate({"tools": {"mcp_tool_timeout": 42}}))
     assert cfg.mcp_tool_timeout == 42
@@ -237,7 +237,7 @@ def test_mcp_tool_timeout_is_configurable(monkeypatch):
     assert seen == [42], f"应把配置的 42s 传给 fut.result，实际 {seen}"
 
     servers = [{"name": "t", "transport": "stdio"}]
-    assert mcp_client._group_key(servers, 42) != mcp_client._group_key(servers, 300), (
+    assert mcp_group._group_key(servers, 42) != mcp_group._group_key(servers, 300), (
         "超时不同的两个使用者不能共用连接组（先到者的超时会影响后到者）"
     )
 

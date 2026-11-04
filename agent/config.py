@@ -15,10 +15,8 @@ load_config, ROOT, _interpolate`）一律不用改。
 
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
-from typing import Any
 
 # re-export：加载流程与工具函数历史上都在本文件内，测试/外壳按名取（F401 是有意的）
 from .config_load import _load_dotenv, load_config  # noqa: F401
@@ -35,6 +33,10 @@ from .config_util import (  # noqa: F401
     _warn_bad_bool,
     _warn_bad_value,
     _warn_empty_ref,
+    as_bool,
+    as_float,
+    as_int,
+    as_list,
 )
 from .profiles import DEFAULT_CONTEXT, AgentProfile  # noqa: F401
 
@@ -88,8 +90,7 @@ class Config:
                     ("base_url", base_url, raw_station_item.get("base_url")),
                     ("api_key", api_key, raw_station_item.get("api_key")),
                 )
-                if not str(val).strip()
-                and (field == "base_url" or "${" in str(raw or ""))
+                if not str(val).strip() and (field == "base_url" or "${" in str(raw or ""))
             )
             # 兼容新结构 models（一站多模型）与旧结构 model（单模型）
             models = item.get("models") or item.get("model")
@@ -140,79 +141,12 @@ class Config:
         return None
 
     # ---------- 数值配置的安全读取 ----------
-
-    @staticmethod
-    def as_int(value: Any, key: str, default: int, minimum: int | None = None) -> int:
-        """把配置值安全转成 int：非法值警告一次并回退默认值，不让程序崩。
-
-        为什么不能裸 int()：配置写错类型（`max_participants: five`）会让程序在
-        启动或首次访问该属性时直接抛 ValueError 崩掉，报错还是 "invalid literal
-        for int()" 这种看不出是哪个配置项的信息。而本项目对配置缺 key 的一贯态度
-        是"不阻启动、只警告"（见 _interpolate），类型错也该同样处理。
-        """
-        try:
-            out = int(value)
-        except (TypeError, ValueError, OverflowError):
-            # OverflowError：int(float('inf')) 走的是这条（yaml 写 `cooldown_max: .inf`
-            # 即触发，2026-11-04 审计实测崩启动）；nan 是 ValueError。
-            _warn_bad_value(key, value, default)
-            out = default
-        return out if minimum is None else max(minimum, out)
-
-    @staticmethod
-    def as_float(value: Any, key: str, default: float, minimum: float | None = None) -> float:
-        """同 as_int，用于 float 型配置项。
-
-        额外拒掉非有限值（inf/nan）：`latency_probe_interval: .inf` 这类写法
-        float() 本身不报错，但会污染所有按它推导的限时/周期计算。
-        """
-        try:
-            out = float(value)
-        except (TypeError, ValueError):
-            _warn_bad_value(key, value, default)
-            out = default
-        if not math.isfinite(out):
-            _warn_bad_value(key, value, default)
-            out = default
-        return out if minimum is None else max(minimum, out)
-
-    @staticmethod
-    def as_list(value: Any, key: str, default: list) -> list:
-        """把配置值安全转成 list：非法值警告一次并回退默认值。
-
-        与 as_int / as_float 同源：配置写错类型不该让程序崩，只警告并回退
-        （本项目对配置的一贯态度是"不阻启动、只警告"）。
-        单个字符串按单元素列表处理，方便 `workspace: ../proj` 这种简写。
-        """
-        if value is None:
-            return list(default)
-        if isinstance(value, str):
-            return [value] if value.strip() else list(default)
-        if isinstance(value, (list, tuple)):
-            return list(value)
-        _warn_bad_value(key, value, default)
-        return list(default)
-
-    @staticmethod
-    def as_bool(value: Any, key: str, default: bool) -> bool:
-        """把配置值安全转成 bool：非法值警告一次并回退默认值，不让程序崩。
-
-        接受 Python 布尔、0/1 数字，以及字符串 "true"/"false"/"yes"/"no"/"1"/"0"
-        （不区分大小写）。其余值（如配置写成了 "省 token" 这类描述文本）视为
-        类型错误：警告一次 + 回退默认，与 as_int / as_float 的态度一致。
-        """
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            text = value.strip().lower()
-            if text in ("1", "true", "yes", "on"):
-                return True
-            if text in ("0", "false", "no", "off"):
-                return False
-        _warn_bad_bool(key, value, default)
-        return bool(default)
+    # 实现已拆到 config_util（守「单文件 ≤500 行」约定）；这里以 staticmethod 挂回
+    # Config 命名空间，`Config.as_int(...)` / `self.as_int(...)` 的调用面逐字不变。
+    as_int = staticmethod(as_int)
+    as_float = staticmethod(as_float)
+    as_list = staticmethod(as_list)
+    as_bool = staticmethod(as_bool)
 
     @property
     def max_workers(self) -> int:

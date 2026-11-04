@@ -247,6 +247,12 @@ def test_touch_latency_probe_covers_unavailable_nodes(tmp_path, monkeypatch):
             break
         time.sleep(0.05)
     assert sorted(seen) == ["st:m1", "st:m2"], f"探测应覆盖全部节点，实际 {sorted(seen)}"
+    # 样本落账发生在探测轮收尾（join 后 record_many）：seen 探到 ≠ 已落账，
+    # 轮询等它写完（旧写法在此处与后台线程赛跑，偶发 None）
+    for _ in range(100):
+        if pool.latency.get_ms("st:m1") == 5.0:
+            break
+        time.sleep(0.05)
     assert pool.latency.get_ms("st:m1") == 5.0
 
 

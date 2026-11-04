@@ -63,13 +63,13 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M4 限时改回固定 300s",
         "agent/core/parallelism.py",
-        "        return batches * worst + 30.0",
-        "        return 300.0",
+        "        return batches * chain * worst + 30.0",
+        "        return 300.0  # mutated: 固定限时会截断尾部批次",
         f"{TESTFILE}::test_effective_timeout_scales_with_batches_and_respects_explicit",
     ),
     (
         "M5 MCP 连接不再共享",
-        "agent/tools/mcp_client.py",
+        "agent/tools/mcp_group.py",
         "                _groups[key] = fresh",
         "                _groups[key + '!'] = fresh",
         f"{TESTFILE}::test_mcp_group_shared_and_refcounted",
@@ -102,14 +102,10 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M13 数值配置裸转换",
-        "agent/config.py",
-        """        try:
-            out = int(value)
-        except (TypeError, ValueError, OverflowError):
-            _warn_bad_value(key, value, default)
-            out = default
-        return out if minimum is None else max(minimum, out)""",
-        """        return int(value)""",
+        "agent/config_util.py",
+        "def as_int(value: Any, key: str, default: int, minimum: int | None = None) -> int:",
+        'def as_int(value, key="k", default=0, minimum=None):\n'
+        "    return int(value)  # mutated: 裸转换，类型错/inf 直接崩",
         "tests/test_audit2_fixes.py::test_bad_numeric_config_falls_back",
     ),
     (
@@ -183,7 +179,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M23 延迟档案不再共享",
-        "agent/core/latency.py",
+        "agent/core/latency_store.py",
         "    return shared_by_path(_shared_instances, _shared_lock, key, lambda: LatencyStore(key))",
         """    return LatencyStore(key)  # mutated: 不共享，各池各写各的""",
         "tests/test_latency.py::test_get_latency_shares_instance_per_path",
@@ -200,7 +196,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M25 延迟窗口不再裁剪（只排序）",
         "agent/core/latency.py",
-        "        drop = int(len(ordered) * (1.0 - self._latency_keep_ratio))",
+        "        drop = math.floor(len(ordered) * (1.0 - self._latency_keep_ratio) + 1e-9)",
         "        drop = 0  # mutated: 不裁掉高延迟的",
         "tests/test_latency.py::test_pick_small_pool_keeps_two_or_three",
     ),
@@ -448,7 +444,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M55 已关闭的 MCP 组被直接复用",
-        "agent/tools/mcp_client.py",
+        "agent/tools/mcp_group.py",
         "        with self._lock:\n"
         "            if self._closed:\n"
         "                return False\n"
@@ -469,7 +465,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         # 所以这里不给它单独条目（否则只能记成 TAUTOLOGY 误报恒真）；
         # 该 parametrize 用例的载荷性由 M58 / M59 / M60 指向同一节点来证明。
         "M57 首词不剥 cmd 的 ^ 转义",
-        "agent/tools/shell_safety.py",
+        "agent/tools/shell_rules.py",
         '    low = _strip_wrapping_quotes(raw).replace("^", "")',
         "    low = _strip_wrapping_quotes(raw)  # mutated: de^l 放行",
         "tests/test_audit5_fixes.py::test_shell_safety_blocks_the_six_bypasses",
@@ -483,7 +479,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M59 重定向目标不拦环境变量展开",
-        "agent/tools/shell_safety.py",
+        "agent/tools/shell_rules.py",
         '        if "%" in target or target.startswith(("$", "~")):',
         "        if False:  # mutated: %USERPROFILE% 之类直接放行",
         "tests/test_audit5_fixes.py::test_shell_safety_blocks_the_six_bypasses",
@@ -541,7 +537,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M67 留档名不带路径哈希（深层与平铺撞名）",
-        "agent/tools/builtin.py",
+        "agent/tools/backup.py",
         '        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]',
         '        digest = "00000000"  # mutated: 回到 a/b.md 与 a__b.md 同名的旧行为',
         "tests/test_audit5_fixes.py::test_backup_names_do_not_collide_across_shapes",
@@ -578,7 +574,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M71 子进程环境只认分段式密钥名（漏 MYKEY/GHTOKEN）",
-        "agent/tools/builtin.py",
+        "agent/tools/shell_rules.py",
         """        if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS or any(
             word in name for word in SECRET_NAME_SUBSTRINGS
         ):""",
@@ -615,12 +611,14 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M75 POSIX 顶层词表又只剩 Windows 集合",
         "agent/tools/shell_safety.py",
-        """        for h in heads:
-            if _is_dangerous_word(h):
-                return f"命令拦截：检测到危险命令 `{h}`\"""",
-        """        for h in heads:
-            if h in _CMD_DANGEROUS_SET:  # mutated: 顶层又只看 Windows 词表
-                return f"命令拦截：检测到危险命令 `{h}`\"""",
+        """    # 只是多认几个 Git-Bash/WSL 里可能出现的词，正常开发命令不受影响）。
+    for h in heads:
+        if _is_dangerous_word(h):
+            return f"命令拦截：检测到危险命令 `{h}`\"""",
+        """    # 只是多认几个 Git-Bash/WSL 里可能出现的词，正常开发命令不受影响）。
+    for h in heads:
+        if h in _CMD_DANGEROUS_SET:  # mutated: 顶层又只看 Windows 词表
+            return f"命令拦截：检测到危险命令 `{h}`\"""",
         "tests/test_platform_compat.py::test_posix_dangerous_commands_blocked_at_top_level",
     ),
     (
@@ -658,7 +656,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M80 shell 不再拦密钥文件读取",
-        "agent/tools/shell_safety.py",
+        "agent/tools/shell_rules.py",
         """        if _is_secret_basename(name):
             return f"命令拦截：`{name}` 是密钥文件，工具层不通过 shell 外发其内容，已拒绝\"""",
         """        if False:  # mutated: `type .env` 又能整份读出
@@ -677,15 +675,15 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M82 Runner 包装正文不再展开",
         "agent/tools/shell_safety.py",
-        """        if _head_word(seg) not in _RUNNER_HEADS:
-            continue""",
-        """        if True:  # mutated: 只扫外层命令词，`"cmd" /c "del x"` 重新放行
-            continue""",
+        """            if _head_word(seg) not in _RUNNER_HEADS:
+                continue""",
+        """            if True:  # mutated: 只扫外层命令词，`"cmd" /c "del x"` 重新放行
+                continue""",
         "tests/test_audit8_security.py::test_wrapped_dangerous_command_blocked",
     ),
     (
         "M83 重定向检查又要求操作符前有空白",
-        "agent/tools/shell_safety.py",
+        "agent/tools/shell_rules.py",
         '    r"(?<![<>=!])"  # 排除 => / >= / -> 这类比较与箭头运算符粘在操作符前的写法',
         '    r"(?:^|\\s)"  # mutated: `echo a>..\\..\\evil` 少一个空格即写出项目根',
         "tests/test_audit8_security.py::test_redirect_without_space_still_checked",
@@ -824,11 +822,11 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "tests/test_audit8_fixes.py::test_mcp_shell_turns_a_handler_crash_into_ok_false",
     ),
     (
-        "M101 call 单发模式崩了不回 JSON 行",
+        "M101 call 单发模式崩了不回 JSON 行（构造失败也要回一行）",
         "agent/__main__.py",
-        "        except Exception as e:  # noqa: BLE001 - 单发模式同样必须回一行 JSON，不能只留崩栈",
-        "        except KeyboardInterrupt as e:  # mutated: 异常直接冒泡，stdout 只剩空行",
-        "tests/test_audit8_fixes.py::test_call_mode_still_prints_one_json_line_when_handler_raises",
+        "    except Exception as e:  # noqa: BLE001 - 构造失败也要守住一行 JSON 的契约",
+        "    except KeyboardInterrupt:  # mutated: 构造异常直接冒泡，stdout 只剩空行",
+        "tests/test_audit9_fixes.py::test_call_mode_reports_init_failure",
     ),
     (
         "M102 探测先拿门再建客户端（构造抛错漏一格）",
@@ -891,16 +889,16 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "M108 `>|` 重定向目标不做越界检查",
-        "agent/tools/shell_safety.py",
-        '(?:>>|>\\||<>|>|<)  # 操作符：长操作符优先匹配（>> 先于 >、>| 先于 >）',
-        "(?:>>|>|<)  # mutated: `>|` 整条 match 失败、越界检查落空",
+        "agent/tools/shell_rules.py",
+        '    r"(?:>>|>\\||<>|>|<)"  # 操作符：长操作符优先匹配（>> 先于 >、>| 先于 >）',
+        '    r"(?:>>|>|<)"  # mutated: `>|` 整条 match 失败、越界检查落空',
         "tests/test_audit9_fixes.py::test_clobber_redirect_targets_are_checked",
     ),
     (
         "M109 内联代码拼接读密钥文件不拦",
         "agent/tools/shell_safety.py",
-        '    for pat, why in _CODE_SECRET_READ:',
-        '    for pat, why in []:  # mutated: 拼接读 .env 的形态放行',
+        "    for pat, why in _CODE_SECRET_READ:",
+        "    for pat, why in []:  # mutated: 拼接读 .env 的形态放行",
         "tests/test_audit9_fixes.py::test_inline_code_cannot_concat_read_secret_file",
     ),
     (
@@ -922,18 +920,16 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "M112 配置不完整的站照常派工（broken 标记不参与跳过判定）",
         "agent/core/orchestrator.py",
         """        p = self.profiles.get(name)
-        if p is not None and getattr(p, "broken", ""):
-            return f"配置不完整（{p.broken}）\"""",
+        if p is not None and getattr(p, "broken", ""):""",
         """        p = self.profiles.get(name)
-        if p is not None and False:  # mutated: 空端点站照常派工，必败请求污染健康档案
-            return f"配置不完整（{p.broken}）\"""",
+        if p is not None and False:  # mutated: 空端点站照常派工，必败请求污染健康档案""",
         "tests/test_audit9_fixes.py::test_broken_worker_is_not_dispatched_and_health_says_so",
     ),
     (
         "M113 非有限数值配置崩启动（int(inf) 的 OverflowError 不接）",
-        "agent/config.py",
-        "        except (TypeError, ValueError, OverflowError):",
-        "        except (TypeError, ValueError):  # mutated: inf 走 OverflowError 直接炸",
+        "agent/config_util.py",
+        "    except (TypeError, ValueError, OverflowError):",
+        "    except (TypeError, ValueError):  # mutated: inf 走 OverflowError 直接炸",
         "tests/test_audit9_fixes.py::test_numeric_config_rejects_nonfinite",
     ),
     # ---------------- 第九轮审计（2026-11-04）：协作内核 ----------------

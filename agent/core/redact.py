@@ -21,9 +21,7 @@ _URL_QUERY = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+?\?[^\s'\"<>]*")
 # 排障要看的恰恰是 host。没有 `@` 的正常 URL 不命中（字符类里排除了 `/`）。
 # 2026-11-04 审计：scheme 不再限定 http(s)/ws(s)——`postgres://u:p@h/db`、
 # `redis://:p@h` 这类连接串里的密码同样会进错误文案，放行等于漏抹。
-_URL_USERINFO = re.compile(
-    r"([A-Za-z][A-Za-z0-9+.\-]*://)[^\s'\"<>/?@]+@([^\s'\"<>/@]+)"
-)
+_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^\s'\"<>/?@]+@([^\s'\"<>/@]+)")
 # 成对的「变量名 = 值」形态：名字须含密钥词（KEY/TOKEN/SECRET/…，见 _is_secret_name），
 # 且只在该词是**独立一段**或带常见后缀（KEY_ID/TOKEN_V2/CREDENTIALS）时才算密钥。
 # 旧写法有两类漏网（2026-11-04 审计）：① 名字里密钥词后面还跟着后缀（`..._KEY_ID=`），

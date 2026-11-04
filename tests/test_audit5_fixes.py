@@ -16,7 +16,7 @@ import pytest
 from agent.bridge import Bridge, _norm_timeout
 from agent.config import Config, _interpolate
 from agent.core.orchestrator import WorkerPool
-from agent.tools import mcp_client
+from agent.tools import mcp_client, mcp_group
 
 
 def _bridge() -> Bridge:
@@ -75,13 +75,13 @@ def test_timeout_is_normalized_before_reaching_the_kernel(raw, expected):
 def test_acquire_group_rebuilds_a_closed_group_instead_of_raising(monkeypatch):
     """并发把共享组用到引用归零后，后来者要能重建，而不是在 ready 行之前就崩。"""
     servers = [{"name": "s1", "transport": "stdio", "command": "noop"}]
-    key = mcp_client._group_key(servers)
+    key = mcp_group._group_key(servers)
     closed = mcp_client.McpGroup(servers)
     closed.start = lambda: None
     closed.try_acquire()
     closed._closed = True
     closed._refs = 0
-    mcp_client._groups[key] = closed
+    mcp_group._groups[key] = closed
 
     built = []
 
@@ -94,15 +94,15 @@ def test_acquire_group_rebuilds_a_closed_group_instead_of_raising(monkeypatch):
             self.conns = []
             self.tools = []
 
-    monkeypatch.setattr(mcp_client, "McpGroup", Fresh)
+    monkeypatch.setattr(mcp_group, "McpGroup", Fresh)
     group = mcp_client.acquire_group(servers)
     try:
         assert group is not closed, "已关闭的组不能被复用"
         assert group.refs == 1 and built, "应重建一份并登记一个使用者"
-        assert mcp_client._groups.get(key) is group, "陈旧条目必须被替换掉"
+        assert mcp_group._groups.get(key) is group, "陈旧条目必须被替换掉"
     finally:
         mcp_client.release_group(group)
-        mcp_client._groups.pop(key, None)
+        mcp_group._groups.pop(key, None)
 
 
 @pytest.mark.parametrize(

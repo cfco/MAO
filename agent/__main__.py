@@ -84,16 +84,23 @@ def main() -> None:
 
     from .bridge import Bridge
 
-    bridge = Bridge(load_config())
+    # 构造（load_config / Bridge）也在 try 内（2026-11-04 审计 P3）：call 的契约是
+    # "一次调用一行回包"，构造抛出去 stdout 只剩 stderr 栈，按行解析 JSON 的调用方
+    # 拿到空行——构造失败同样要回一行 ok:false。
     try:
+        bridge = Bridge(load_config())
         try:
             resp = bridge.handle(payload)
         except Exception as e:  # noqa: BLE001 - 单发模式同样必须回一行 JSON，不能只留崩栈
             # bridge 的长驻循环对每条指令都有兜底；call 是"一次调用一行回包"的契约，
             # 抛出去就只剩 stderr 的栈，脚本按 stdout 解析 JSON 的调用方会拿到空行。
             resp = {"ok": False, "error": f"{type(e).__name__}: {safe_error_text(e)}"}
+    except Exception as e:  # noqa: BLE001 - 构造失败也要守住一行 JSON 的契约
+        resp = {"ok": False, "error": f"初始化失败：{type(e).__name__}: {safe_error_text(e)}"}
     finally:
-        bridge.close()
+        bridge_close = locals().get("bridge")
+        if bridge_close is not None:
+            bridge_close.close()
     print(json.dumps(resp, ensure_ascii=False))
     sys.exit(0 if resp.get("ok") else 1)
 

@@ -16,7 +16,26 @@
 from __future__ import annotations
 
 import re
-import shlex
+
+from .shell_rules import (  # noqa: F401 - re-export：历史导入面（builtin/测试）不变
+    _CMD_SEPARATOR,
+    _DOTENV_TOKEN_RE,
+    _EXE_SUFFIXES,
+    _QUOTED_RE,
+    _REDIRECT_RE,
+    _UNQUOTE_CHARS,
+    _check_powershell_encoding,
+    _check_redirect_targets,
+    _check_secret_file_access,
+    _head_word,
+    _is_encoded_cmd_flag,
+    _is_secret_basename,
+    _mask_quoted,
+    _norm_head,
+    _runner_targets,
+    _split_tokens,
+    _strip_wrapping_quotes,
+)
 
 # ==============================================================
 # run_shell 安全加固：命令黑名单 + 注入模式拦截
@@ -58,15 +77,8 @@ _RUNNER_FLAGS = {
     "cmd": frozenset({"/c", "/k"}),
     "shell": frozenset({"-c"}),
 }
-# Windows 可执行后缀：format.com / del.exe 等真实二进制要归一到命令词再比对
-_EXE_SUFFIXES = (".exe", ".com")
-# 命令分隔符：一次请求里可能串多条命令（echo x & del /s y），每段的首词都要查。
-# 必须含换行：cmd.exe 也把换行当命令分隔符执行，而含 `>` 的命令一律走 shell=True，
-# 于是 `echo a>nul` + 换行 + `del /f /q x` 的首词只会是 echo，整条黑名单被绕过（实测放行）。
-_CMD_SEPARATOR = re.compile(r"&&|\|\||[&|;\r\n]")
-
-# Runner 展开的总量预算（见 _unwrap_runners）：正常命令的嵌套不超过两三层，
-# 离预算差几个数量级；只有刻意构造的超深包装才会触顶，触顶即整条拒绝（宁可误拦）。
+# Runner 展开的总量预算（2026-11-04 审计，见 _unwrap_runners）：正常命令的嵌套不超过
+# 两三层，离预算差几个数量级；只有刻意构造的超深包装才会触顶，触顶即整条拒绝（宁可误拦）。
 _RUNNER_SCAN_CHAR_BUDGET = 65536
 _RUNNER_MAX_TEXTS = 64
 
@@ -98,101 +110,7 @@ _INJECTION_PATTERNS = [
 _SHELL_ONLY_SIGNS = re.compile(r"[|><&]|\|\||&&")
 
 # 成对引号包裹的内容（单/双引号）
-_QUOTED_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
-
-
-def _strip_wrapping_quotes(token: str) -> str:
-    """剥掉 token 首尾成对的包裹引号（"..." 或 '...'）。
-
-    shlex posix=False 分词会保留引号字符：`python -c "print(1)"` 会把
-    带引号的表达式当参数传给 Python（静默无输出），带空格的路径同理损坏。
-    引号语义已在分词时生效，这里只去掉包裹字符，恢复真实参数值。
-    """
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
-        return token[1:-1]
-    return token
-
-
-def _mask_quoted(command: str) -> str:
-    r"""把引号包裹的内容替换为等长占位符，专供注入模式匹配使用。
-
-    为什么：`echo "a|b|c"` 里的管道符是字面量、不是命令拼接，直接对整串匹配会误拦；
-    而 `python -c "print(1|2)"` 又因规则要求两侧都得分隔符而放行 —— 同一类写法两种
-    结果，行为不一致。先屏蔽引号内容再匹配，`cmd1 && cmd2`、`a | b` 这类真实拼接照拦。
-
-    占位符用 \x00：它不属于 \s，不会与分隔符规则混淆；等长替换（按原串长度补位）
-    保证命中位置在原文里能直接取到片段用于提示文案。
-    """
-    return _QUOTED_RE.sub(lambda m: "\x00" * len(m.group()), command)
-
-
-# shell 重定向操作符：> >> < 2> 2>> 1> &> >| <> 等，后跟目标文件名。
-# 用于检测「echo x > ..\..\etc\passwd」这类通过重定向绕过 cwd 限制的写越界。
-# 目标捕获：引号包裹的串 或 不含空白/特殊符号的 token。
-# `>|`（POSIX clobber 强制覆盖）必须单列：旧写法的操作符表只有 >> > <，而目标字符类
-# 排除了 `|`，于是 `echo x >| /etc/evil` 整条 match 失败、越界检查一次都不进（实测放行）。
 # `<>`（读写打开）同理补上。
-_REDIRECT_RE = re.compile(
-    r"(?<![<>=!])"  # 排除 => / >= / -> 这类比较与箭头运算符粘在操作符前的写法
-    r"(?:\d*&?)?"  # 可选 fd 前缀：1/2/&（1>, 2>>, &>）
-    r"(?:>>|>\||<>|>|<)"  # 操作符：长操作符优先匹配（>> 先于 >、>| 先于 >）
-    r"\s*"
-    r"(\"[^\"]*\"|'[^']*'|[^\s&|<>]+)"  # 目标：引号串 或 非特殊 token
-)
-
-
-def _check_redirect_targets(command: str) -> str | None:
-    r"""检查 shell 重定向目标是否逃出项目根目录。
-
-    cwd 被限制在项目根内，但重定向符的目标路径不受 cwd 约束：
-      echo x > ..\..\Windows\System32\drivers\etc\hosts
-    会把内容写到项目根之外。这里对每个重定向目标做路径穿越检测，
-    命中即返回拦截说明，安全返回 None。
-
-    注意：这是启发式检查，不解析完整 shell 语法；目标是挡住最常见的越界写法，
-    而非实现一个完整的 shell 解析器。设备名（NUL/CON 等）与 fd 引用（&1）放行。
-    """
-    for m in _REDIRECT_RE.finditer(command):
-        target = m.group(1)
-        # 剥引号："> \"my file.txt\"" 的目标是带引号的
-        target = _strip_wrapping_quotes(target)
-        if not target:
-            continue
-        # fd 引用（>&1, 1>&2）不是文件路径，放行
-        if target.startswith("&"):
-            continue
-        low = target.lower()
-        # 环境变量/家目录写法（%USERPROFILE%\\x、$env:TEMP\\x、~/x）要展开后才决定落点，
-        # 静态检查看不到展开结果 → 一律当作可能写出项目根拒绝（实测旧写法直接放行）。
-        if "%" in target or target.startswith(("$", "~")):
-            return (
-                f"命令拦截：重定向目标 `{target}` 含环境变量/家目录展开，落点无法静态确认，已拒绝"
-            )
-        # 设备名放行（NUL/CON/PRN/AUX/COMx/LPTx 等）
-        if re.match(r"^(nul|con|prn|aux|com[1-9]|lpt[1-9])(\.|$)", low):
-            continue
-        # 绝对路径（盘符 C: 或根斜杠）直接越界
-        if re.match(r"^[a-zA-Z]:", target) or target.startswith(("/", "\\")):
-            return f"命令拦截：重定向目标 `{target}` 是绝对路径，可能写出项目根目录，已拒绝"
-        # 相对路径穿越：含 .. 的目标可能逃出项目根
-        if ".." in target.replace("\\", "/").split("/"):
-            return f"命令拦截：重定向目标 `{target}` 含路径穿越(..)，可能写出项目根目录，已拒绝"
-    return None
-
-
-def _norm_head(raw: str) -> str:
-    """把 token 归一为可比较的命令词：剥包裹引号、cmd 的 `^` 转义与 `%VAR%` 两侧百分号，
-    取 basename、去 exe 后缀。
-
-    归一不做全的话，`"del" /s x`、`C:\\...\\format.com`、`de^l /f x`、`%COMSPEC% /c del x`
-    这类写法各自逃过一张词表里的某一条。
-    """
-    low = _strip_wrapping_quotes(raw).replace("^", "")
-    low = low.replace("\\", "/").rsplit("/", 1)[-1].strip("%").lower()
-    for suf in _EXE_SUFFIXES:
-        if low.endswith(suf):
-            return low[: -len(suf)]
-    return low
 
 
 def _wrapped_payload(tokens: list[str]) -> str:
@@ -223,24 +141,6 @@ def _wrapped_payload(tokens: list[str]) -> str:
             continue
         return ""  # 开关还没出现就来了位置参数（`cmd /d something`）：没有正文可扫
     return ""
-
-
-def _head_word(segment: str) -> str:
-    """取一段命令中"实际被执行"的命令首词（小写）。
-
-    归一化见 _norm_head（剥引号、去 cmd 的 `^` 转义与 `%…%`、取 basename、去 .exe/.com 后缀）。
-    `cmd /c` 这类包装不在这里剥：它的首词就是 cmd 本身，被包装的正文由 _command_heads
-    递归扫描（见 _wrapped_payload 的四个绕过点）。
-    """
-    s = segment.strip()
-    if not s:
-        return ""
-    tokens = _split_tokens(s) or [s]  # 拆词统一走 _split_tokens：ValueError 已兜成空列表
-    if not tokens:
-        return ""
-    # 剥引号后可能仍带空格（整个命令被一对引号包住），取第一个词才是命令词
-    parts = _strip_wrapping_quotes(tokens[0]).strip().split()
-    return _norm_head(parts[0]) if parts else ""
 
 
 def _unwrap_runners(command: str) -> list[str] | None:
@@ -302,104 +202,6 @@ def _command_heads(command: str) -> list[str] | None:
                 words.append(head)
             words.extend(_runner_targets(seg))
     return words
-
-
-_UNQUOTE_CHARS = re.compile(r'["\']')
-
-# ==============================================================
-# 密钥文件访问拦截：read_file 有守卫，但 `type .env` / `cat .env` 走 run_shell
-# 就能整份读出（首词既不在 cmd 也不在 POSIX 危险词表里），而工具输出是直接外发给
-# 外部主的。文件名口径与 builtin._is_secret_file 共用 _is_secret_basename。
-# ==============================================================
-
-
-def _is_secret_basename(name: str) -> bool:
-    """该文件名是否属于"工具不得外发内容"的密钥文件（模板 .env.example 除外）。
-
-    只认**开头**是 secret/credential 的名字：用 `in` 判定会把 `NODE_A_KEY=super…` 这类
-    参数值一并误拦（实测：`python -c "print('...supersecretvalue...')"` 整条命令被拒）。
-    名字里带 `.example` 的一律放行：模板及其备份（`.env.example.bak`）不含凭据，
-    而文档正是教人从模板复制。
-    """
-    n = name.strip().lower().lstrip("<>;&|")
-    if not n or ".example" in n:
-        return False
-    return n == ".env" or n.startswith(".env.") or n.startswith(("secret", "credential"))
-
-
-# `.env` 及其派生名（`.env.local`），前后不能粘字母数字（避开 `myenv`、`.environment`、
-# 以及可读写、也可安全外发的模板 `.env.example`）；`%`/`$`/`{`/`}` 也要排除，否则
-# Windows 的 `%comspec%` 这类变量名尾部会被当成 `.env` 误拦。
-_DOTENV_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_%${])\.env(\.[A-Za-z0-9_-]+)?(?![A-Za-z0-9])", re.IGNORECASE
-)
-
-
-def _check_secret_file_access(command: str) -> str | None:
-    """命令正文里出现密钥文件名一律拒绝（读写方向都拦：写入等于把 key 换到外部端点）。
-
-    两条判定合成一处：token 走 basename 比对（`cat /etc/paid-secrets.json`），整串正则
-    走 dotenv 形态（`echo x>.env` 这种重定向不留空格时 shlex 给出 `x>.env`，basename
-    比对看不见）。`.env` 就躺在项目根，能读它的命令不需要越界，故按名字一律拦。
-    """
-    for raw in _split_tokens(command):
-        name = _strip_wrapping_quotes(raw).replace("\\", "/").rsplit("/", 1)[-1]
-        if _is_secret_basename(name):
-            return f"命令拦截：`{name}` 是密钥文件，工具层不通过 shell 外发其内容，已拒绝"
-    for m in _DOTENV_TOKEN_RE.finditer(_strip_wrapping_quotes(command)):
-        # 命中形态还要过一遍名字判定：`.env.example`（模板）也会被这条正则扫到，
-        # 但它不含凭据、且是文档里教人复制的来源，不能拦。
-        if _is_secret_basename(m.group(0)):
-            return f"命令拦截：`{m.group(0)}` 是密钥文件，工具层不通过 shell 外发其内容，已拒绝"
-    return None
-
-
-def _check_powershell_encoding(command: str) -> str | None:
-    """整条命令（含被引号包裹的正文）里出现 powershell + -EncodedCommand 一律拒。
-
-    为什么不能只按首词判定：`echo hi & powershell -enc AAAA=` 的首词是 echo，
-    `cmd /c "powershell -enc AAAA="` 的正文藏在引号里（shlex 拆出来是一整串）——
-    两种写法都绕过原先"首词是 powershell 才检查"的分支。base64 编码的命令正文静态扫不动，
-    只能整类拒绝。`-executionpolicy` 不会被误伤：前缀判定只认 encodedcommand 的缩写。
-    """
-    flat = _UNQUOTE_CHARS.sub(" ", command)
-    for seg in _CMD_SEPARATOR.split(flat):
-        toks = [t.lower() for t in seg.split()]
-        if not any(t in ("powershell", "powershell.exe", "pwsh", "pwsh.exe") for t in toks):
-            continue
-        for t in toks:
-            if t.startswith("-") and _is_encoded_cmd_flag(t):
-                return "命令拦截：PowerShell -EncodedCommand 可能掩盖危险操作，拒绝执行"
-    return None
-
-
-def _runner_targets(segment: str) -> list[str]:
-    """xargs / find 段里"实际会被执行"的命令词（Runner 自己的参数不算）。
-
-    - xargs：第一个非选项参数即要执行的命令（`-I{} rm` 的 rm 在占位符之后，
-      取第一个非选项词即可；多取一个选项词只是多查一个无害词，不漏判就行）；
-    - find：-exec/-execdir 的后一个词；-delete 等价递归删除，按 rm 同等拦截。
-    """
-    tokens = [_strip_wrapping_quotes(t) for t in _split_tokens(segment)]
-    if not tokens:
-        return []
-    head = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if head == "xargs":
-        for t in tokens[1:]:
-            if t.startswith("-"):
-                continue
-            return [t.replace("\\", "/").rsplit("/", 1)[-1].lower()]
-        return []
-    if head == "find":
-        out: list[str] = []
-        for i, t in enumerate(tokens[1:], start=1):
-            low = t.lower()
-            if low == "-delete":
-                out.append("rm")  # -delete 就是递归删除，按 rm 拦
-            elif low in ("-exec", "-execdir") and i + 1 < len(tokens):
-                out.append(tokens[i + 1].replace("\\", "/").rsplit("/", 1)[-1].lower())
-        return out
-    return []
 
 
 _PS_PATTERNS = [(re.compile(p, re.IGNORECASE), desc) for p, desc in _PS_DANGEROUS]
@@ -521,18 +323,6 @@ _CODE_SECRET_READ = [
 ]
 
 
-def _split_tokens(command: str) -> list[str]:
-    """把命令拆成参数列表；**全模块唯一的 shlex 入口**，失败（引号不闭合等 ValueError）返回空列表。
-
-    原先 _command_head / _try_split_args 等各自再包一层 shlex.split + except，
-    容错口径散在多处、改一处漏一处；统一收在这里。
-    """
-    try:
-        return shlex.split(command, posix=False)
-    except ValueError:
-        return []
-
-
 def _extract_inline_code(tokens: list[str]) -> tuple[str | None, str]:
     """若首 token 是内联解释器且带内联代码开关，返回 (解释器名, 代码正文)；否则 (None, "")。"""
     if not tokens:
@@ -591,17 +381,6 @@ def _scan_code_body(body: str) -> str | None:
     if danger:
         return danger
     return None
-
-
-def _is_encoded_cmd_flag(tok: str) -> bool:
-    """判断 powershell 参数是否为 -EncodedCommand 或其合法缩写。
-
-    powershell.exe 允许参数前缀缩写（-e / -enc / -ec / -encodedcommand …），
-    只匹配全称会让 `-e <base64>` 绕过检查。这里用"是否为 encodedcommand 的前缀"
-    精确判定：-executionpolicy（-ex…）不匹配，不会误伤。
-    """
-    t = tok.lower().lstrip("-")
-    return bool(t) and ("encodedcommand".startswith(t) or t == "ec")
 
 
 def _check_command_safety(command: str) -> str | None:

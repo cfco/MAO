@@ -38,9 +38,10 @@ MAO/
 │   └── tools/
 │       ├── base.py         # 工具基类 + 注册表
 │       ├── builtin.py      # 内置工具（shell/文件；覆盖前留档可回滚；读写两侧都拒密钥文件、命令输出过掩码）
-│       ├── shell_safety.py # 黑名单 + 注入拦截 + 解释器内联代码扫描（含 POSIX shell）；
-│       │                   #   `cmd /c` / `sh -c` 这类包装的正文递归再扫一遍
-│       └── mcp_client.py   # MCP 接入层（stdio/HTTP，进程内共享 + 引用计数）
+│       ├── shell_safety.py # 命令安全编排：注入拦截 + 危险首词黑名单（全段无条件生效）+ 解释器内联扫描
+│       ├── shell_rules.py  # 安全共享规则层：token 拆分/重定向越界/密钥文件名/PS 开关/子进程辅助
+│       ├── backup.py       # 覆盖写前的自动留档与三道清理闸（30 天/300 个/256MB）
+│       └── mcp_client.py   # MCP 接入层（stdio/HTTP）；连接组共享见 mcp_group.py
 ├── skills/                 # 技能目录（example_hello 是示例）
 ├── tests/                  # 全离线测试（无 key/无网络）+ mutation_check.py 变异门禁
 ├── config.yaml             # 只留结构骨架（值在 .env，模型名在 model_registry.txt）
@@ -71,13 +72,11 @@ MAO/
    uv sync            # 读取 pyproject.toml，创建 .venv 并安装全部依赖
    ```
 
-   > 国内加速：把 PyPI 镜像设为清华源。新建用户级配置
-   > `C:\Users\<你>\AppData\Roaming\uv\uv.toml`（macOS/Linux 为 `~/.config/uv/uv.toml`）：
-   > ```toml
-   > [[index]]
-   > url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-   > default = true
-   > ```
+   > 国内加速说明：本项目的依赖索引在 `pyproject.toml` 里**钉死为 pypi.org**（项目级
+   > `[[tool.uv.index]] default = true`），不跟随各机器的 uv 用户级镜像配置——这是刻意
+   > 取舍（uv.lock 记录具体下载 URL，锁镜像与锁 PyPI 来回打架会让 CI 时好时坏，详见
+   > pyproject.toml 内注释）。代价是本机装依赖走 pypi.org，比国内镜像慢，但只在依赖
+   > 变化时付一次；确要换镜像请删掉 pyproject 里该段并 `uv lock`。
 
 3. 运行（入口命令 `mao`，由 `uv run` 驱动）：
 
@@ -145,7 +144,7 @@ registry），启动时按 `[配置分层提醒]` 点名警告（只报变量名
 实际启动工作的天，没运行项目的日子不计入、也不打断连击；纯瞬时失败只冷却、不计入、永不触发下线），自动在 `model_registry.txt`
 给它标 `#` 下线（删掉 `#` 即恢复；阈值 `COLLAB_RETIRE_DAYS` 可调）。可用 `health` 指令查各节点当前是否可用。
 
-多模型中转站的韧性：某模型出现**可重试瞬时失败**（429/5xx/超时/连接）时，会自动切换到**同一中转站**（`base_url`+`api_key` 相同）的其它当前可用模型重试——不跨站、不重复试已失败模型、终态认证错误不回退（那类错误整站级出现，回退既无用又浪费其它模型额度）。重试次数上限由 `collaboration.fallback_models`（默认 2）约束，避免整站故障时把同站几十个模型挨个试穿。每个模型的健康/冷却仍各自独立记账。
+多模型中转站的韧性：某模型出现**可重试瞬时失败**（429/5xx/超时/连接）时，会自动切换到**同一中转站**（`base_url`+`api_key` 相同）的其它当前可用模型重试；同站无可用候选且 `collaboration.fallback_cross_station`（默认 true）时再**跨站**从整池挑未试过的可用模型恢复。不重复试已失败模型、终态认证错误不回退（那类错误整站级出现，回退既无用又浪费其它模型额度）。重试次数上限由 `collaboration.fallback_models`（默认 2）约束，避免整站故障时把同站几十个模型挨个试穿。每个模型的健康/冷却仍各自独立记账。
 
 **第 3 步：配池（编辑 `config.yaml` 的 `agents`）**
 
@@ -162,7 +161,7 @@ agents:
     tags: code,长上下文      # 可选：给外部主选路用的能力标签
 ```
 
-**第 3 步：验证**
+**第 4 步：验证**
 
 ```
 # 起 bridge，发一行 list_agents，应回出池内智能体（不含 key）
@@ -314,6 +313,6 @@ mcp_servers:
 
 - 内置 `run_shell` 可直接执行本机命令，等于把本机命令权交给主智能体；bridge 通过本地 stdin/stdout 通信，不监听任何网络端口
 - `bridge` 模式等价于把本机工具权交给驱动它的外部智能体，只给你信任的智能体用
-- ⚠ **`mao mcp` 把接入门槛降到"宿主配置里加一行"**：任何连上它的 MCP 宿主（Claude Desktop / Cursor 等）都能经 `call_tool → run_shell` 在你这台机器执行命令，而 `run_shell` 是命令卫生黑名单、**并非沙箱**（`python -c` 之类可绕，见 `builtin.py` 说明）。接入前确认信任该宿主；生产环境建议用容器 / 独立账户隔离，`tools.workspace` 只配必要目录、默认为空。
+- ⚠ **`mao mcp` 把接入门槛降到"宿主配置里加一行"**：任何连上它的 MCP 宿主（Claude Desktop / Cursor 等）都能经 `call_tool → run_shell` 在你这台机器执行命令，而 `run_shell` 是命令卫生黑名单、**并非沙箱**（内联代码已扫危险 API 与密钥文件拼接读取、`-EncodedCommand` 与超深包装整类拒绝，但启发式不可能穷尽，见 `shell_safety.py` 说明）。接入前确认信任该宿主；生产环境建议用容器 / 独立账户隔离，`tools.workspace` 只配必要目录、默认为空。
 - `config.yaml` 里若直接填 API key，注意不要外传该文件
 - **工具层不再往外送凭据**（2026-10-16 起）：`run_shell` 与技能脚本的子进程环境按名字末段剔除 `*_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD` 形态的变量（保留 PATH 等功能变量）。此前一条 `set` 就能把 `.env` 注入 `os.environ` 的全部池 key 打印进工具结果，而工具输出不过脱敏层。`read_file` 也拒绝读出 `.env` 与 `.env.*`（`.env.example` 模板仍可），覆盖留档同样跳过密钥文件。**代价**：技能脚本确实需要这类变量时必须显式传参，不再能从环境继承。

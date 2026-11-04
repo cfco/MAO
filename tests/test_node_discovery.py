@@ -69,9 +69,10 @@ def test_kilo_adapter_filters_free_suffix(monkeypatch):
             {"id": "baz:free", "context_length": 8000},
         ]
     }
-    import agent.core.node_discovery as nd
+    import agent.core.discovery_adapters as adp
 
-    monkeypatch.setattr(nd, "_http_get_json", lambda url, key, timeout: sample)
+    # 适配器已拆到 discovery_adapters（2026-11-04）：_http_get_json 的 patch 目标随之迁移
+    monkeypatch.setattr(adp, "_http_get_json", lambda url, key, timeout: sample)
     out = KiloAdapter().fetch("", "", 5)
     assert [m.model for m in out] == ["foo:free", "baz:free"]
     assert out[0].ctx == 262144
@@ -129,12 +130,12 @@ def test_discoverer_run_once_writes_overlay_and_idempotent(tmp_path, monkeypatch
 
 
 def test_discoverer_run_once_fetch_failure_skips_station(tmp_path, monkeypatch):
-    import agent.core.node_discovery as nd
+    import agent.core.discovery_adapters as adp
 
     cfg, registry, overlay = _cfg_with_registry(
         tmp_path, [{"name": "node-a", "base_url": "x", "api_key": "k", "models": "m1@256k"}]
     )
-    monkeypatch.setattr(nd, "_http_get_json", lambda url, key, timeout: None)
+    monkeypatch.setattr(adp, "_http_get_json", lambda url, key, timeout: None)
     disc = FreeNodeDiscoverer(cfg, overlay, adapters={"kilo": KiloAdapter()})
     report = disc.run_once()
     assert report["stations"]["NODE_A_MODELS"]["status"] == "skip"

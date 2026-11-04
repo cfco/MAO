@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agent.core.redact import mask_secrets
 from agent.tools import builtin
 from agent.tools.shell_safety import _check_command_safety
@@ -94,7 +96,9 @@ def test_inline_code_legit_file_reads_still_pass():
     """正常开发内联代码不误伤：不带拼接、不碰编码组合的 open 照常放行。"""
     assert _check_command_safety("python -c \"print(open('requirements.txt').read())\"") is None
     assert _check_command_safety("python -c \"print(open('data.txt','rb').read())\"") is None
-    assert _check_command_safety("python -c \"import json;print(json.load(open('c.json')))\"") is None
+    assert (
+        _check_command_safety("python -c \"import json;print(json.load(open('c.json')))\"") is None
+    )
 
 
 # ---------------- 4. 密钥名子串判定 + 掩码补漏（P1） ----------------
@@ -355,7 +359,9 @@ def test_run_once_merges_into_overlay_written_by_another_process(tmp_path):
     d = FreeNodeDiscoverer(cfg, overlay, adapters={"x": _A()})
     d.run_once()
     data = json.loads(overlay.read_text(encoding="utf-8"))
-    assert data["NODE_Y_MODELS"]["added"] == ["ynew@8192"], "其它站的增量被整篇抹掉（跨进程 lost update）"
+    assert data["NODE_Y_MODELS"]["added"] == ["ynew@8192"], (
+        "其它站的增量被整篇抹掉（跨进程 lost update）"
+    )
     assert "mnew@8192" in data["NODE_X_MODELS"]["added"]
 
 
@@ -406,3 +412,26 @@ def test_keep_ratio_integer_boundary_not_lost():
     kept = _Stub()._latency_window(["w1", "w2", "w3", "w4", "w5"])
     assert len(kept) == 4, f"ratio=0.8、n=5 应裁掉最慢 1 个：{kept}"
     assert "w5" not in kept
+
+
+# ---------------- 13. call 外壳构造失败也回一行 JSON（P3） ----------------
+
+
+def test_call_mode_reports_init_failure(monkeypatch, capsys):
+    """`mao call` 的契约是"一次调用一行回包"：构造（load_config/Bridge）抛异常
+    也不能只剩 stderr 崩栈，要回一行 ok:false（第九轮前构造在 try 之外）。"""
+    import json as _json
+
+    import agent.__main__ as m
+
+    def _boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m, "load_config", _boom)
+    # payload 必须走 argv（省略时会去读 stdin，pytest 捕获下必炸）
+    monkeypatch.setattr("sys.argv", ["agent", "call", "ping", "{}"])
+    with pytest.raises(SystemExit) as ei:
+        m.main()
+    assert ei.value.code == 1
+    resp = _json.loads(capsys.readouterr().out.strip())
+    assert resp["ok"] is False and "初始化失败" in resp["error"]

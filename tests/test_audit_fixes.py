@@ -21,6 +21,7 @@ from pathlib import Path
 
 import agent.core.orchestrator as orch
 import agent.tools.mcp_client as mcp_client
+import agent.tools.mcp_group as mcp_group
 from agent.config import Config, _interpolate
 from agent.core.health import ModelHealth, get_health
 from agent.core.orchestrator import WorkerPool
@@ -161,10 +162,14 @@ def test_effective_timeout_scales_with_batches_and_respects_explicit():
     # 回退链折算（2026-11-04 审计）：一次 ask_result 最坏换 (1+fallback_models) 个模型、
     # 每个各跑一条完整重试链，整体限时按整链折算，否则回退中的工人被误判 timeout。
     chain = 1 + pool._fallback_models
-    assert pool._effective_timeout(1, None) == chain * w + 30.0, "1 批 = 整条回退链的最坏墙钟 + 30 余量"
+    assert pool._effective_timeout(1, None) == chain * w + 30.0, (
+        "1 批 = 整条回退链的最坏墙钟 + 30 余量"
+    )
     assert pool._effective_timeout(3, None) == chain * w + 30.0, "3 名刚好 1 批"
     assert pool._effective_timeout(5, None) == 2 * chain * w + 30.0, "5 名 = 2 批"
-    assert pool._effective_timeout(25, None) == 9 * chain * w + 30.0, "25 名 = 9 批（固定 300s 会截断尾部）"
+    assert pool._effective_timeout(25, None) == 9 * chain * w + 30.0, (
+        "25 名 = 9 批（固定 300s 会截断尾部）"
+    )
     assert pool._effective_timeout(25, 0.3) == 0.3, "调用方显式指定优先"
 
 
@@ -239,7 +244,7 @@ def test_mcp_group_shared_and_refcounted():
             "args": [],
         }
     ]
-    key = mcp_client._group_key(servers)
+    key = mcp_group._group_key(servers)
     g1 = mcp_client.acquire_group(servers)
     try:
         g2 = mcp_client.acquire_group(servers)
@@ -249,10 +254,10 @@ def test_mcp_group_shared_and_refcounted():
 
         mcp_client.release_group(g2)
         assert g1.refs == 1
-        assert key in mcp_client._groups, "还有使用者在用，不能关连接"
+        assert key in mcp_group._groups, "还有使用者在用，不能关连接"
     finally:
         mcp_client.release_group(g1)
-    assert key not in mcp_client._groups, "引用归零后从共享表移除"
+    assert key not in mcp_group._groups, "引用归零后从共享表移除"
 
 
 # ---------------- 4) 缓存命中优先于冷却（批量路径） ----------------
