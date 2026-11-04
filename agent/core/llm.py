@@ -16,6 +16,7 @@ from __future__ import annotations
 import random
 import threading
 import time
+from contextlib import contextmanager
 
 import openai
 from openai import OpenAI
@@ -210,6 +211,23 @@ class LLMClient:
             should_close = self._inflight <= 0 and self._close_pending
         if should_close:
             self.close()
+
+    @contextmanager
+    def call_span(self):
+        """把"整条重试链"记成**一次**在飞的上下文管理器。
+
+        为什么需要（2026-11-04 审计 P1）：派工路径的重试环（_attempt_with_retry）对同一
+        client 连跑多次 `chat_once`，两次尝试之间（尤其退避 sleep 时）`_inflight` 归 0
+        ——此刻热同步若回收该工人，`close_when_idle` 判空闲当场 `close()`，后续重试/回退
+        全部打在已关闭的 httpx 池上，在飞派工被假失败（实测复现）。用 span 把整条链
+        罩成一次在飞：链中途被点名回收只记 `_close_pending`，收尾时统一关闭。
+        chat_once 内部自带的 enter/leave 与本 span 嵌套计数，互不冲突。
+        """
+        self._enter_call()
+        try:
+            yield self
+        finally:
+            self._leave_call()
 
     # ---------- 内部 ----------
 

@@ -57,6 +57,20 @@ def _today() -> str:
     return time.strftime("%Y-%m-%d")
 
 
+def _clean_model_entry(v: dict) -> dict:
+    """按元素验类型并裁剪单条模型记录（读盘与并盘共用同一口径）。
+
+    手工编辑/对端进程写坏的档案不能让 sorted()/min() 抛 TypeError：fail_dates 只留
+    字符串（并裁剪到上限）、disabled 只留字符串日期（非字符串视为没下线过，丢弃）。
+    """
+    out = dict(v)
+    out["fail_dates"] = sorted({d for d in (v.get("fail_dates") or []) if isinstance(d, str)})
+    out["fail_dates"] = out["fail_dates"][-_MAX_DATES_KEPT:]
+    if not isinstance(out.get("disabled"), str):
+        out.pop("disabled", None)
+    return out
+
+
 class ModelHealth(AtomicJsonLedger):
     """模型健康账本：当日失败隔离查询 + 失败记账 + 连续运行日达阈值下线改写。"""
 
@@ -233,18 +247,12 @@ class ModelHealth(AtomicJsonLedger):
                 raw = json.loads(self.store_path.read_text(encoding="utf-8"))
                 models = raw.get("models") if isinstance(raw, dict) else None
                 if isinstance(models, dict):
-                    # fail_dates 也要按元素验类型（原先只验 active_dates）：手工写成整数
-                    # 日期就会在 `sorted(set(...) | {day})` 处抛 TypeError，而调用方
-                    # （orchestrator._record_result）整段吞异常 ⇒ 隔离与连击静默失效。
+                    # fail_dates / disabled 都要按元素验类型（原先只验 active_dates）：
+                    # 手工写成整数日期就会在 sorted()/min() 处抛 TypeError（str 与 int
+                    # 不可比），而调用方（orchestrator._record_result）整段吞异常 ⇒
+                    # 隔离与连击静默失效（2026-11-04 审计：disabled 混型同样中招）。
                     data = {
-                        k: {
-                            **v,
-                            "fail_dates": sorted(
-                                {d for d in (v.get("fail_dates") or []) if isinstance(d, str)}
-                            )[-_MAX_DATES_KEPT:],
-                        }
-                        for k, v in models.items()
-                        if isinstance(v, dict)
+                        k: _clean_model_entry(v) for k, v in models.items() if isinstance(v, dict)
                     }
                 if isinstance(raw, dict):
                     active = [d for d in (raw.get("active_dates") or []) if isinstance(d, str)]
@@ -305,14 +313,19 @@ class ModelHealth(AtomicJsonLedger):
                 if not isinstance(entry, dict):
                     continue
                 mine = self._data.setdefault(name, {})
-                # 两侧都要按元素验类型：对端文件里的整数日期会让 sorted() 抛
+                # 两侧都要按元素验类型：对端文件里的整数日期会让 sorted()/min() 抛
                 # TypeError（str 与 int 不可比），而调用方整段吞异常 ⇒ 隔离静默失效。
+                # disabled 同样只收字符串日期（_ensure_loaded 已洗过 mine 侧，对端再验一道）。
                 dates = sorted(
                     {d for d in (mine.get("fail_dates") or []) if isinstance(d, str)}
                     | {d for d in (entry.get("fail_dates") or []) if isinstance(d, str)}
                 )
                 mine["fail_dates"] = dates[-_MAX_DATES_KEPT:]
-                days = [d for d in (entry.get("disabled"), mine.get("disabled")) if d]
+                days = [
+                    d
+                    for d in (entry.get("disabled"), mine.get("disabled"))
+                    if isinstance(d, str) and d
+                ]
                 if days:
                     mine["disabled"] = min(days)
         d_active = [d for d in (disk.get("active_dates") or []) if isinstance(d, str)]

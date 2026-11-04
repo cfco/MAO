@@ -98,6 +98,7 @@ class FreeNodeMixin:
                         note=tmpl.note,
                         models_env=env_var,
                         discovery=tmpl.discovery,
+                        broken=getattr(tmpl, "broken", ""),
                     )
                     profiles[name] = np
                     existing.add(model)

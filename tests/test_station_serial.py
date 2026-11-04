@@ -175,14 +175,16 @@ def test_max_per_station_relaxes_the_gate(monkeypatch):
 
 
 def test_effective_timeout_accounts_for_station_serialization():
-    """6 名 / 2 站 / 每站 1 ⇒ 实际并行 2 路 = 3 批 ⇒ 3×最坏墙钟+30；旧口径只有 2 批会误杀尾部。"""
+    """6 名 / 2 站 / 每站 1 ⇒ 实际并行 2 路 = 3 批 ⇒ 3×整链最坏墙钟+30；旧口径只有 2 批会误杀尾部。"""
     pool = _pool([("A", "http://a", "m1,m2,m3"), ("B", "http://b", "m1,m2,m3")])
     try:
         names = ["A:m1", "A:m2", "A:m3", "B:m1", "B:m2", "B:m3"]
         assert pool._batch_concurrency(len(names), names) == 2, "min(max_workers=3, 1×2站)"
-        assert pool._effective_timeout(len(names), None, names) == 3 * _worst(pool) + 30
+        # 2026-11-04 审计：限时按整条回退链折算（chain = 1 + fallback_models）
+        chain = 1 + pool._fallback_models
+        assert pool._effective_timeout(len(names), None, names) == 3 * chain * _worst(pool) + 30
         # 不传 workers ⇒ 退回旧口径（既有断言/调用方行为逐字不变）
-        assert pool._effective_timeout(len(names), None) == 2 * _worst(pool) + 30
+        assert pool._effective_timeout(len(names), None) == 2 * chain * _worst(pool) + 30
         # 显式传入永远优先
         assert pool._effective_timeout(len(names), 0.3, names) == 0.3
     finally:
@@ -195,7 +197,10 @@ def test_single_station_batch_widens_timeout_the_most():
     try:
         names = ["A:m1", "A:m2", "A:m3"]
         assert pool._batch_concurrency(len(names), names) == 1
-        assert pool._effective_timeout(len(names), None, names) == 3 * _worst(pool) + 30
+        assert (
+            pool._effective_timeout(len(names), None, names)
+            == 3 * (1 + pool._fallback_models) * _worst(pool) + 30
+        )
     finally:
         pool.close()
 

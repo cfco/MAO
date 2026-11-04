@@ -113,7 +113,11 @@ class McpConnection:
         )
         self._thread.start()
         if not ready.wait(timeout=90):
-            self.error = self.error or "连接超时（90s）"
+            # error 的读写统一走 _lock（2026-11-04 审计）：后台线程连接成功时会在锁内清零
+            # error，这里裸写会把"刚连上"覆盖回"超时"——调用方判失败、工具一个不注册，
+            # 后台连接却活着占着 stdio 子进程。
+            with self._lock:
+                self.error = self.error or "连接超时（90s）"
 
     def _run_connect_forever(self, ready: threading.Event) -> None:
         """后台线程主循环：连接+托管 → 唤醒（断开/停止）→ 退避重连 → ... 直到 stop()。"""
@@ -293,14 +297,23 @@ class McpConnection:
             fut = asyncio.run_coroutine_threadsafe(session.call_tool(remote_name, args or {}), loop)
             result = fut.result(timeout=self._call_timeout)
         except Exception as e:  # noqa: BLE001
+            # 超时分支必须 cancel future（2026-11-04 审计）：协程还在 loop 里持有 session，
+            # 不标记取消的话它会陪到 session 作废才被吞掉异常，资源回收路径不干净。
+            try:
+                fut.cancel()
+            except Exception:  # noqa: BLE001
+                pass
             # 调用时异常（session 断了）：作废 session 并唤醒 host，走「同 task 清理→退避→重连」。
             if not self._stop.is_set():
                 with self._lock:
                     self.session = None
-                # _host_evt 为 None 说明线程已在退避/重连途中，无需（也无从）唤醒。
-                if self._host_evt is not None and loop.is_running():
+                # 唤醒用**当场捕获的事件对象**而不是再回读 self._host_evt（2026-11-04 审计）：
+                # 检查通过之后、回调执行之前 loop 线程可能已把它清空——回调里回读拿到 None
+                # 直接返回，唤醒丢失，host 还挂在 ev.wait() 上永不重连（连接永久僵死）。
+                ev = self._host_evt
+                if ev is not None and loop.is_running():
                     try:
-                        loop.call_soon_threadsafe(self._wake_host)
+                        loop.call_soon_threadsafe(ev.set)
                     except Exception:  # noqa: BLE001 - loop 恰好已退出等边缘情况
                         pass
             return ToolResult(
@@ -341,11 +354,22 @@ def connect_and_register(
             out_conns.append(conn)
         if conn.error or not conn.session:
             status.append(f"[MCP] {name}: 连接失败 - {conn.error}")
+            # 别留活连接空转（2026-11-04 审计）：90s 超时判失败后，后台线程若恰好在此刻
+            # 连上了，会一直托管着 stdio 子进程却没有任何工具注册——stop() 收掉它，
+            # 用户修好配置重启自然重连。
+            try:
+                conn.stop()
+            except Exception:  # noqa: BLE001 - 替身连接对象可能没有 stop
+                pass
             continue
         try:
             tools = conn.list_tools()
         except Exception as e:  # noqa: BLE001
             status.append(f"[MCP] {name}: 工具发现失败 - {safe_error_text(e)}")
+            try:
+                conn.stop()
+            except Exception:  # noqa: BLE001 - 工具一个没注册，连接留着只是占资源
+                pass
             continue
         prefix = _safe_name(name)
         for t in tools:

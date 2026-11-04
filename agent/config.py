@@ -15,6 +15,7 @@ load_config, ROOT, _interpolate`）一律不用改。
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,23 @@ class Config:
             # 会自动去给 git 里的 model_registry.txt 加 `#`，把一个配置笔误放大成清单改动。
             _warn_empty_ref(station, "base_url", raw_station_item.get("base_url"), base_url)
             _warn_empty_ref(station, "api_key", raw_station_item.get("api_key"), api_key)
+            # 配置不完整的站打 broken 标记（2026-11-04 审计 P0）：旧实现只警告、空端点站
+            # 照常入池，health 还把它们全报 available:true——外部主按 health 预检点名
+            # 派工必然失败，冷却/延迟档案被污染。照常入池而非直接剔除：分层契约与
+            # 诊断视图依赖 profile 存在；不可用性由 orchestrator._skip_reason /
+            # health_status 统一承接（available:false、点名派工拦下、不进回退候选）。
+            # 口径：base_url 为空一律算 broken（没有端点不可能工作）；api_key 为
+            # **字面空串**放行（本地 Ollama 等免 key 站的合法写法），引用 ${VAR} 解析成
+            # 空才算 broken。
+            broken = "/".join(
+                field
+                for field, val, raw in (
+                    ("base_url", base_url, raw_station_item.get("base_url")),
+                    ("api_key", api_key, raw_station_item.get("api_key")),
+                )
+                if not str(val).strip()
+                and (field == "base_url" or "${" in str(raw or ""))
+            )
             # 兼容新结构 models（一站多模型）与旧结构 model（单模型）
             models = item.get("models") or item.get("model")
             model_list = _split_models(models)
@@ -103,6 +121,7 @@ class Config:
                         tags=str(item.get("tags", "")),
                         models_env=models_env,
                         discovery=discovery,
+                        broken=broken,
                     )
                 )
 
@@ -133,17 +152,26 @@ class Config:
         """
         try:
             out = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError：int(float('inf')) 走的是这条（yaml 写 `cooldown_max: .inf`
+            # 即触发，2026-11-04 审计实测崩启动）；nan 是 ValueError。
             _warn_bad_value(key, value, default)
             out = default
         return out if minimum is None else max(minimum, out)
 
     @staticmethod
     def as_float(value: Any, key: str, default: float, minimum: float | None = None) -> float:
-        """同 as_int，用于 float 型配置项。"""
+        """同 as_int，用于 float 型配置项。
+
+        额外拒掉非有限值（inf/nan）：`latency_probe_interval: .inf` 这类写法
+        float() 本身不报错，但会污染所有按它推导的限时/周期计算。
+        """
         try:
             out = float(value)
         except (TypeError, ValueError):
+            _warn_bad_value(key, value, default)
+            out = default
+        if not math.isfinite(out):
             _warn_bad_value(key, value, default)
             out = default
         return out if minimum is None else max(minimum, out)

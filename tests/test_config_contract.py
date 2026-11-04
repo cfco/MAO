@@ -22,7 +22,6 @@ from agent.config import _ENV_PATTERN, _interpolate
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_YAML = ROOT / "config.yaml"
 MODEL_REGISTRY = ROOT / "model_registry.txt"
-DOTENV = ROOT / ".env"
 
 
 def _parse_plain(path: Path) -> dict[str, str]:
@@ -35,6 +34,27 @@ def _parse_plain(path: Path) -> dict[str, str]:
     for line in path.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if not s or s.startswith("#") or "=" not in s:
+            continue
+        key, _, val = s.partition("=")
+        out[key.strip()] = val.strip()
+    return out
+
+
+def _parse_template(path: Path) -> dict[str, str]:
+    """.env.example 专用：模板行是全注释形态（`#VAR=`，避免被 shell 误加载），
+    先剥行首 `#` 再按 KEY=VALUE 解析——契约只关心"变量名有没有列出来"，
+    值留空/给示例都算数。剥完注释后必须仍是「大写变量名=」形态才收：
+    模板正文里的说明性注释（"别留成 `KEY=` 空串"这类散文）不是变量定义。
+    """
+    import re as _re
+
+    var_line = _re.compile(r"[A-Z_][A-Z0-9_]*=.*")
+    out: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            s = s.lstrip("#").strip()
+        if not s or not var_line.fullmatch(s):
             continue
         key, _, val = s.partition("=")
         out[key.strip()] = val.strip()
@@ -78,21 +98,32 @@ def test_env_pattern_distinguishes_missing_default():
     assert [(m.group(1), m.group(2)) for m in ms] == [("A", None), ("B", "x"), ("C", "")]
 
 
-def test_config_referenced_vars_are_covered_by_registry_and_env():
-    """config.yaml 引用的每个 ${VAR}，要么有 :-默认值，要么在 model_registry.txt 或 .env 里有定义。
+def test_config_referenced_vars_are_covered_by_registry_and_env_example():
+    """config.yaml 引用的每个 ${VAR}，要么有 :-默认值，要么在进 git 的文件里有定义。
 
-    拆成两半（审计 P1：旧写法无 .env 就整条 skip，而 CI 的干净克隆**永远**没有 .env，
-    于是"变量名两边对得上"这条核心契约在 CI 上一次都没执行过）：
-    - 模型清单类变量（`*_MODELS`/`*_MODEL`）的真源是**进 git 的** model_registry.txt，
-      CI 与新克隆同样能核、也必须核 → 恒断言，不 skip；
-    - 端点 / KEY / 协作参数这类只可能出现在本地 .env 的变量 → 缺 .env 时才跳过。
-    只要有一个"引用了但没定义也没默认"的变量，程序启动就会拿到空配置。
+    真源全部取**进 git** 的文件（2026-11-04 审计改）：旧写法的"配置类变量缺 .env 就
+    skip"有两个真实缺陷——① CI 的干净克隆永远没有 .env，这半契约一次都没执行过；
+    ② 本机 .env 是用户的私有配置、允许只配部分站点（实测只剩一个 KEY），用本地 .env
+    当覆盖真源会让契约测试在合法配置下必红。改为对照 `.env.example`（模板，随仓库
+    维护）：凡 config.yaml 引用而无默认值的变量，模板里必须列出名字，新用户才知道
+    要填什么；至于用户本地是否真的填了值，本就无法离线验证，也不该由测试断言。
     """
     refs = _config_referenced_vars()
     # 护栏：解析出足够多的引用，避免 pattern/解析失效后测试变成空转
     assert len(refs) >= 6, f"只解析到 {len(refs)} 个引用，解析逻辑可能已失效：{refs}"
     registry_defined = set(_parse_plain(MODEL_REGISTRY))
+    template_defined = set(_parse_template(ROOT / ".env.example"))
 
+    defined = registry_defined | template_defined
+    uncovered = sorted(k for k, default in refs if default is None and k not in defined)
+    assert not uncovered, (
+        f"这些变量 config.yaml 引用了，但 model_registry.txt / .env.example 都没有列出、"
+        f"也没有 :-默认值：{uncovered}。要么在模板里补上变量名（新用户才知道要填什么），"
+        "要么给引用加 :-默认值。"
+    )
+
+    # 模型清单类变量的真源**只**是 model_registry.txt（.env 里混清单变量会被启动告警点
+    # 名），单独再核一遍，防止有人把清单塞进模板蒙混过关。
     model_refs = [k for k, default in refs if default is None and k.endswith(("_MODELS", "_MODEL"))]
     assert model_refs, "config.yaml 里应当有模型清单类引用，解析可能变了"
     missing = sorted(k for k in model_refs if k not in registry_defined)
@@ -101,15 +132,20 @@ def test_config_referenced_vars_are_covered_by_registry_and_env():
         f"而进 git 的 model_registry.txt 里也没有：{missing}"
     )
 
-    if not DOTENV.exists():
-        pytest.skip("无本地 .env：配置类变量（端点/KEY/参数）留待本地核对，模型清单已恒断言覆盖")
 
-    defined = registry_defined | set(_parse_plain(DOTENV))
-    uncovered = sorted(k for k, default in refs if default is None and k not in defined)
-    assert not uncovered, (
-        f"这些变量 config.yaml 引用了，但 .env / model_registry.txt 都没提供、"
-        f"也没有 :-默认值：{uncovered}；它们插值后是空串。"
-    )
+def test_template_lists_no_real_secret_values():
+    """.env.example 是模板：密钥形命名（*_KEY/*_TOKEN/*_SECRET/…）只允许留空占位，
+    绝不允许带一个能直接用的值（模板进 git，带值=泄密）。参数类变量（超时/开关）
+    允许给示例值，不在本断言范围内。
+    """
+    import re as _re
+
+    # 以密钥词结尾才算密钥形命名：COLLAB_LATENCY_PROBE_MAX_TOKENS 这类参数名
+    # 只是"恰好含 TOKEN 子串"，不是凭据（模板里允许带示例值）。
+    secret_shape = _re.compile(r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)$")
+    for name, val in _parse_template(ROOT / ".env.example").items():
+        if secret_shape.search(name):
+            assert val == "", f"模板里 {name} 是密钥形命名，值必须留空占位，不能带可用值"
 
 
 def test_registry_has_no_dead_vars():

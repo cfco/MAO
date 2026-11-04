@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import queue
 import statistics
 import threading
 import time
@@ -264,29 +266,45 @@ class LatencyProber:
 
         每个工人独立探测，单个失败/超时不牵连其它工人；成功样本写进档案。
         探测失败**不**记 health / 冷却（见类文档）。
+
+        固定线程槽 + 队列取活（2026-11-04 审计 P2）：旧实现为每个工人各起一条线程、
+        只靠信号量限并发——自动发现把池撑到几十个模型后，每 10 分钟一轮就同时存在
+        几十条 live 线程（多数阻塞在 sem.acquire 上），与 _run_parallel 当初改成
+        "线程数 = 并发上限"是同一类资源问题，探测侧一并收口。并发语义不变：
+        同时在飞的探测数仍是 _concurrency。
         """
         out: dict[str, float | None] = {}
         lock = threading.Lock()
-        sem = threading.Semaphore(self._concurrency)
-        waiters: list[threading.Thread] = []
         samples: list[tuple[str, float]] = []
+        jobs: queue.SimpleQueue = queue.SimpleQueue()
+        names_unique = list(dict.fromkeys(names))  # 去重且保序
+        for nm in names_unique:
+            jobs.put(nm)
+        slots = max(1, min(self._concurrency, len(names_unique)))
+        for _ in range(slots):
+            jobs.put(None)  # 每条线程取到收工标记就退出
 
-        def _one(nm: str) -> None:
-            with sem:
+        def _one() -> None:
+            while True:
+                nm = jobs.get()
+                if nm is None:
+                    return
                 try:
                     ms = self._probe_one(nm)
                 except Exception:  # noqa: BLE001 - 单个工人探测异常不影响整轮
                     ms = None
-            with lock:
-                out[nm] = ms
-                if ms is not None:
-                    samples.append((nm, ms))
+                with lock:
+                    out[nm] = ms
+                    if ms is not None:
+                        samples.append((nm, ms))
 
-        for nm in dict.fromkeys(names):  # 去重且保序
-            t = threading.Thread(target=_one, args=(nm,), daemon=True)
-            waiters.append(t)
+        threads = [
+            threading.Thread(target=_one, daemon=True, name=f"mao-probe-{i}")
+            for i in range(slots)
+        ]
+        for t in threads:
             t.start()
-        for t in waiters:
+        for t in threads:
             t.join()
         # 整轮只落盘一次：旧实现每个工人各自 record() 各写一遍整份 JSON（N 工人 = N 次 IO）。
         if samples:
@@ -373,7 +391,9 @@ class LatencyMixin:
         if len(known) < min(self._latency_min_samples, len(live)):
             return live
         ordered = self._latency_sorted(live)
-        drop = int(len(ordered) * (1.0 - self._latency_keep_ratio))
+        # floor 前加一点 epsilon：浮点乘法在整数边界会差一位（ratio=0.8、n=5 时
+        # 5*0.2=0.9999999999999998 → drop=0，完全不裁剪），eps 把 0.999…拉回 1。
+        drop = math.floor(len(ordered) * (1.0 - self._latency_keep_ratio) + 1e-9)
         return ordered[: max(1, len(ordered) - drop)]
 
     # ---------- 探测与记账 ----------

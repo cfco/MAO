@@ -37,6 +37,12 @@ class AgentProfile:
     # 免费节点发现适配器名（"kilo"/"bynara"/""=不自动发现）。由 config.yaml 各 agent
     # 的 `discovery:` 字面量指定；发现器据此拉该站在线免费清单并与 registry 对账。
     discovery: str = ""
+    # 配置不完整标记（2026-11-04 审计 P0）：base_url 为空 / api_key 引用变量解析为空时
+    # 站照常入池（分层契约与健康诊断依赖 profile 存在），但派工/回退/health 一律按
+    # 不可用处理——否则派工必败污染冷却与延迟档案，空 key 的 401 是终态失败、
+    # 连击 7 个运行日会误改 git 里的 model_registry.txt。空串=配置完整；
+    # 非空=原因说明（进 health 与跳过提示，只含字段名、绝不含任何值）。
+    broken: str = ""
 
     @property
     def station_key(self) -> tuple[str, str]:

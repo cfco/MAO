@@ -1126,13 +1126,23 @@ def test_successful_dispatch_registers_run_day(tmp_path, monkeypatch):
 
 
 def test_redact_masks_underscore_suffixed_secret_names():
-    """脱敏必须命中本项目实际的 key 命名（`NODE_A_KEY=` / `CF_API_TOKEN=`），且不误抹普通词。"""
+    """脱敏必须命中本项目实际的 key 命名（`NODE_A_KEY=` / `CF_API_TOKEN=`），
+    以及密钥词带后缀的中段命名（`..._KEY_ID=`，2026-11-04 审计补的漏）。
+    `monkey` 这类同形词现在**会被一起抹**：子串级判定是有意为之的取舍——
+    漏抹一个真实密钥（如 `AWS_ACCESS_KEY_ID=`）的代价远高于误抹一段调试文本，
+    与子进程 env 通道（_child_env，宁严勿漏）口径一致。
+    """
     from agent.core.redact import safe_error_text
 
-    out = safe_error_text("fail NODE_A_KEY=abcdefghijkl CF_API_TOKEN=zyxwvu monkey=3 status=404")
+    out = safe_error_text(
+        "fail NODE_A_KEY=abcdefghijkl CF_API_TOKEN=zyxwvu "
+        "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE monkey=3 status=404"
+    )
     assert "abcdefghijkl" not in out and "zyxwvu" not in out, out
+    assert "AKIAIOSFODNN7EXAMPLE" not in out, out
     assert "NODE_A_KEY=****" in out and "CF_API_TOKEN=****" in out, out
-    assert "monkey=3" in out, f"同尾词不该被误抹：{out}"
+    assert "AWS_ACCESS_KEY_ID=****" in out, out
+    assert "monkey=****" in out, f"同形词按宁严勿漏口径一并抹掉：{out}"
     assert "status=404" in out
 
 

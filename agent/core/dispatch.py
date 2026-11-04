@@ -17,6 +17,7 @@ _latency_sorted / _record_latency / _touch_latency（LatencyMixin）/ render_ans
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 from ..config import AgentProfile
@@ -76,6 +77,16 @@ class DispatchMixin:
                 "error": (
                     f"子智能体 '{worker}' 今日调用已失败，当天隔离不再派工，请换其它工人或明天再试"
                 ),
+            }
+        if reason is not None:
+            # 其它不可派原因（2026-11-04 审计：配置不完整）：点名直派同样拦下，
+            # 空端点站不许烧真实网络请求
+            return {
+                "worker": worker,
+                "ok": False,
+                "status": ST_ERROR,
+                "answer": "",
+                "error": f"子智能体 '{worker}' 当前不可派工：{reason}",
             }
         return self._call_result(p, system, prompt, memo=memo)
 
@@ -285,13 +296,20 @@ class DispatchMixin:
         resp: dict | None = None
         err: Exception | None = None
         elapsed_ms = 0.0
-        for attempt in range(attempts):
-            resp, err, elapsed_ms = self._chat_gated(client, station, messages)
-            if err is None:
-                return resp, None, elapsed_ms
-            if not isinstance(err, LLMError) or not err.retryable:
-                return resp, err, elapsed_ms  # 终态错误：重试也没用，直接交回上层按终态记账
-            if attempt >= attempts - 1:
-                return resp, err, elapsed_ms
-            time.sleep(backoff_seconds(attempt, err.error_type))  # 门已释放，退避不占站配额
+        # 整条重试链记成一次"在飞"（2026-11-04 审计 P1）：否则两次尝试之间（退避 sleep
+        # 最宽）_inflight 归 0，热同步恰好在此刻回收该工人就会当场 close()——后面的
+        # 重试/回退全部打在已关闭的连接池上，在飞派工被假失败。
+        # getattr 兜底：替身客户端（测试 FakeClient 等）可能没有 call_span，
+        # 此时退回无上下文——只影响测试替身，真实 LLMClient 恒有该方法。
+        span_factory = getattr(client, "call_span", None)
+        with (span_factory() if callable(span_factory) else nullcontext()):
+            for attempt in range(attempts):
+                resp, err, elapsed_ms = self._chat_gated(client, station, messages)
+                if err is None:
+                    return resp, None, elapsed_ms
+                if not isinstance(err, LLMError) or not err.retryable:
+                    return resp, err, elapsed_ms  # 终态错误：重试也没用，直接交回上层按终态记账
+                if attempt >= attempts - 1:
+                    return resp, err, elapsed_ms
+                time.sleep(backoff_seconds(attempt, err.error_type))  # 门已释放，退避不占站配额
         return resp, err, elapsed_ms

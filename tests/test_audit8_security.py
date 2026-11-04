@@ -188,14 +188,18 @@ def test_run_shell_output_masks_secret_shaped_lines():
     文件名判定，只看输出内容里的凭证形态。
     """
     probe = (
-        "print('fail NODE_A_KEY=supersecretvalue CF_API_TOKEN=anothertoken monkey=3 status=404')"
+        "print('fail NODE_A_KEY=supersecretvalue CF_API_TOKEN=anothertoken "
+        "AWS_ACCESS_KEY_ID=kid12345 status=404')"
     )
     reg = build_builtin_tools(_cfg())
     out = str(reg.execute("run_shell", {"command": f'"{sys.executable}" -c "{probe}"'}))
     assert "NODE_A_KEY=****" in out, out[:300]
     assert "CF_API_TOKEN=****" in out, out[:300]
     assert "supersecretvalue" not in out and "anothertoken" not in out, out[:300]
-    assert "monkey=3" in out, "同尾词不该被误抹（与 safe_error_text 同一口径）"
+    # 中段密钥命名（词不在末尾）也要被掩码：与 _child_env 的宁严勿漏口径一致
+    # （2026-11-04 审计：KEY_ID 这类后缀命名曾整类漏掉，一条 set 就能带走）
+    assert "AWS_ACCESS_KEY_ID=****" in out, out[:300]
+    assert "kid12345" not in out, out[:300]
 
 
 # ---------------- 5. 异常文案抹 URL userinfo ----------------

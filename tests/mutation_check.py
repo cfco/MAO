@@ -105,7 +105,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "agent/config.py",
         """        try:
             out = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _warn_bad_value(key, value, default)
             out = default
         return out if minimum is None else max(minimum, out)""",
@@ -168,8 +168,10 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M21 批次死站记忆不再抑制同站回退",
         "agent/core/dispatch.py",
-        "                    fb = self._fallback_target(p, tried, memo)",
-        "                    fb = self._fallback_target(p, tried, None)  # mutated: 忽略批次死站记忆",
+        """                    if err.retryable and fallbacks_left > 0:
+                        fb = self._fallback_target(p, tried, memo)""",
+        """                    if err.retryable and fallbacks_left > 0:
+                        fb = self._fallback_target(p, tried, None)  # mutated: 忽略批次死站记忆""",
         "tests/test_core.py::test_station_memo_suppresses_cross_worker_fallback",
     ),
     (
@@ -403,8 +405,10 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M49 read_file 不拒绝密钥文件",
         "agent/tools/builtin.py",
-        "        if _is_secret_file(p):",
-        "        if False:  # mutated: 允许根之内即可读出 .env",
+        """        if _is_secret_file(p):
+            # 允许根之内不等于可以外发：`.env` 就躺在项目根里，read_file 原先把它整份读出，""",
+        """        if False:  # mutated: 允许根之内即可读出 .env
+            # 允许根之内不等于可以外发：`.env` 就躺在项目根里，read_file 原先把它整份读出，""",
         "tests/test_core.py::test_read_file_refuses_env_secret",
     ),
     (
@@ -576,7 +580,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "M71 子进程环境只认分段式密钥名（漏 MYKEY/GHTOKEN）",
         "agent/tools/builtin.py",
         """        if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS or any(
-            name.endswith(tail) for tail in SECRET_NAME_TAILS
+            word in name for word in SECRET_NAME_SUBSTRINGS
         ):""",
         '        if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS:  # mutated: 只看分段后缀',
         "tests/test_audit6_fixes.py::test_child_env_strips_compact_secret_names",
@@ -871,6 +875,116 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "                if False:  # mutated: 不补大写别名（Windows 巧合可用、Linux/CI 静默失效）\n"
         "                    pass",
         "tests/test_audit8_fixes.py::test_lowercase_dotenv_key_gets_upper_alias",
+    ),
+    # ---------------- 第九轮审计（2026-11-04）：安全层补漏 ----------------
+    (
+        "M107 PS 段前的危险首词不再检查（黑名单被分流短路）",
+        "agent/tools/shell_safety.py",
+        """    heads = _command_heads(stripped)
+    if heads is None:
+        return "命令拦截：Runner 包装嵌套过深，已拒绝（防绕过黑名单）\"""",
+        """    heads = _command_heads(stripped)
+    if heads is None:
+        return "命令拦截：Runner 包装嵌套过深，已拒绝（防绕过黑名单）"
+    heads = [h for h in heads if h in ("powershell", "pwsh")]  # mutated: 只看 PS 段""",
+        "tests/test_audit9_fixes.py::test_ps_branch_no_longer_short_circuits_head_blacklist",
+    ),
+    (
+        "M108 `>|` 重定向目标不做越界检查",
+        "agent/tools/shell_safety.py",
+        '(?:>>|>\\||<>|>|<)  # 操作符：长操作符优先匹配（>> 先于 >、>| 先于 >）',
+        "(?:>>|>|<)  # mutated: `>|` 整条 match 失败、越界检查落空",
+        "tests/test_audit9_fixes.py::test_clobber_redirect_targets_are_checked",
+    ),
+    (
+        "M109 内联代码拼接读密钥文件不拦",
+        "agent/tools/shell_safety.py",
+        '    for pat, why in _CODE_SECRET_READ:',
+        '    for pat, why in []:  # mutated: 拼接读 .env 的形态放行',
+        "tests/test_audit9_fixes.py::test_inline_code_cannot_concat_read_secret_file",
+    ),
+    (
+        "M110 密钥名子串判定撤掉（KEY_ID 类命名漏出）",
+        "agent/core/redact.py",
+        "    return any(word in up for word in SECRET_NAME_SUBSTRINGS)",
+        "    return False  # mutated: 只认末段词，AWS_ACCESS_KEY_ID 原样外流",
+        "tests/test_audit9_fixes.py::test_mask_covers_midword_secret_names_and_dict_repr",
+    ),
+    (
+        "M111 Runner 展开只剥一层（超深包装正文不再扫描）",
+        "agent/tools/shell_safety.py",
+        "            queue.append(payload)",
+        "            continue  # mutated: 不再深入展开，第 2 层起包装正文永远进不了扫描",
+        "tests/test_audit9_fixes.py::test_runner_nesting_beyond_old_depth_cap_is_blocked",
+    ),
+    # ---------------- 第九轮审计（2026-11-04）：配置层 ----------------
+    (
+        "M112 配置不完整的站照常派工（broken 标记不参与跳过判定）",
+        "agent/core/orchestrator.py",
+        """        p = self.profiles.get(name)
+        if p is not None and getattr(p, "broken", ""):
+            return f"配置不完整（{p.broken}）\"""",
+        """        p = self.profiles.get(name)
+        if p is not None and False:  # mutated: 空端点站照常派工，必败请求污染健康档案
+            return f"配置不完整（{p.broken}）\"""",
+        "tests/test_audit9_fixes.py::test_broken_worker_is_not_dispatched_and_health_says_so",
+    ),
+    (
+        "M113 非有限数值配置崩启动（int(inf) 的 OverflowError 不接）",
+        "agent/config.py",
+        "        except (TypeError, ValueError, OverflowError):",
+        "        except (TypeError, ValueError):  # mutated: inf 走 OverflowError 直接炸",
+        "tests/test_audit9_fixes.py::test_numeric_config_rejects_nonfinite",
+    ),
+    # ---------------- 第九轮审计（2026-11-04）：协作内核 ----------------
+    (
+        "M114 重试链不整体记在飞（退避间隙被回收即关连接池）",
+        "agent/core/llm.py",
+        """        self._enter_call()
+        try:
+            yield self""",
+        """        try:
+            yield self  # mutated: 重试链不记在飞，close_when_idle 当场关""",
+        "tests/test_audit9_fixes.py::test_call_span_defers_close_until_chain_ends",
+    ),
+    (
+        "M115 健康档案并盘不验 disabled 类型（混型 TypeError 吞隔离）",
+        "agent/core/health.py",
+        """                days = [
+                    d
+                    for d in (entry.get("disabled"), mine.get("disabled"))
+                    if isinstance(d, str) and d
+                ]""",
+        """                days = [d for d in (entry.get("disabled"), mine.get("disabled")) if d]  # mutated: min() 混型抛 TypeError""",
+        "tests/test_audit9_fixes.py::test_health_merge_tolerates_nonstring_disabled",
+    ),
+    (
+        "M116 叠加层写前不重读（并发进程整篇互相覆盖）",
+        "agent/core/node_discovery.py",
+        "            disk = load_overlay(self.overlay_path)",
+        "            disk = {}  # mutated: 不重读盘，其它站的增量被整篇抹掉",
+        "tests/test_audit9_fixes.py::test_run_once_merges_into_overlay_written_by_another_process",
+    ),
+    (
+        "M117 探测一人一线程（池大时线程爆炸）",
+        "agent/core/latency.py",
+        "        slots = max(1, min(self._concurrency, len(names_unique)))",
+        "        slots = len(names_unique)  # mutated: 一人一线程",
+        "tests/test_audit9_fixes.py::test_probe_round_uses_bounded_threads",
+    ),
+    (
+        "M118 整体限时不算回退链（回退中的工人被误判超时）",
+        "agent/core/parallelism.py",
+        '        chain = 1 + max(0, int(getattr(self, "_fallback_models", 0) or 0))',
+        "        chain = 1  # mutated: 只按单模型重试链折算",
+        "tests/test_audit_fixes.py::test_effective_timeout_scales_with_batches_and_respects_explicit",
+    ),
+    (
+        "M119 延迟裁剪浮点截断差一位（ratio=0.8/n=5 完全不裁）",
+        "agent/core/latency.py",
+        "        drop = math.floor(len(ordered) * (1.0 - self._latency_keep_ratio) + 1e-9)",
+        "        drop = int(len(ordered) * (1.0 - self._latency_keep_ratio))  # mutated: 截断差一位",
+        "tests/test_audit9_fixes.py::test_keep_ratio_integer_boundary_not_lost",
     ),
 ]
 

@@ -292,6 +292,45 @@ def _reconcile(registry_line: str, live: list[FreeModel], adapter: Adapter | Non
     return {"added": added, "retired": retired}
 
 
+def _delta_signature(d: Any) -> tuple[frozenset, frozenset]:
+    """增量的集合签名：added / retired 各自按 bare 名取 frozenset。
+
+    为什么要"集合比较"而不是 list 相等（2026-11-04 审计 P2）：added 的顺序跟远端清单
+    顺序走、retired 来自 set 迭代（跨进程 hash 种子不同则顺序不同）——远端只是顺序抖动
+    一下，list 比较就判"有变化"，叠加层被整篇重写、sync_free_nodes 白跑。集合相同
+    就不算变化。
+    """
+    if not isinstance(d, dict):
+        return frozenset(), frozenset()
+    return (
+        frozenset(_bare(a).lstrip("#") for a in d.get("added") or []),
+        frozenset(_bare(r).lstrip("#") for r in d.get("retired") or []),
+    )
+
+
+def _merge_deltas(prev: Any, delta: dict) -> dict:
+    """把本轮增量合并进盘上已有增量：added 保序取并集，retired 排序取并集。
+
+    服务跨进程写前重读（见 run_once）：两个进程各自 load→改→save 全文时，后写者
+    必须把先写者的**其它站增量**原样保留；同一站两轮结果合并时取并集（幂等）。
+    retired 存为有序列表（排序后跨进程稳定），比较走 _delta_signature 不受顺序影响。
+    """
+    base = prev if isinstance(prev, dict) else {}
+    added: list[str] = []
+    seen: set[str] = set()
+    for a in list(base.get("added") or []) + list(delta.get("added") or []):
+        bare = _bare(a).lstrip("#")
+        if bare in seen:
+            continue
+        seen.add(bare)
+        added.append(a)
+    retired = sorted(
+        {_bare(r).lstrip("#") for r in base.get("retired") or []}
+        | {_bare(r).lstrip("#") for r in delta.get("retired") or []}
+    )
+    return {"added": added, "retired": retired}
+
+
 class FreeNodeDiscoverer:
     """按站挂适配器，拉在线免费清单并与 registry 对账，写叠加层。
 
@@ -337,11 +376,18 @@ class FreeNodeDiscoverer:
             return (self._clock() - self._last_start) >= self._interval
 
     def maybe_start(self) -> bool:
-        """到期且无在飞 ⇒ 起守护线程跑一轮；返回是否真起了（调用方不等待）。"""
-        if not self.enabled() or not self.due():
+        """到期且无在飞 ⇒ 起守护线程跑一轮；返回是否真起了（调用方不等待）。
+
+        到期判定与占位在**同一次持锁**内完成（2026-11-04 审计）：旧写法 due() 与占位
+        分两次取锁，中间若被手动 refresh_now 插队跑完一轮（_last_start 已刷新），这里
+        只复查 _running、不复查周期 ⇒ 立刻又起一轮冗余自动发现（多打一次网络）。
+        """
+        if not self.enabled():
             return False
         with self._lock:
-            if self._running:
+            if self._running or self._interval <= 0:
+                return False
+            if (self._clock() - self._last_start) < self._interval:
                 return False
             self._running = True
             self._last_start = self._clock()
@@ -383,11 +429,19 @@ class FreeNodeDiscoverer:
         return by_env
 
     def run_once(self, clock: Any = None) -> dict:
-        """同步跑一轮发现：逐站拉取 → 对账 → 写叠加层。返回摘要（不含密钥）。"""
+        """同步跑一轮发现：逐站拉取 → 对账 → 写叠加层。返回摘要（不含密钥）。
+
+        写叠加层前**重读磁盘再合并**（2026-11-04 审计 P1）：进程内互斥由 _round_lock
+        保证，但每个 `mao call` 都会建池起发现轮——两个进程并发时各自以旧 overlay 为
+        基底整篇 save，后写者会把先写者**另一站**的增量整段抹掉（跨进程 lost update，
+        与 health/registry 已实现的写前重读同源，唯独这条写路径曾漏掉）。修法与
+        ledger 同思路：save 前重读、按站合并（added/retired 取并集）、集合签名没变
+        就不写。
+        """
         targets = self._targets()
-        overlay = load_overlay(self.overlay_path)
         registry = load_model_registry(self.cfg.model_registry_path)
         report: dict[str, Any] = {"stations": {}, "updated": False}
+        deltas: dict[str, dict] = {}
         for env_var, info in targets.items():
             adapter = self.adapters.get(info["discovery"])
             if adapter is None:
@@ -409,19 +463,22 @@ class FreeNodeDiscoverer:
             if not live:
                 report["stations"][env_var] = {"status": "skip", "reason": "no_valid_models"}
                 continue
-            delta = _reconcile(registry_line, live, adapter)
-            prev = overlay.get(env_var)
-            if prev != delta:
-                overlay[env_var] = delta
-                report["updated"] = True
+            deltas[env_var] = _reconcile(registry_line, live, adapter)
             report["stations"][env_var] = {
                 "status": "ok",
                 "live": len({m.model for m in live}),
-                "added": delta["added"],
-                "retired": delta["retired"],
+                "added": deltas[env_var]["added"],
+                "retired": deltas[env_var]["retired"],
             }
-        if report["updated"]:
-            save_overlay(self.overlay_path, overlay)
+        if deltas:
+            disk = load_overlay(self.overlay_path)
+            for env_var, delta in deltas.items():
+                merged = _merge_deltas(disk.get(env_var), delta)
+                if _delta_signature(merged) != _delta_signature(disk.get(env_var)):
+                    disk[env_var] = merged
+                    report["updated"] = True
+            if report["updated"]:
+                save_overlay(self.overlay_path, disk)
         return report
 
     def refresh_now(self) -> dict:

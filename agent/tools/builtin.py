@@ -26,7 +26,10 @@ import time
 from pathlib import Path
 
 from ..config import ROOT, Config  # 统一从 config 拿 ROOT，避免多处重复定义漂移
-from ..core.constants import SECRET_NAME_TAILS  # 凭据词表：与 redact 共用同一份
+from ..core.constants import (  # 凭据词表：与 redact 共用同一份
+    SECRET_NAME_SUBSTRINGS,
+    SECRET_NAME_TAILS,
+)
 from ..core.redact import mask_secrets, safe_error_text
 from .base import FunctionTool, ToolRegistry, ToolResult
 from .shell_safety import (  # shell 命令安全扫描，独立模块见 shell_safety.py
@@ -49,6 +52,8 @@ MAX_WRITE_BYTES = 1024 * 1024  # write_file / append_file 单次最多写 1MB，
 BACKUP_DIR = ROOT / "data" / "backup"  # 覆盖写前的自动留档目录（可回滚）
 BACKUP_KEEP_DAYS = 30  # 留档保留天数，超期惰性清理
 MAX_BACKUP_BYTES = 1024 * 1024  # 超过该大小不做留档（避免大文件反复整份复制）
+MAX_BACKUP_FILES = 300  # 留档目录文件数上限：高频覆盖场景每个 .bak 都不重名，
+MAX_BACKUP_TOTAL_BYTES = 256 * 1024 * 1024  # 30 天内可无限堆积，这里按总量兜底
 
 
 def _shell_flavor() -> str:
@@ -108,18 +113,21 @@ def _child_env() -> dict[str, str]:
     任意 MCP 宿主，且工具输出根本不过 `redact.py` —— 一条 `set` 就能把这台机器的全部
     API key 打包带走（实测子进程确实能看到 `NODE_A_KEY`）。命令黑名单声明过"不是沙箱"，
     但"能执行命令"和"能顺手抄走凭据"是两回事。
-    只按名字判断（词表见 core/constants.SECRET_NAME_TAILS，与 redact 脱敏共用一份）：
-    两种命名都要拦——分段式（`NODE_A_KEY` → 末段 `KEY`）与紧凑式（`MYKEY` / `GHTOKEN` /
-    `OPENAIKEY` → 整名以密钥词结尾）。紧凑式若只看"末段等于词表"会整类漏掉，而 `.env` 由人
-    维护，加一行这种写法完全可能。
-    这里刻意**宁严勿漏**：误剔一个同尾词（如 `MONKEY`）只是子进程少一个无关变量，
-    漏掉一个密钥则是把整机凭据交给工具输出（展示侧脱敏另按更保守口径，见 redact.py）。
+    只按名字判断（词表见 core/constants 的 SECRET_NAME_TAILS / SECRET_NAME_SUBSTRINGS，
+    与 redact 脱敏共用一份）：三种命名都要拦——
+    - 分段式（`NODE_A_KEY` → 末段 `KEY`）；
+    - 紧凑式（`MYKEY` / `GHTOKEN` / `OPENAIKEY` → 整名以密钥词结尾）；
+    - 中段式（`AWS_ACCESS_KEY_ID` / `AUTH_TOKEN_V2` / `CREDENTIALS` → 密钥词在名字
+      中段、末段是 ID/V2/S 这类后缀）。2026-11-04 审计实测第三类整类漏掉，
+      一条 `set`/`env` 就能把值原样带进工具输出，故补子串级判定。
+    这里刻意**宁严勿漏**：误剔一个同形词（如 `MONKEY`）只是子进程少一个无关变量，
+    漏掉一个密钥则是把整机凭据交给工具输出（展示侧脱敏现已同口径，见 redact.py）。
     """
     out: dict[str, str] = {}
     for k, v in os.environ.items():
         name = k.upper()
         if name.rsplit("_", 1)[-1] in SECRET_NAME_TAILS or any(
-            name.endswith(tail) for tail in SECRET_NAME_TAILS
+            word in name for word in SECRET_NAME_SUBSTRINGS
         ):
             continue
         out[k] = v
@@ -205,12 +213,43 @@ def _resolve(p: str) -> Path | None:
 
 
 def _purge_old_backups() -> None:
-    """清掉超过保留期的留档（惰性调用，不额外起线程）。"""
+    """清理留档目录（惰性调用，不额外起线程）。
+
+    三道闸按序执行：① 超过保留期（30 天）的删掉；② 仍超文件数/总字节上限时，
+    按 mtime 从最旧开始删到限额以内。旧实现只有第①道且**只在下一次覆盖写时触发**
+    ——系统长期不覆盖文件时过期留档（含历史明文 .env 备份）会无限期躺着
+    （实测 43 天未清）。除"每次覆盖写"外，build_builtin_tools 建池时也调一次，
+    让清理不依赖"恰好又有覆盖写"这个低频事件。
+    """
     try:
+        if not BACKUP_DIR.is_dir():
+            return
         cutoff = time.time() - BACKUP_KEEP_DAYS * 86400
-        for stale in BACKUP_DIR.glob("*.bak"):
-            if stale.stat().st_mtime < cutoff:
-                stale.unlink(missing_ok=True)
+        kept: list[tuple[float, Path]] = []
+        total = 0
+        for p in BACKUP_DIR.glob("*.bak"):
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                p.unlink(missing_ok=True)
+                continue
+            kept.append((mtime, p))
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        if len(kept) <= MAX_BACKUP_FILES and total <= MAX_BACKUP_TOTAL_BYTES:
+            return
+        kept.sort()  # 最旧的先删
+        while kept and (len(kept) > MAX_BACKUP_FILES or total > MAX_BACKUP_TOTAL_BYTES):
+            _mtime, p = kept.pop(0)
+            try:
+                total -= p.stat().st_size
+            except OSError:
+                pass
+            p.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -275,6 +314,7 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
     - run_shell 前置安全检查（shell_safety._check_command_safety）。
     """
     set_workspace_roots(cfg.workspace)  # 允许访问的根：MAO 项目根 + tools.workspace
+    _purge_old_backups()  # 建池时顺手清一次过期留档：清理不再依赖"恰好又有覆盖写"
     registry = ToolRegistry()
     timeout = cfg.shell_timeout
 
@@ -401,8 +441,12 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
         except (TypeError, ValueError):
             limit = DEFAULT_READ_LIMIT
         # 按字节限量读取（只读头部，不全量载入内存）：防超长单行/超大文件把内存和上下文塞爆
-        with p.open("rb") as f:
-            raw = f.read(MAX_READ_BYTES + 1)
+        try:
+            with p.open("rb") as f:
+                raw = f.read(MAX_READ_BYTES + 1)
+        except OSError as e:
+            # 本地兜底而不是逃到注册表通用兜底：外层只能给"工具执行出错"，这里给人话
+            return ToolResult(f"错误：读取失败：{safe_error_text(e)}", ok=False)
         truncated_bytes = len(raw) > MAX_READ_BYTES
         raw = raw[:MAX_READ_BYTES]
         text = raw.decode("utf-8", errors="replace")
@@ -436,8 +480,16 @@ def build_builtin_tools(cfg: Config) -> ToolRegistry:
                 f"错误：写入内容超过 {MAX_WRITE_BYTES}B，拒绝写入（防误操作占满磁盘）", ok=False
             )
         backup = _backup_before_overwrite(p)  # 覆盖前留档，保证可回滚
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        except OSError as e:
+            # 留档可能已经发生：必须把留档路径带出来，否则外部主以为没备份、
+            # 想回滚时找不到那份原文件
+            msg = f"错误：写入失败：{safe_error_text(e)}"
+            if backup:
+                msg += f"（原文件已留档到 {backup}，可从那里复制恢复）"
+            return ToolResult(msg, ok=False)
         if backup:
             return f"已写入 {p}（原文件已留档到 {backup}，需要回滚时直接复制回来）"
         return f"已写入 {p}"

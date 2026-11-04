@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-from .constants import SECRET_NAME_TAILS
+from .constants import SECRET_NAME_SUBSTRINGS, SECRET_NAME_TAILS
 
 # URL 的 query 段：凭证最常藏在这里（?key=… / ?api_key=…）
 _URL_QUERY = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+?\?[^\s'\"<>]*")
@@ -19,29 +19,40 @@ _URL_QUERY = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+?\?[^\s'\"<>]*")
 # 规则要求有 `?` 才命中，无 query 的端点串会整段原样外流（异常文案里回显请求 URL 正是
 # 这条通道的主要来源）。只抹 `scheme://` 到第一个 `@` 之间的部分，host/path 保留——
 # 排障要看的恰恰是 host。没有 `@` 的正常 URL 不命中（字符类里排除了 `/`）。
-_URL_USERINFO = re.compile(r"((?:https?|wss?)://)[^\s'\"<>/?@]+@([^\s'\"<>/@]+)")
-# 成对的「变量名 = 值」形态：名字必须以密钥词结尾（KEY/TOKEN/SECRET/PASSWORD/…），
-# 且只在该词是**独立一段**时才算密钥 —— 旧写法用 `\b(key|token|...)=` 匹配，
-# `NODE_A_KEY=sk-xxx`、`CF_API_TOKEN=yyy` 这类下划线后缀名一个都不命中（`_` 与 `K`
-# 之间没有词边界），而本项目的池 key 恰恰全是这种命名。`MONKEY=3` 不该被误抹。
-# 值本身若形如 sk-/Bearer，即使名字没命中也会被上面的规则抹掉（双重兜底）。
+# 2026-11-04 审计：scheme 不再限定 http(s)/ws(s)——`postgres://u:p@h/db`、
+# `redis://:p@h` 这类连接串里的密码同样会进错误文案，放行等于漏抹。
+_URL_USERINFO = re.compile(
+    r"([A-Za-z][A-Za-z0-9+.\-]*://)[^\s'\"<>/?@]+@([^\s'\"<>/@]+)"
+)
+# 成对的「变量名 = 值」形态：名字须含密钥词（KEY/TOKEN/SECRET/…，见 _is_secret_name），
+# 且只在该词是**独立一段**或带常见后缀（KEY_ID/TOKEN_V2/CREDENTIALS）时才算密钥。
+# 旧写法有两类漏网（2026-11-04 审计）：① 名字里密钥词后面还跟着后缀（`..._KEY_ID=`），
+# 正则要求密钥词紧跟 `=`，一个都不命中；② Python dict / JSON repr 形态
+# （`'NODE_A_KEY': 'xxx'`），名字与 `:` 之间隔着引号。两类都已在下面修正：
+# 名字允许带后缀、分隔符允许夹一对引号。`MONKEY=3` 这类同形词现在也会被抹——
+# 漏抹的代价是凭据进第三方上下文，误抹只是少看一段调试文本（宁严勿漏）。
 _SECRET_KV = re.compile(
-    r"(?i)\b([A-Za-z0-9_\-]*(?:api[ _\-]?key|key|token|secret|password|passwd|credential))"
-    r"(\s*[=:]\s*)([^\s&'\",;]+)"
+    r"(?i)\b([A-Za-z0-9_\-]*(?:api[ _\-]?key|key|token|secret|password|passwd|credential)[a-z0-9_\-]*)"
+    r"(\s*['\"]?\s*[=:]\s*['\"]?)"
+    r"([^\s&'\",;]+)"
 )
 
 
 def _is_secret_name(name: str) -> bool:
-    """分段命名（`NODE_A_KEY` / `CF_API_TOKEN`）的末段是否密钥词。
+    """该变量名是否密钥形态（末段是密钥词，或密钥词出现在名字中段/带后缀）。
 
-    只按末段判、不按整名后缀判：`MONKEY=3` 这种同尾词若也抹，就把正常正文里的
-    KV 抹成****（对外文案的口径是"宁可少抹也不误伤"）；紧凑写法（`MYKEY=` /
-    `GHTOKEN=`）在异常文案里几乎不出现，真出现时值本身通常形如 sk-/Bearer，
-    会被上面两条规则抹掉。子进程 env 通道另有更保守的判定（builtin._child_env
-    同时看末段与后缀），因为那条路"误剔一个无关变量"的代价远小于"抄走凭据"。
+    两级判定（2026-11-04 审计从"只按末段"放宽）：
+    1) 末段 ∈ SECRET_NAME_TAILS：`NODE_A_KEY` → `KEY`、`MYKEY` 紧凑式经后缀判定命中；
+    2) 密钥词作为**子串**出现在名字里（SECRET_NAME_SUBSTRINGS）：兜住
+       `AWS_ACCESS_KEY_ID` / `AUTH_TOKEN_V2` / `CREDENTIALS` 这类词不在末尾的命名。
+    代价：MONKEY 这类同形词会被误抹。旧口径为"对外文案宁可少抹不误伤"只按末段判，
+    但实测漏掉的恰是真实密钥命名（子进程 env 通道早就用了更严的口径），两道口子
+    必须同严：漏抹一次就是把凭据送进第三方上下文，误抹只是少看一段调试文本。
     """
     up = name.upper().replace("-", "_").replace(" ", "_")
-    return up.rsplit("_", 1)[-1] in SECRET_NAME_TAILS
+    if up.rsplit("_", 1)[-1] in SECRET_NAME_TAILS:
+        return True
+    return any(word in up for word in SECRET_NAME_SUBSTRINGS)
 
 
 def _mask_secret_kv(m: re.Match) -> str:

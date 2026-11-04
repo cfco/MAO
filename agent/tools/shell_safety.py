@@ -65,6 +65,11 @@ _EXE_SUFFIXES = (".exe", ".com")
 # 于是 `echo a>nul` + 换行 + `del /f /q x` 的首词只会是 echo，整条黑名单被绕过（实测放行）。
 _CMD_SEPARATOR = re.compile(r"&&|\|\||[&|;\r\n]")
 
+# Runner 展开的总量预算（见 _unwrap_runners）：正常命令的嵌套不超过两三层，
+# 离预算差几个数量级；只有刻意构造的超深包装才会触顶，触顶即整条拒绝（宁可误拦）。
+_RUNNER_SCAN_CHAR_BUDGET = 65536
+_RUNNER_MAX_TEXTS = 64
+
 # PowerShell 危险命令（带破坏性参数才拦）
 _PS_DANGEROUS = [
     (r"Remove-Item\s+.*-Recurse\s+-Force", "PowerShell: Remove-Item -Recurse -Force（递归强删）"),
@@ -121,13 +126,16 @@ def _mask_quoted(command: str) -> str:
     return _QUOTED_RE.sub(lambda m: "\x00" * len(m.group()), command)
 
 
-# shell 重定向操作符：> >> < 2> 2>> 1> &> 等，后跟目标文件名。
+# shell 重定向操作符：> >> < 2> 2>> 1> &> >| <> 等，后跟目标文件名。
 # 用于检测「echo x > ..\..\etc\passwd」这类通过重定向绕过 cwd 限制的写越界。
 # 目标捕获：引号包裹的串 或 不含空白/特殊符号的 token。
+# `>|`（POSIX clobber 强制覆盖）必须单列：旧写法的操作符表只有 >> > <，而目标字符类
+# 排除了 `|`，于是 `echo x >| /etc/evil` 整条 match 失败、越界检查一次都不进（实测放行）。
+# `<>`（读写打开）同理补上。
 _REDIRECT_RE = re.compile(
     r"(?<![<>=!])"  # 排除 => / >= / -> 这类比较与箭头运算符粘在操作符前的写法
     r"(?:\d*&?)?"  # 可选 fd 前缀：1/2/&（1>, 2>>, &>）
-    r"(?:>>|>|<)"  # 操作符：>> 优先于 > 匹配
+    r"(?:>>|>\||<>|>|<)"  # 操作符：长操作符优先匹配（>> 先于 >、>| 先于 >）
     r"\s*"
     r"(\"[^\"]*\"|'[^']*'|[^\s&|<>]+)"  # 目标：引号串 或 非特殊 token
 )
@@ -235,28 +243,44 @@ def _head_word(segment: str) -> str:
     return _norm_head(parts[0]) if parts else ""
 
 
-def _unwrap_runners(command: str, _depth: int = 0) -> list[str]:
-    """把命令连同**每一层 Runner 包装的正文**一起展开（深度限 4 层）。
+def _unwrap_runners(command: str) -> list[str] | None:
+    """把命令连同**每一层 Runner 包装的正文**一起展开（迭代、带总量预算）。
 
     Runner = `cmd /c`、`cmd.exe /k`、`%COMSPEC% /c`、`sh/bash/zsh/dash/ksh -c`。它们的
     破坏动作都藏在正文里，展开一次就等于给内层再走一遍全部扫描（危险词、内联代码、
-    重定向越界）。递归而非"只剥一层"的理由见 _wrapped_payload。
+    重定向越界）。迭代而非"只剥一层"的理由见 _wrapped_payload。
+
+    为什么改为迭代 + 预算（2026-11-04 审计）：旧实现递归且深度硬限 4 层，第 5 层起的
+    正文不再展开，`cmd /c ` ×5 + `del /f /q x` 的 del 永远进不了 heads——深度上限
+    成了可复现的绕过点。但完全不设限也不行：极端嵌套会做 O(n²) 次分词。正文每剥一层
+    严格变短（丢掉 runner 头与开关），递归天然会终止，所以用「展开文本数 + 累计字符
+    预算」代替层数上限；预算耗尽返回 None，调用方**整条拒绝**（宁可误拦也不放行），
+    正常命令离预算差几个数量级，不受影响。
     """
     out = [command]
-    if _depth >= 4:
-        return out
-    for seg in _CMD_SEPARATOR.split(command):
-        if _head_word(seg) not in _RUNNER_HEADS:
-            continue
-        # cmd 执行前会还原 `^` 转义，正文里留着转义符就扫不到真实命令词
-        payload = _wrapped_payload(_split_tokens(seg.strip())).replace("^", "")
-        if payload:
-            out.extend(_unwrap_runners(payload, _depth + 1))
+    seen_chars = len(command)
+    queue = [command]
+    while queue:
+        text = queue.pop(0)
+        for seg in _CMD_SEPARATOR.split(text):
+            if _head_word(seg) not in _RUNNER_HEADS:
+                continue
+            # cmd 执行前会还原 `^` 转义，正文里留着转义符就扫不到真实命令词
+            payload = _wrapped_payload(_split_tokens(seg.strip())).replace("^", "")
+            if not payload:
+                continue
+            out.append(payload)
+            seen_chars += len(payload)
+            if seen_chars > _RUNNER_SCAN_CHAR_BUDGET or len(out) > _RUNNER_MAX_TEXTS:
+                return None
+            queue.append(payload)
     return out
 
 
-def _command_heads(command: str) -> list[str]:
+def _command_heads(command: str) -> list[str] | None:
     """把命令按 shell 分隔符切段，返回每段"实际被执行"的命令词（全部要查）。
+
+    Runner 展开超预算时返回 None：调用方必须整条拒绝（防绕过，见 _unwrap_runners）。
 
     只查整条命令的首词会漏掉串联在后面的危险命令：`echo x & del /s y` 的
     首词是 echo，但真正执行删除的是 del。`&&`/`||` 已被注入模式拦下，
@@ -267,8 +291,11 @@ def _command_heads(command: str) -> list[str]:
     - xargs / find 的目标命令（_runner_targets）；
     - Runner 包装正文里的命令词（_unwrap_runners 展开后各自再切段一次）。
     """
+    texts = _unwrap_runners(command)
+    if texts is None:
+        return None
     words: list[str] = []
-    for text in _unwrap_runners(command):
+    for text in texts:
         for seg in _CMD_SEPARATOR.split(text):
             head = _head_word(seg)
             if head:
@@ -469,6 +496,30 @@ _CODE_HIGH_RISK = [
 # 代码里以引号包裹的"内嵌 shell 命令串"（os.system('del ...') 等）
 _EMBEDDED_Q = re.compile(r"'([^']*)'|\"([^\"]*)\"")
 
+# 内联代码里"读文件再编码外带"的形态（2026-11-04 审计）：`open('.en'+'v')` 靠字符串
+# 拼接绕过 .env 文件名识别，再 base64 让输出掩码失效——三层凭据防护被一条命令穿透。
+# 只在代码正文里查（不查普通 shell 命令）：正常开发代码极少在 open() 参数里拼字符串。
+_CODE_SECRET_READ = [
+    # open() / readFileSync 参数里出现"字符串字面量 + 拼接"：拼路径读密钥文件的典型写法
+    (
+        re.compile(r"\bopen\s*\([^)]*['\"][^'\"]*['\"]\s*\+"),
+        "open() 参数含字符串拼接（疑似拼出密钥文件名）",
+    ),
+    (
+        re.compile(r"\bopen\s*\([^)]*\+\s*['\"]"),
+        "open() 参数含字符串拼接（疑似拼出密钥文件名）",
+    ),
+    (
+        re.compile(r"\breadFile(?:Sync)?\s*\([^)]*\+"),
+        "Node readFile 参数含字符串拼接",
+    ),
+    # 短字面量拼接出 ".env" 的碎片形态：'.en'+'v'、'.'+'env'、".en" +"v"
+    (
+        re.compile(r"['\"]\.en['\"]|['\"]\.['\"]\s*\+\s*['\"]env|['\"]env['\"]\s*\+"),
+        "字符串字面量疑似 .env 的拆分拼接",
+    ),
+]
+
 
 def _split_tokens(command: str) -> list[str]:
     """把命令拆成参数列表；**全模块唯一的 shlex 入口**，失败（引号不闭合等 ValueError）返回空列表。
@@ -502,22 +553,38 @@ def _extract_inline_code(tokens: list[str]) -> tuple[str | None, str]:
 
 def _scan_code_body(body: str) -> str | None:
     """扫描"代码正文 / 内联脚本"里的破坏性内容：PS 模式、危险命令首词、
-    高危 API、内嵌 shell 命令、重定向越界。命中返回拦截说明，安全返回 None。
+    高危 API、密钥文件拼接读取、内嵌 shell 命令、重定向越界。
+    命中返回拦截说明，安全返回 None。
     """
     if not body or not body.strip():
         return None
     for pat, desc in _PS_PATTERNS:
         if pat.search(body):
             return f"命令拦截：{desc}"
-    for h in _command_heads(body):
+    heads = _command_heads(body)
+    if heads is None:
+        return "命令拦截：Runner 包装嵌套过深，已拒绝（防绕过黑名单）"
+    for h in heads:
         if _is_dangerous_word(h):
             return f"命令拦截：检测到危险命令 `{h}`"
     for pat, why in _CODE_HIGH_RISK:
         if re.search(pat, body):
             return f"命令拦截：内联代码调用了 `{why}`（不可逆或绕过黑名单）"
+    for pat, why in _CODE_SECRET_READ:
+        if pat.search(body):
+            return f"命令拦截：内联代码疑似拼接读取密钥文件（{why}），已拒绝"
+    # 编码外带兜底：同一正文里既 open() 读文件又用 base64/codecs 编码，读什么已不重要
+    # ——这是"读出来再编码绕过输出掩码"的固定组合，宁严勿漏。
+    if re.search(r"\bopen\s*\(", body) and re.search(
+        r"\bbase64\b|\bcodecs\b|\bbinascii\b|b64encode|b64encodeSync", body
+    ):
+        return "命令拦截：内联代码读文件后做 base64/codecs 编码（疑似绕过输出掩码外带），已拒绝"
     for m in _EMBEDDED_Q.finditer(body):
         inner = m.group(1) or m.group(2) or ""
-        for h in _command_heads(inner):
+        inner_heads = _command_heads(inner)
+        if inner_heads is None:
+            return "命令拦截：Runner 包装嵌套过深，已拒绝（防绕过黑名单）"
+        for h in inner_heads:
             if _is_dangerous_word(h):
                 return f"命令拦截：内联代码里嵌了危险命令 `{h}`"
     danger = _check_redirect_targets(body)
@@ -582,11 +649,42 @@ def _check_command_safety(command: str) -> str | None:
     if ps_enc:
         return ps_enc
 
-    # ---- 2. 危险命令匹配 ----
+    # ---- 2. 危险命令匹配（无条件、对全部 heads）----
+    # 2026-11-04 审计 P0：旧写法按"heads 里出现 powershell 就走 PS 分支"分流，
+    # else 分支里的首词黑名单与内联扫描被整体跳过——`del /f /q x & powershell -c "1"`
+    # 的 del 排在 PS 段之前，既不在 body 里、也不再被检查，黑名单形同虚设（实测放行）。
+    # 修法：首词黑名单与内联代码扫描对**所有** heads 无条件执行；PS 分支只保留
+    # "额外扫 -Command 正文"这一层增量防护。
     heads = _command_heads(stripped)
+    if heads is None:
+        return "命令拦截：Runner 包装嵌套过深，已拒绝（防绕过黑名单）"
+    # 用 _ALL_DANGEROUS_SET（Windows + POSIX 合并）而非只看 Windows 词表：
+    # Linux 上 rm/mkfs/dd 是原生命令，顶层放行与工具描述的拦截声明相悖
+    # （2026-10-22 实测顶层 `rm -rf /` 直过；两边词表合并后 Windows 侧
+    # 只是多认几个 Git-Bash/WSL 里可能出现的词，正常开发命令不受影响）。
+    for h in heads:
+        if _is_dangerous_word(h):
+            return f"命令拦截：检测到危险命令 `{h}`"
 
+    # ---- 3. 解释器内联代码扫描（无条件）----
+    # #5：python -c / node -e / perl -e 等"解释器 + 内联代码"绕过点——
+    # 首词是解释器、破坏藏在正文里，这里对正文再扫一遍。逐层展开 Runner 包装，
+    # 否则 `cmd /c "python -c …"` 的外层词是 cmd，内联正文永远进不了这条扫描。
+    texts = _unwrap_runners(stripped)
+    if texts is None:
+        return "命令拦截：Runner 包装嵌套过深，已拒绝（防绕过黑名单）"
+    for text in texts:
+        _interp, code = _extract_inline_code(_split_tokens(text))
+        if code:
+            danger = _scan_code_body(code)
+            if danger:
+                return danger
+
+    # ---- 4. PowerShell -Command 正文额外扫描（增量防护）----
     # 按"任意一段的命令词"识别 PowerShell，而不是只看 heads[0]：`cmd /c powershell -c …`
-    # 的外层词是 cmd，只看首词会让 PS 正文整段不扫。
+    # 的外层词是 cmd，只看首词会让 PS 正文整段不扫。上面的通用扫描已经覆盖危险首词
+    # 与内联解释器，这里补的是 PS 危险模式（Remove-Item -Force / iex / …）与 -Command
+    # 后的正文本身。
     if any(h in ("powershell", "pwsh") for h in heads):
         # PowerShell 模式：跳过 powershell.exe [-nop] [-command] 包裹，检查 -Command 后的正文
         tokens = _split_tokens(stripped) or [stripped]
@@ -602,24 +700,6 @@ def _check_command_safety(command: str) -> str | None:
         danger = _scan_code_body(body)
         if danger:
             return danger
-    else:
-        # cmd 或裸命令：按每段"实际执行的命令词"判定（路径/包装/后缀已归一）。
-        # 用 _ALL_DANGEROUS_SET（Windows + POSIX 合并）而非只看 Windows 词表：
-        # Linux 上 rm/mkfs/dd 是原生命令，顶层放行与工具描述的拦截声明相悖
-        # （2026-10-22 实测顶层 `rm -rf /` 直过；两边词表合并后 Windows 侧
-        # 只是多认几个 Git-Bash/WSL 里可能出现的词，正常开发命令不受影响）。
-        for h in heads:
-            if _is_dangerous_word(h):
-                return f"命令拦截：检测到危险命令 `{h}`"
-        # #5：python -c / node -e / perl -e 等"解释器 + 内联代码"绕过点——
-        # 首词是解释器、破坏藏在正文里，这里对正文再扫一遍。逐层展开 Runner 包装，
-        # 否则 `cmd /c "python -c …"` 的外层词是 cmd，内联正文永远进不了这条扫描。
-        for text in _unwrap_runners(stripped):
-            _interp, code = _extract_inline_code(_split_tokens(text))
-            if code:
-                danger = _scan_code_body(code)
-                if danger:
-                    return danger
 
     return None
 

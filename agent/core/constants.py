@@ -39,3 +39,9 @@ VOTER_SYSTEM = (
 SECRET_NAME_TAILS = frozenset(
     {"KEY", "APIKEY", "TOKEN", "APITOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"}
 )
+# 子串级判定词表（2026-11-04 审计新增）：密钥词出现在名字**中段**也算密钥形态——
+# `AWS_ACCESS_KEY_ID` / `AUTH_TOKEN_V2` / `CREDENTIALS` 这类命名，末段（ID/V2/S）
+# 不在词表里，旧口径整类漏掉，一条 `set`/`env` 就能把值原样带走。
+# 代价是 MONKEY 这类同形词会被一起判成密钥：展示侧误抹只损失一段调试文本，
+# 子进程侧误剔只少一个无关变量，而漏掉一个是把整机凭据交出去——两侧都宁严勿漏。
+SECRET_NAME_SUBSTRINGS = frozenset({"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"})

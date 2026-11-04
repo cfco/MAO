@@ -267,15 +267,19 @@ class WorkerPool(
         for name, p in self.profiles.items():
             until = untils.get(name, 0.0)
             quarantined = self.health.quarantined(name)
+            broken = getattr(p, "broken", "")
             out.append(
                 {
                     "worker": name,
                     "model": p.model,
                     "tags": getattr(p, "tags", ""),
-                    "available": until <= now and not quarantined,
+                    "available": until <= now and not quarantined and not broken,
                     "cooldown_s": round(max(0.0, until - now), 1),
                     "quarantined_today": quarantined,
                     "latency_ms": lat.get(name),
+                    # 配置不完整的原因说明（空串=配置完整）：外部主据此知道该站是
+                    # "配置问题"而不是"节点坏了"，修好 .env 重启即恢复
+                    "broken": broken,
                 }
             )
         return out
@@ -289,10 +293,14 @@ class WorkerPool(
         return time.monotonic() < until
 
     def _skip_reason(self, name: str) -> str | None:
-        """该工人当前不可派工的原因（'冷却中' / '当日失败隔离'），None=可派。
+        """该工人当前不可派工的原因（'冷却中' / '当日失败隔离' / '配置不完整(…)'），None=可派。
 
         这里服务 pick / ask_many / collect / vote 的预过滤，点名直派（ask_result）也查同一份。
         """
+        p = self.profiles.get(name)
+        if p is not None and getattr(p, "broken", ""):
+            # 配置不完整（2026-11-04 审计 P0）：空端点/空引用 key 的站不派工、不进回退
+            return f"配置不完整（{p.broken}）"
         if self._is_in_cooldown(name):
             return "冷却中"
         if self.health.quarantined(name):

@@ -161,9 +161,14 @@ class ParallelMixin:
         # 下限钳制）会漂移，同一份 config.yaml 在"建客户端"和"折算限时"两条路上
         # 读出不同的 timeout。
         worst = worst_case_per_request(self._llm_timeout, self._max_retries)
+        # 回退链折算（2026-11-04 审计 P2）：一次 ask_result 最坏会换 (1+fallback_models)
+        # 个模型、每个各跑一条完整重试链，且同站串行门把它们排成一队。旧口径只按单模型
+        # 链折算，预算低估约 fallback 倍——整站慢/整站 429 触发回退时，wait() 到点把还在
+        # 回退的工人判 timeout 丢弃，后台线程仍打网络（额度白烧、结果拿不到）。
+        chain = 1 + max(0, int(getattr(self, "_fallback_models", 0) or 0))
         concurrency = self._batch_concurrency(max(1, n), workers)
         batches = max(1, -(-max(1, n) // concurrency))
-        return batches * worst + 30.0
+        return batches * chain * worst + 30.0
 
     def _run_parallel(
         self,
