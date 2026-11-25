@@ -40,7 +40,7 @@ def _warn_bad_value(key: str, value: Any, default: Any) -> None:
     if key in _bad_value_logged:
         return
     print(
-        f"[配置警告] {key} 的值 {value!r} 不是合法数字，已按默认值 {default} 处理",
+        f"[配置警告] {key} 的值类型 {type(value).__name__} 不是合法数字，已按默认值 {default} 处理",
         file=sys.stderr,
     )
     _bad_value_logged.add(key)
@@ -51,7 +51,8 @@ def _warn_bad_bool(key: str, value: Any, default: Any) -> None:
     if key in _bad_value_logged:
         return
     print(
-        f"[配置警告] {key} 的值 {value!r} 不是合法布尔（true/false/1/0），已按默认值 {default} 处理",
+        f"[配置警告] {key} 的值类型 {type(value).__name__} 不是合法布尔（true/false/1/0），"
+        f"已按默认值 {default} 处理",
         file=sys.stderr,
     )
     _bad_value_logged.add(key)
@@ -248,7 +249,7 @@ def as_bool(value: Any, key: str, default: bool) -> bool:
     """
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and value in (0, 1):
         return bool(value)
     if isinstance(value, str):
         text = value.strip().lower()

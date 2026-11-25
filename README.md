@@ -113,9 +113,9 @@ MAO/
 全部配置值都写在 `.env`（端点 / KEY / LLM 与协作参数）。仓库**不带** `.env`（它不进 git），
 带的是全注释模板 `.env.example`，所以第一次配置要自己复制一份再填四行真实密钥：
 
-新环境没有 `.env` 时：`cp .env.example .env`，把要用的那几行的行首 `#` 去掉再填值。
-模板只列**变量名**、值一律留空（别留成 `KEY=` 空串——空串会顶掉 `config.yaml` 的 `:-默认值`）；
-模型清单不在模板里，那是 `model_registry.txt` 的事（写进 `.env` 会盖住 git 更新与自动下线）。
+新环境没有 `.env` 时：Windows 用 `copy .env.example .env`，Linux/macOS 用 `cp .env.example .env`；把要用的那几行的行首 `#` 去掉再填值。
+模板里密钥项一律留空，参数项给的是 `config.yaml` 的默认值示例（照抄或不填都行）；别把任何项留成 `KEY=` 空串——空串会顶掉 `config.yaml` 的 `:-默认值`。
+模型清单不在模板里，那是 `model_registry.txt` 的事（写进 `.env` 会盖住 git 更新与自动下线）。模板的站点 C/D 段另附了新建 Key 的控制台入口与端点格式。
 
 ```ini
 NODE_A_ENDPOINT=https://router.bynara.id/v1

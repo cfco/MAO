@@ -258,7 +258,7 @@ def test_probe_degrades_to_no_max_tokens_per_station(monkeypatch):
     pool = _pool()
     pool._latency_probe_max_tokens = 8
     client = PickyClient()
-    monkeypatch.setattr(pool, "_probe_client_for", lambda p: client)
+    monkeypatch.setattr(pool, "_probe_client_for", lambda p, lease=False: client)
 
     ms = pool._probe_one("st:m1")
     station = pool.profiles["st:m1"].station_key

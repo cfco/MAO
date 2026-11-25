@@ -43,7 +43,7 @@ import time
 from pathlib import Path
 
 from ..model_registry import RETIRE_ALREADY, RETIRE_OFFLINED, retire_model
-from .ledger import AtomicJsonLedger, shared_by_path
+from .ledger import AtomicJsonLedger, file_lock, shared_by_path
 
 _MAX_DATES_KEPT = 30
 _MAX_ACTIVE_KEPT = 60
@@ -86,6 +86,7 @@ class ModelHealth(AtomicJsonLedger):
         self.retire_days = max(1, int(retire_days))
         self._data: dict[str, dict] | None = None  # 懒加载：首次使用时才读盘
         self._active: list[str] = []  # 运行日清单（加载后随记账增长）
+        self._disk_sig: tuple[int, int] | None = None
         self._load_lock = threading.Lock()  # 只护"首次读盘"，与 _lock 分开（见 _ensure_loaded）
 
     # ---------- 查询 ----------
@@ -93,6 +94,7 @@ class ModelHealth(AtomicJsonLedger):
     def quarantined(self, name: str) -> bool:
         """当天记过失败 ⇒ 隔离（当天不再派工）。只查内存，热路径友好。"""
         self._ensure_loaded()  # 读盘放在 _lock 之外：载入不在记账锁内碰磁盘
+        self._refresh_if_changed()
         with self._lock:
             entry = self._data.get(name) or {}
             return _today() in (entry.get("fail_dates") or [])
@@ -117,6 +119,7 @@ class ModelHealth(AtomicJsonLedger):
         notice: str | None = None
         need_retire = False
         self._ensure_loaded()  # 读盘放在 _lock 之外
+        self._refresh_if_changed()
         with self._lock:
             self._mark_active_locked(day)  # 有失败记账 ⇒ 当天必然是运行日
             entry = self._data.setdefault(name, {})
@@ -145,6 +148,7 @@ class ModelHealth(AtomicJsonLedger):
     def note_active(self, day: str | None = None) -> None:
         """显式登记一个运行日（测试注入用：模拟"这天开过程序、但该模型没失败"）。"""
         self._ensure_loaded()  # 读盘放在 _lock 之外
+        self._refresh_if_changed()
         with self._lock:
             self._mark_active_locked(day or _today())
         self.write()  # 落盘放锁外，理由同 record_failure
@@ -243,6 +247,7 @@ class ModelHealth(AtomicJsonLedger):
                 return
             data: dict[str, dict] = {}
             active: list[str] = []
+            signature = self._disk_signature()
             try:
                 raw = json.loads(self.store_path.read_text(encoding="utf-8"))
                 models = raw.get("models") if isinstance(raw, dict) else None
@@ -263,6 +268,7 @@ class ModelHealth(AtomicJsonLedger):
             # 于是 `_streak_full_locked` 的 `len(_active) < retire_days` 误判一次不降级。
             self._active = sorted(set(active))[-_MAX_ACTIVE_KEPT:]
             self._data = data
+            self._disk_sig = signature
         # 注意：这里**不**把今天预记为运行日。运行日由记账决定——record_failure /
         # note_active 记哪一天，哪一天才算运行日（"没运行项目的那天不计入"）。
         # 若加载即预记今天，窗口会混入"今天还没机会失败"的日子：测试注入历史失败日
@@ -279,6 +285,37 @@ class ModelHealth(AtomicJsonLedger):
         self._trim_models_locked()
         payload = {"version": 2, "active_dates": list(self._active), "models": self._data}
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _disk_signature(self) -> tuple[int, int] | None:
+        try:
+            stat = self.store_path.stat()
+            return (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return None
+
+    def _refresh_if_changed(self) -> None:
+        signature = self._disk_signature()
+        if signature == self._disk_sig:
+            return
+        try:
+            with file_lock(self.store_path):
+                signature = self._disk_signature()
+                if signature == self._disk_sig:
+                    return
+                with self._load_lock:
+                    if signature == self._disk_sig:
+                        return
+                    try:
+                        raw = json.loads(self.store_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        self._disk_sig = signature
+                        return
+                    with self._lock:
+                        if isinstance(raw, dict):
+                            self._merge_disk_locked(raw)
+                        self._disk_sig = signature
+        except OSError:
+            return
 
     def _disk_for_merge(self):
         """写盘前重读档案，返回 (对端数据, 用于写前比对的原始文本)。
@@ -334,7 +371,8 @@ class ModelHealth(AtomicJsonLedger):
 
     def snapshot(self) -> dict[str, dict]:
         """当前档案的浅拷贝（诊断/测试用，不含任何密钥）。"""
-        self._ensure_loaded()  # 读盘放在 _lock 之外
+        self._ensure_loaded()
+        self._refresh_if_changed()
         with self._lock:
             return {k: dict(v) for k, v in self._data.items()}
 

@@ -42,18 +42,6 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         f"{TESTFILE}::test_get_health_returns_same_instance_per_path",
     ),
     (
-        "M2 健康档案不共享（覆盖写盘）",
-        "agent/core/health.py",
-        """    return shared_by_path(
-        _shared_instances,
-        _shared_lock,
-        key,
-        lambda: ModelHealth(key, registry_path, retire_days),
-    )""",
-        """    return ModelHealth(key)  # mutated: 不共享，各池各持一本账""",
-        f"{TESTFILE}::test_shared_health_does_not_lose_each_others_records",
-    ),
-    (
         "M3 pick() 不再限制人数",
         "agent/core/orchestrator.py",
         "        return window[:cap]",
@@ -125,19 +113,14 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M17 档案落盘 IO 拉回锁内",
         "agent/core/ledger.py",
-        """                    text = self._snapshot_locked()
-                if raw is None or self._read_disk_text() == raw:
-                    break
-                disk, raw = self._disk_for_merge()  # 被对端改过：拿新的一份重合并
-            try:
-                atomic_write_text(self.store_path, text)""",
-        """                    text = self._snapshot_locked()
-                    atomic_write_text(self.store_path, text)  # mutated: 落盘 IO 回到记账锁内
-                if raw is None or self._read_disk_text() == raw:
-                    break
-                disk, raw = self._disk_for_merge()
-            try:
-                pass""",
+        """                text = self._snapshot_locked()
+            if raw is None or self._read_disk_text() == raw:
+                atomic_write_text(self.store_path, text)
+                return""",
+        """                text = self._snapshot_locked()
+                atomic_write_text(self.store_path, text)  # mutated: 落盘 IO 回到记账锁内
+            if raw is None or self._read_disk_text() == raw:
+                return""",
         "tests/test_audit2_fixes.py::test_persist_does_not_block_quarantine_queries",
     ),
     (
@@ -257,10 +240,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M33 取快照挪到写锁之外",
         "agent/core/ledger.py",
-        """        with self._write_lock:
-            disk, raw = self._disk_for_merge()  # IO 留在 _lock 之外""",
-        """        with threading.Lock():  # mutated: 每次现造一把锁＝写盘之间不再串行，快照顺序可能反于写盘顺序
-            disk, raw = self._disk_for_merge()""",
+        "            with self._write_lock, file_lock(self.store_path):",
+        "            with file_lock(self.store_path):  # mutated: 写盘之间不再串行",
         "tests/test_audit4_fixes.py::test_snapshot_is_taken_inside_the_write_lock[health]",
     ),
     (
@@ -356,12 +337,12 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M46 账本写盘不并对方进程记录（互相覆盖）",
         "agent/core/ledger.py",
-        "                with self._lock:\n"
-        "                    if disk is not None:\n"
-        "                        self._merge_disk_locked(disk)\n"
-        "                    text = self._snapshot_locked()\n",
-        "                with self._lock:\n"
-        "                    text = self._snapshot_locked()  # mutated: 不并对端记录，整篇覆盖\n",
+        "            with self._lock:\n"
+        "                if disk is not None:\n"
+        "                    self._merge_disk_locked(disk)\n"
+        "                text = self._snapshot_locked()",
+        "            with self._lock:\n"
+        "                text = self._snapshot_locked()  # mutated: 不并对端记录，整篇覆盖",
         "tests/test_health.py::test_write_merges_records_from_another_process",
     ),
     (
@@ -675,17 +656,16 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M82 Runner 包装正文不再展开",
         "agent/tools/shell_safety.py",
-        """            if _head_word(seg) not in _RUNNER_HEADS:
-                continue""",
-        """            if True:  # mutated: 只扫外层命令词，`"cmd" /c "del x"` 重新放行
-                continue""",
+        "            if head not in _RUNNER_HEADS:",
+        "            if True:  # mutated: 只扫外层命令词，`cmd /c del x` 重新放行\n"
+        "                continue",
         "tests/test_audit8_security.py::test_wrapped_dangerous_command_blocked",
     ),
     (
         "M83 重定向检查又要求操作符前有空白",
         "agent/tools/shell_rules.py",
-        '    r"(?<![<>=!])"  # 排除 => / >= / -> 这类比较与箭头运算符粘在操作符前的写法',
-        '    r"(?:^|\\s)"  # mutated: `echo a>..\\..\\evil` 少一个空格即写出项目根',
+        '        if ch not in "<>":',
+        '        if ch not in "<>" or (i > 0 and command[i - 1].isspace()):  # mutated: 又要求操作符前有空白',
         "tests/test_audit8_security.py::test_redirect_without_space_still_checked",
     ),
     (
@@ -708,15 +688,15 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M86 落盘前不做写前重读比对（跨进程覆盖）",
         "agent/core/ledger.py",
-        "                if raw is None or self._read_disk_text() == raw:",
-        "                if True:  # mutated: 读盘与落盘之间被对端插队也照样整篇覆盖",
+        "            if raw is None or self._read_disk_text() == raw:",
+        "            if True:  # mutated: 读盘与落盘之间被对端插队也照样整篇覆盖",
         "tests/test_audit8_fixes.py::test_write_remerges_when_peer_wrote_after_our_read",
     ),
     (
         "M87 档案落盘失败又静默吞掉",
         "agent/core/ledger.py",
-        "                _warn_write_failed(self.store_path, e)",
-        "                pass  # mutated: 一声不吭，档案从此不再更新没人知道",
+        "        except OSError as e:\n            _warn_write_failed(self.store_path, e)",
+        "        except OSError as e:\n            pass  # mutated: 一声不吭，档案从此不再更新没人知道",
         "tests/test_audit8_fixes.py::test_write_failure_is_reported_once_on_stderr",
     ),
     (
@@ -832,14 +812,14 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "M102 探测先拿门再建客户端（构造抛错漏一格）",
         "agent/core/latency.py",
         """        try:
-            client = self._probe_client_for(p)
+            client = self._probe_client_for(p, lease=True)
         except Exception:  # noqa: BLE001 - 建不出探测客户端就跳过这个工人
             return None
         if not gate.acquire(timeout=_PROBE_GATE_WAIT):""",
         """        if not gate.acquire(timeout=_PROBE_GATE_WAIT):
             return None
         try:
-            client = self._probe_client_for(p)
+            client = self._probe_client_for(p, lease=True)
         except Exception:  # mutated: 门已拿到，抛在这里就永不 release""",
         "tests/test_audit8_fixes.py::test_probe_client_construction_failure_does_not_leak_station_slot",
     ),
@@ -890,8 +870,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M108 `>|` 重定向目标不做越界检查",
         "agent/tools/shell_rules.py",
-        '    r"(?:>>|>\\||<>|>|<)"  # 操作符：长操作符优先匹配（>> 先于 >、>| 先于 >）',
-        '    r"(?:>>|>|<)"  # mutated: `>|` 整条 match 失败、越界检查落空',
+        '        while j < len(command) and command[j] in "><|":',
+        '        while j < len(command) and command[j] in "><":  # mutated: `>|` 目标从竖线开始，检查落空',
         "tests/test_audit9_fixes.py::test_clobber_redirect_targets_are_checked",
     ),
     (
@@ -911,8 +891,22 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M111 Runner 展开只剥一层（超深包装正文不再扫描）",
         "agent/tools/shell_safety.py",
-        "            queue.append(payload)",
-        "            continue  # mutated: 不再深入展开，第 2 层起包装正文永远进不了扫描",
+        """            payload = _wrapped_payload(_split_tokens(seg.strip())).replace("^", "")
+            if not payload:
+                continue
+            out.append(payload)
+            seen_chars += len(payload)
+            if seen_chars > _RUNNER_SCAN_CHAR_BUDGET or len(out) > _RUNNER_MAX_TEXTS:
+                return None
+            queue.append(payload)""",
+        """            payload = _wrapped_payload(_split_tokens(seg.strip())).replace("^", "")
+            if not payload:
+                continue
+            out.append(payload)
+            seen_chars += len(payload)
+            if seen_chars > _RUNNER_SCAN_CHAR_BUDGET or len(out) > _RUNNER_MAX_TEXTS:
+                return None
+            continue  # mutated: 不再深入展开，第 2 层起包装正文永远进不了扫描""",
         "tests/test_audit9_fixes.py::test_runner_nesting_beyond_old_depth_cap_is_blocked",
     ),
     # ---------------- 第九轮审计（2026-11-04）：配置层 ----------------
@@ -981,6 +975,131 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "        drop = math.floor(len(ordered) * (1.0 - self._latency_keep_ratio) + 1e-9)",
         "        drop = int(len(ordered) * (1.0 - self._latency_keep_ratio))  # mutated: 截断差一位",
         "tests/test_audit9_fixes.py::test_keep_ratio_integer_boundary_not_lost",
+    ),
+    (
+        "M120 max_retries=0 被 or 兜底成 2",
+        "agent/core/orchestrator.py",
+        '            2 if raw_retries is None or raw_retries == "" else raw_retries,',
+        "            raw_retries or 2,  # mutated: 合法的 0 被覆盖",
+        "tests/test_audit10_fixes.py::test_zero_max_retries_survives_pool_construction",
+    ),
+    (
+        "M121 站点分布偏斜时整体限时少算一波",
+        "agent/core/parallelism.py",
+        "        batches = self._batch_waves(max(1, n), workers)",
+        "        concurrency = self._batch_concurrency(max(1, n), workers)\n"
+        "        batches = max(1, -(-max(1, n) // concurrency))  # mutated: 退回全局批次数",
+        "tests/test_audit10_fixes.py::test_station_skew_uses_queue_waves_and_interleaves_stations",
+    ),
+    (
+        "M122 整体超时不设置运行中任务取消标记",
+        "agent/core/parallelism.py",
+        "                cancel_event.set()",
+        "                pass  # mutated: 运行中任务继续重试和记账",
+        "tests/test_audit10_fixes.py::test_overall_timeout_sets_cancellation_for_running_worker",
+    ),
+    (
+        "M123 取消任务拿到站门后仍发网络请求",
+        "agent/core/station_gate.py",
+        "                raise DispatchCancelled",
+        "                return None, None, 0.0  # mutated: 取消后仍走真实请求",
+        "tests/test_audit10_fixes.py::test_cancelled_station_gate_does_not_call_client",
+    ),
+    (
+        "M124 健康查询不刷新其它进程写入的隔离记录",
+        "agent/core/health.py",
+        "        self._refresh_if_changed()",
+        "        return  # mutated: 永远只查旧内存",
+        "tests/test_audit10_fixes.py::test_health_query_refreshes_after_another_instance_writes",
+    ),
+    (
+        "M125 自动发现不撤销上一轮自动新增模型",
+        "agent/core/node_discovery.py",
+        "                registry_line, live, adapter, previous_overlay.get(env_var)",
+        "                registry_line, live, adapter  # mutated: 看不到上一轮 added",
+        "tests/test_audit10_fixes.py::test_discovery_can_retire_and_restore_models",
+    ),
+    (
+        "M126 热同步丢静态站点模板，空站无法恢复新增",
+        "agent/core/free_nodes.py",
+        "            for p in self.cfg.agent_profiles:\n"
+        "                if p.models_env:\n"
+        "                    templates.setdefault(p.models_env, p)\n",
+        "",
+        "tests/test_audit10_fixes.py::test_sync_free_nodes_recovers_after_station_becomes_empty",
+    ),
+    (
+        "M127 配置类型告警回显敏感原值",
+        "agent/config_util.py",
+        '        f"[配置警告] {key} 的值类型 {type(value).__name__} 不是合法数字，已按默认值 {default} 处理",',
+        '        f"[配置警告] {key} 的值 {value!r} 不是合法数字，已按默认值 {default} 处理",',
+        "tests/test_audit10_fixes.py::test_bad_config_warning_does_not_echo_value",
+    ),
+    (
+        "M128 布尔配置把 NaN/2 等异常数字当成 true",
+        "agent/config_util.py",
+        "    if isinstance(value, (int, float)) and value in (0, 1):",
+        "    if isinstance(value, (int, float)):  # mutated: 任意数字都转 bool",
+        "tests/test_audit10_fixes.py::test_bool_config_rejects_non_binary_numbers",
+    ),
+    (
+        "M129 不兼容 Windows NO_PROXY 的 [::1]",
+        "agent/core/llm.py",
+        '    return ",".join("::1" if item.strip() == "[::1]" else item for item in value.split(","))',
+        "    return value  # mutated: httpx2 把 [::1] 解析成非法端口",
+        "tests/test_audit10_fixes.py::test_openai_client_handles_bracketed_ipv6_no_proxy",
+    ),
+    (
+        "M130 call/command 透明包装不展开",
+        "agent/tools/shell_safety.py",
+        '_TRANSPARENT_HEADS = {"call", "command"}',
+        "_TRANSPARENT_HEADS = set()  # mutated: 危险内层命令漏扫",
+        "tests/test_audit10_fixes.py::test_transparent_command_wrappers_are_scanned",
+    ),
+    (
+        "M131 引号内重定向字面量被误判为真实重定向",
+        "agent/tools/shell_rules.py",
+        "        if ch in (\"'\", '\"'):\n            quote = ch",
+        "        if False:  # mutated: 引号状态失效\n            quote = ch",
+        "tests/test_audit10_fixes.py::test_redirect_check_is_quote_aware",
+    ),
+    (
+        "M132 技能超时不杀进程树",
+        "agent/skills_manager.py",
+        "            _kill_process_tree(proc)",
+        "            proc.kill()  # mutated: 只杀直接脚本",
+        "tests/test_audit10_fixes.py::test_skill_timeout_kills_process_tree",
+    ),
+    (
+        "M133 MCP session 退出异常跳过 transport 清理",
+        "agent/tools/mcp_client.py",
+        "        finally:\n            if self._transport_cm is not None:",
+        "        finally:\n            if False:  # mutated: session 退出异常时不再清理 transport",
+        "tests/test_audit10_fixes.py::test_mcp_shutdown_cleans_transport_when_session_exit_raises",
+    ),
+    (
+        "M134 客户端租约不登记在飞，热同步可提前关闭",
+        "agent/core/llm.py",
+        '    def acquire_call(self) -> bool:\n        """原子登记一次调用；已关闭的客户端不再接收新调用。"""\n'
+        "        with self._inflight_lock:\n"
+        "            if self._closed:\n"
+        "                return False\n"
+        "            self._inflight += 1\n"
+        "            return True",
+        '    def acquire_call(self) -> bool:\n        """原子登记一次调用；已关闭的客户端不再接收新调用。"""\n'
+        "        with self._inflight_lock:\n"
+        "            if self._closed:\n"
+        "                return False\n"
+        "            self._inflight += 0  # mutated: 租约不生效\n"
+        "            return True",
+        "tests/test_audit10_fixes.py::test_client_lease_defers_close_until_release",
+    ),
+    (
+        "M135 CAS 冲突耗尽后仍写旧快照",
+        "agent/core/ledger.py",
+        '        raise OSError("并发写入冲突持续出现，已放弃本次落盘")',
+        "        atomic_write_text(self.store_path, text)  # mutated: 覆盖对端新记录",
+        "tests/test_audit10_fixes.py::test_ledger_cas_exhaustion_does_not_write_stale_snapshot",
     ),
 ]
 

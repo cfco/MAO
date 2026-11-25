@@ -73,6 +73,7 @@ _CMD_DANGEROUS_SET = frozenset(_CMD_DANGEROUS)
 # 等于放行内层（`cmd /c "del /f /q x"` 的首词变成 cmd）。cmd 用斜杠开关，shell 家族
 # 用 `-c`（含 `-lc` 这类短选项簇，见 _SHELL_CODE_FLAG）。
 _RUNNER_HEADS = {"cmd", "comspec", "sh", "bash", "zsh", "dash", "ksh"}
+_TRANSPARENT_HEADS = {"call", "command"}
 _RUNNER_FLAGS = {
     "cmd": frozenset({"/c", "/k"}),
     "shell": frozenset({"-c"}),
@@ -163,7 +164,18 @@ def _unwrap_runners(command: str) -> list[str] | None:
     while queue:
         text = queue.pop(0)
         for seg in _CMD_SEPARATOR.split(text):
-            if _head_word(seg) not in _RUNNER_HEADS:
+            head = _head_word(seg)
+            if head in _TRANSPARENT_HEADS:
+                tokens = _split_tokens(seg.strip())
+                if len(tokens) > 1:
+                    payload = " ".join(_strip_wrapping_quotes(t) for t in tokens[1:])
+                    out.append(payload)
+                    seen_chars += len(payload)
+                    if seen_chars > _RUNNER_SCAN_CHAR_BUDGET or len(out) > _RUNNER_MAX_TEXTS:
+                        return None
+                    queue.append(payload)
+                continue
+            if head not in _RUNNER_HEADS:
                 continue
             # cmd 执行前会还原 `^` 转义，正文里留着转义符就扫不到真实命令词
             payload = _wrapped_payload(_split_tokens(seg.strip())).replace("^", "")

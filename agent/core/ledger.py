@@ -17,9 +17,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import tempfile
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from .redact import safe_error_text
@@ -42,6 +47,59 @@ def atomic_write_text(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+_thread_locks: dict[str, threading.Lock] = {}
+_thread_locks_guard = threading.Lock()
+
+
+@contextmanager
+def file_lock(path: Path, timeout: float = 10.0) -> Iterator[None]:
+    """跨进程串行化同一文件的读改写区间；锁文件放系统临时目录，不污染仓库。"""
+    key = os.path.normcase(str(Path(path).resolve()))
+    with _thread_locks_guard:
+        thread_lock = _thread_locks.setdefault(key, threading.Lock())
+    lock_path = (
+        Path(tempfile.gettempdir())
+        / "mao-locks"
+        / f"{hashlib.sha256(key.encode()).hexdigest()}.lock"
+    )
+    with thread_lock:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class AtomicJsonLedger:
@@ -81,37 +139,37 @@ class AtomicJsonLedger:
         """把 `_disk_for_merge` 读到的对端记录并进内存账本。子类实现，只读内存。"""
 
     def _read_disk_text(self) -> str | None:
-        """只读回磁盘文本本身（给写前重读比对用）；读不到返回 None。"""
+        """只读回磁盘文本本身（给写前重读比对用）；文件不存在按空串处理。"""
         try:
             return self.store_path.read_text(encoding="utf-8")
         except OSError:
-            return None
+            return ""
 
     def write(self) -> None:
         """取快照并原子落盘（在 _lock 之外调用）。落盘失败只丢持久化，不外抛。
 
-        顺序固定：读盘（锁外 IO）→ 合并 + 取快照（锁内纯内存）→ 落盘。
-        合并过的账本在落盘前再重读一次：与合并依据不一致就整轮重来（最多 `_CAS_RETRIES`
-        次），绝不拿过时快照硬覆盖对端进程刚写的记录。
+        跨进程锁覆盖读盘、合并、快照和替换的完整区间；锁内 CAS 仍用于防御不合作的写入者。
+        CAS 重试耗尽时放弃本次落盘，绝不把旧快照覆盖回去。
         """
-        with self._write_lock:
-            disk, raw = self._disk_for_merge()  # IO 留在 _lock 之外
-            self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）
-            for _ in range(_CAS_RETRIES):
-                with self._lock:
-                    if disk is not None:
-                        self._merge_disk_locked(disk)
-                    text = self._snapshot_locked()
-                if raw is None or self._read_disk_text() == raw:
-                    break
-                disk, raw = self._disk_for_merge()  # 被对端改过：拿新的一份重合并
-            try:
+        try:
+            with self._write_lock, file_lock(self.store_path):
+                self._write_locked()
+        except OSError as e:
+            _warn_write_failed(self.store_path, e)
+
+    def _write_locked(self) -> None:
+        disk, raw = self._disk_for_merge()  # IO 留在 _lock 之外
+        self._ensure_loaded()  # 载入同理锁外：合并/取快照前账本必已就绪（子类实现）
+        for _ in range(_CAS_RETRIES):
+            with self._lock:
+                if disk is not None:
+                    self._merge_disk_locked(disk)
+                text = self._snapshot_locked()
+            if raw is None or self._read_disk_text() == raw:
                 atomic_write_text(self.store_path, text)
-            except OSError as e:
-                # 写不进去只损失持久化，内存账本照常工作；但**不能一声不吭**：
-                # Windows 上 os.replace 撞目标被占用是常态（杀毒/索引/另一个进程开着），
-                # 静默 pass 等于档案从此不再更新而没人知道。
-                _warn_write_failed(self.store_path, e)
+                return
+            disk, raw = self._disk_for_merge()  # 被对端改过：拿新的一份重合并
+        raise OSError("并发写入冲突持续出现，已放弃本次落盘")
 
 
 _CAS_RETRIES = 3

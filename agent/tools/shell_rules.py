@@ -67,6 +67,58 @@ _REDIRECT_RE = re.compile(
 )
 
 
+def _redirect_targets(command: str) -> list[str]:
+    """提取引号外的真实重定向目标；引号内的 > / < 字面量不参与判定。"""
+    targets: list[str] = []
+    i = 0
+    quote = ""
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            elif ch == "\\" and quote == '"':
+                i += 1
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch not in "<>":
+            i += 1
+            continue
+        if i > 0 and command[i - 1] in "<>=!-":
+            i += 1
+            continue
+        if i + 1 < len(command) and command[i + 1] == "=":
+            i += 1
+            continue
+        j = i + 1
+        while j < len(command) and command[j] in "><|":
+            j += 1
+        while j < len(command) and command[j].isspace():
+            j += 1
+        if j >= len(command) or command[j] in "&|":
+            i = max(j, i + 1)
+            continue
+        if command[j] in ("'", '"'):
+            q = command[j]
+            j += 1
+            start = j
+            while j < len(command) and command[j] != q:
+                j += 1
+            targets.append(command[start:j])
+            i = min(j + 1, len(command))
+            continue
+        start = j
+        while j < len(command) and not command[j].isspace() and command[j] not in "&|<>":
+            j += 1
+        targets.append(command[start:j])
+        i = max(j, i + 1)
+    return targets
+
+
 def _check_redirect_targets(command: str) -> str | None:
     r"""检查 shell 重定向目标是否逃出项目根目录。
 
@@ -78,10 +130,7 @@ def _check_redirect_targets(command: str) -> str | None:
     注意：这是启发式检查，不解析完整 shell 语法；目标是挡住最常见的越界写法，
     而非实现一个完整的 shell 解析器。设备名（NUL/CON 等）与 fd 引用（&1）放行。
     """
-    for m in _REDIRECT_RE.finditer(command):
-        target = m.group(1)
-        # 剥引号："> \"my file.txt\"" 的目标是带引号的
-        target = _strip_wrapping_quotes(target)
+    for target in _redirect_targets(command):
         if not target:
             continue
         # fd 引用（>&1, 1>&2）不是文件路径，放行

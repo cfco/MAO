@@ -46,7 +46,7 @@ agents:
 # agent 时从池里挑一个当前可用工人，池空就如实报错，不再私连一个 solo 模型。
 # 读法见 Config.llm_cfg —— 只有 timeout / max_retries 两项被代码读取。
 llm:
-  # 单请求超时秒数：ask_many/vote 的整体限时按它折算 = 批次数 × timeout + 30s。
+  # 单请求超时秒数；整体限时按站感知批次数 × 整条回退链最坏墙钟 + 30s 折算。
   # 重 prompt（如整库审计）要抬超时，改这里或设环境变量 LLM_TIMEOUT（env 优先）。
   timeout: ${LLM_TIMEOUT:-120}
   # 限流(429)/超时/5xx/连接失败的最大重试次数（指数退避；认证与其余 4xx 不重试）

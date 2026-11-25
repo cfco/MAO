@@ -243,11 +243,16 @@ class McpConnection:
         """
         try:
             if self._session_cm is not None:
-                await self._session_cm.__aexit__(None, None, None)
+                try:
+                    await self._session_cm.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
             if self._transport_cm is not None:
-                await self._transport_cm.__aexit__(None, None, None)
-        except Exception:  # noqa: BLE001
-            pass
+                try:
+                    await self._transport_cm.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _backoff_wait(self) -> None:
         """指数退避 + 随机抖动。等待期间可被 stop() 提前中断。"""

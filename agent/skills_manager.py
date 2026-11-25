@@ -12,6 +12,7 @@ load_skill 工具读取全文。本模块只负责扫描、按需加载全文、
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -122,25 +123,36 @@ class SkillManager:
         if not path.exists():
             return ToolResult(f"错误：脚本不存在：{path}", ok=False)
         payload = json.dumps(args or {}, ensure_ascii=False)
-        try:
-            from .tools.builtin import _child_env
+        from .tools.builtin import _child_env, _decode, _kill_process_tree
 
-            proc = subprocess.run(
+        try:
+            proc = subprocess.Popen(
                 [sys.executable, str(path), payload],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 cwd=str(info["dir"]),
-                timeout=SCRIPT_TIMEOUT,
                 env=_child_env(),  # 技能脚本（含第三方 SKILL.md 里的）也不该拿到整池 key
+                start_new_session=os.name != "nt",
             )
+        except OSError as e:
+            return ToolResult(f"错误：技能脚本启动失败：{type(e).__name__}", ok=False)
+        try:
+            stdout, stderr = proc.communicate(timeout=SCRIPT_TIMEOUT)
         except subprocess.TimeoutExpired:
-            return ToolResult(f"错误：脚本超过 {SCRIPT_TIMEOUT} 秒未完成，已终止", ok=False)
-        from .tools.builtin import _decode
+            _kill_process_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+            return ToolResult(f"错误：脚本超过 {SCRIPT_TIMEOUT} 秒未完成，已终止进程树", ok=False)
 
         parts = []
-        if proc.stdout:
-            parts.append(_decode(proc.stdout)[-8000:])
-        if proc.stderr:
-            parts.append("[stderr] " + _decode(proc.stderr)[-2000:])
+        if stdout:
+            parts.append(_decode(stdout)[-8000:])
+        if stderr:
+            parts.append("[stderr] " + _decode(stderr)[-2000:])
         parts.append(f"[exit code] {proc.returncode}")
         text = "\n".join(parts)
         if proc.returncode != 0:

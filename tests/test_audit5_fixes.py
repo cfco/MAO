@@ -151,7 +151,10 @@ def test_run_script_marks_nonzero_exit_as_failure(monkeypatch, tmp_path):
         stderr = b"boom"
         returncode = 2
 
-    monkeypatch.setattr(sp, "run", lambda *a, **kw: Proc())
+        def communicate(self, timeout=None):
+            return self.stdout, self.stderr
+
+    monkeypatch.setattr(sp, "Popen", lambda *a, **kw: Proc())
     res = mgr.run_script("s1", "boom.py", {})
     assert getattr(res, "ok", True) is False, "非 0 退出不得被当成成功"
     assert "exit code] 2" in str(res)

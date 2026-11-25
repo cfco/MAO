@@ -27,14 +27,30 @@ from .constants import (
     ST_MISSING,
     ST_OK,
     ST_QUARANTINED,
+    ST_TIMEOUT,
     WORKER_SYSTEM,
 )
 from .llm import ERR_OTHER, LLMError, backoff_seconds
-from .parallelism import StationMemo
+from .parallelism import (
+    DispatchCancelled,
+    StationMemo,
+    dispatch_cancel_event,
+    is_dispatch_cancelled,
+)
 from .redact import safe_error_text
 
 if TYPE_CHECKING:  # 仅类型标注用，运行期不引入依赖
     from .llm import LLMClient
+
+
+def _cancelled_result(worker: str) -> dict:
+    return {
+        "worker": worker,
+        "ok": False,
+        "status": ST_TIMEOUT,
+        "answer": "",
+        "error": "整体限时已放弃本次派工",
+    }
 
 
 class DispatchMixin:
@@ -49,6 +65,8 @@ class DispatchMixin:
         成败由控制流决定（是否跳过、chat 是否抛错），而不是事后解析文本前缀（#4）。
         跳过判定（冷却 / 当日隔离）也在这里直接算出，批量路径无需再预过滤或嗅探。
         """
+        if is_dispatch_cancelled():
+            return _cancelled_result(worker)
         p = self.profiles.get(worker)
         if not p:
             return {
@@ -180,6 +198,8 @@ class DispatchMixin:
                        主调用、不再各自回退撞死站，抑制 N×(1+fallback) 的跨工人额度放大。
                        顺序单发不传（None）⇒ 回退行为逐字不变。
         """
+        if is_dispatch_cancelled():
+            return _cancelled_result(p.name)
         if tried is None:
             tried = set()
         if fallbacks_left is None:
@@ -191,13 +211,16 @@ class DispatchMixin:
             if memo is not None:
                 memo.mark_dead(station)
 
+        client: LLMClient | None = None
         try:
-            client = self._client_for(p)
+            client = self._client_for(p, lease=True)
             messages = [
                 {"role": "system", "content": system or WORKER_SYSTEM},
                 {"role": "user", "content": prompt},
             ]
             resp, err, elapsed_ms = self._attempt_with_retry(client, station, messages)
+            if is_dispatch_cancelled():
+                return _cancelled_result(p.name)
             if err is not None:
                 # 分类与记账逐字沿用旧实现：LLMError 按 retryable 分级，其它意外异常按可重试
                 # 处理（别全天拉黑）。回退递归发生在**站点门之外**（见 _chat_gated 文档）。
@@ -264,6 +287,8 @@ class DispatchMixin:
                 "answer": str(resp.get("content") or ""),
                 "error": "",
             }
+        except DispatchCancelled:
+            return _cancelled_result(p.name)
         except Exception as e:  # noqa: BLE001 - 连取 client 都失败，也不让派工崩（只冷却）
             if fallbacks_left > 0:
                 fb = self._fallback_target(p, tried, memo)
@@ -279,6 +304,11 @@ class DispatchMixin:
                 "answer": "",
                 "error": f"调用子智能体 '{p.name}' 异常：{type(e).__name__}: {safe_error_text(e)}",
             }
+        finally:
+            if client is not None:
+                release = getattr(client, "release_call", None)
+                if callable(release):
+                    release()
 
     def _attempt_with_retry(
         self, client: LLMClient, station: tuple[str, str], messages: list[dict]
@@ -304,6 +334,8 @@ class DispatchMixin:
         span_factory = getattr(client, "call_span", None)
         with span_factory() if callable(span_factory) else nullcontext():
             for attempt in range(attempts):
+                if is_dispatch_cancelled():
+                    raise DispatchCancelled
                 resp, err, elapsed_ms = self._chat_gated(client, station, messages)
                 if err is None:
                     return resp, None, elapsed_ms
@@ -311,5 +343,12 @@ class DispatchMixin:
                     return resp, err, elapsed_ms  # 终态错误：重试也没用，直接交回上层按终态记账
                 if attempt >= attempts - 1:
                     return resp, err, elapsed_ms
-                time.sleep(backoff_seconds(attempt, err.error_type))  # 门已释放，退避不占站配额
+                delay = backoff_seconds(attempt, err.error_type)  # 门已释放，退避不占站配额
+                cancel_event = dispatch_cancel_event()
+                if cancel_event is not None:
+                    cancel_event.wait(delay)
+                else:
+                    time.sleep(delay)
+                if is_dispatch_cancelled():
+                    raise DispatchCancelled
         return resp, err, elapsed_ms

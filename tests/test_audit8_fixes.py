@@ -125,7 +125,16 @@ def test_write_remerges_when_peer_wrote_after_our_read(tmp_path):
     def snapshot_after_peer_write():
         if not fired:
             fired.append(1)
-            b.record_failure("w-b", "m-b", "")  # 对端在我们取快照这一刻落了盘
+            ledger_mod.atomic_write_text(
+                store,
+                json.dumps(
+                    {
+                        "version": 2,
+                        "active_dates": [],
+                        "models": {"w-b": {"fail_dates": [_day(0)]}},
+                    }
+                ),
+            )
         return original()
 
     a._snapshot_locked = snapshot_after_peer_write  # 只改这个实例，影响面最小

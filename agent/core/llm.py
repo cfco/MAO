@@ -13,6 +13,7 @@ DeepSeek / Kimi / 豆包(方舟) / OpenAI / 本地 Ollama 均兼容，换模型�
 
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
@@ -41,6 +42,33 @@ DEFAULT_RETRIES = 2
 # 限流/连接类错误的初始退避秒数（指数增长，封顶 60s；限流更慢）
 _BASE_BACKOFF_RATE_LIMIT = 8.0
 _BASE_BACKOFF_OTHER = 2.0
+_OPENAI_ENV_LOCK = threading.Lock()
+
+
+def _normalize_no_proxy(value: str) -> str:
+    return ",".join("::1" if item.strip() == "[::1]" else item for item in value.split(","))
+
+
+def _build_openai_client(base_url: str, api_key: str) -> OpenAI:
+    # httpx2 2.13 会把 NO_PROXY 的 [::1] 当成带端口 URL；等价改成 ::1 后再恢复环境。
+    keys = ("NO_PROXY",) if os.name == "nt" else ("NO_PROXY", "no_proxy")
+    with _OPENAI_ENV_LOCK:
+        saved: dict[str, str] = {}
+        for key in keys:
+            if key not in os.environ:
+                continue
+            original = os.environ[key]
+            normalized = _normalize_no_proxy(original)
+            if normalized != original:
+                saved[key] = original
+                os.environ[key] = normalized
+        try:
+            return OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        finally:
+            for key, value in saved.items():
+                os.environ[key] = value
+
+
 _MAX_BACKOFF = 60.0
 # 除 5xx 外这些 HTTP 状态码也值得退避重试：408 请求超时 / 425 Too Early /
 # 429 限流（SDK 一般已归到 RateLimitError，这里是兜底）。免费中转网关超时很常见，
@@ -118,7 +146,7 @@ class LLMClient:
     ):
         # 关闭 SDK 内置重试：让 chat() 的自定义指数退避成为唯一重试源，
         # 避免两层退避叠加导致实际重试次数/超时不可预期。
-        self.client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY", max_retries=0)
+        self.client = _build_openai_client(base_url, api_key or "EMPTY")
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
@@ -200,6 +228,18 @@ class LLMClient:
             idle = self._inflight <= 0
         if idle:
             self.close()
+
+    def acquire_call(self) -> bool:
+        """原子登记一次调用；已关闭的客户端不再接收新调用。"""
+        with self._inflight_lock:
+            if self._closed:
+                return False
+            self._inflight += 1
+            return True
+
+    def release_call(self) -> None:
+        """归还一次调用租约，最后一个租约释放时执行延迟关闭。"""
+        self._leave_call()
 
     def _enter_call(self) -> None:
         with self._inflight_lock:

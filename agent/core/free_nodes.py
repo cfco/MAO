@@ -56,11 +56,14 @@ class FreeNodeMixin:
         """
         with self._lock:
             profiles = dict(self.profiles)
-            # 先按 env 抓一个模板（base_url/api_key/discovery 来源），即便该站活跃模型全被
-            # retired 移除也能据此把新增模型建出来——否则模板随 retired 一起被删就没法加了。
+            # 运行池可能已把某站模型全部移出；静态配置仍保留站点模板，供后续新增恢复。
             templates: dict[str, AgentProfile] = {}
+            for p in self.cfg.agent_profiles:
+                if p.models_env:
+                    templates.setdefault(p.models_env, p)
             for p in profiles.values():
-                templates.setdefault(p.models_env, p)
+                if p.models_env:
+                    templates[p.models_env] = p
             removed: list[str] = []
             for env_var, delta in overlay.items():
                 if env_var.startswith("_") or not isinstance(delta, dict):
@@ -96,6 +99,7 @@ class FreeNodeMixin:
                         model=model,
                         context_length=ctx,
                         note=tmpl.note,
+                        tags=tmpl.tags,
                         models_env=env_var,
                         discovery=tmpl.discovery,
                         broken=getattr(tmpl, "broken", ""),

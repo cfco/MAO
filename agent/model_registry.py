@@ -21,7 +21,7 @@ import re
 import threading
 from pathlib import Path
 
-from .core.ledger import atomic_write_text
+from .core.ledger import atomic_write_text, file_lock
 
 # retire_model 的三态返回值（对外稳定：调用方按值拼提示文本）
 RETIRE_OFFLINED = "offlined"
@@ -108,7 +108,7 @@ def _retire_once(path: Path, env_var: str, model: str) -> str:
     """
     file_path = Path(path)
     lock = _locks.setdefault(str(file_path), threading.Lock())
-    with lock:
+    with lock, file_lock(file_path):
         try:
             raw = file_path.read_text(encoding="utf-8")
         except OSError:
@@ -164,7 +164,10 @@ def retire_model(path: Path, env_var: str, model: str) -> str:
     （多进程同时改写同一清单时，后写者不覆盖先写者的 #）。
     """
     for _ in range(_RETIRE_RETRIES):
-        state = _retire_once(path, env_var, model)
+        try:
+            state = _retire_once(path, env_var, model)
+        except OSError:
+            return RETIRE_MISSING
         if state != _RETIRE_STALE:
             return state
     return RETIRE_MISSING  # 反复被并发改写：当作写入失败，交调用方按提示人工确认

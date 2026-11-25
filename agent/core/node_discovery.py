@@ -52,7 +52,7 @@ from .discovery_adapters import (  # noqa: F401 - re-export：历史导入面不
     _manages,
     _owns_station,
 )
-from .ledger import _warn_write_failed, atomic_write_text
+from .ledger import _warn_write_failed, atomic_write_text, file_lock
 
 _DEFAULT_OVERLAY = "data/free_nodes.json"
 
@@ -114,16 +114,14 @@ def load_overlay(path: Path) -> dict:
         return {}
 
 
-def save_overlay(path: Path, data: dict) -> None:
-    """原子写叠加层（临时文件 + os.replace），IO 失败只丢持久化、不炸调用方。
-
-    失败要如实报一行 stderr（同 ledger 口径）：叠加层是"哪些免费模型上新/下架"的唯一
-    落盘处，静默失败会让人以为发现轮跑了却没结果，而实际什么都没存下来。
-    """
+def save_overlay(path: Path, data: dict) -> bool:
+    """原子写叠加层；返回是否真正落盘成功。"""
     try:
         atomic_write_text(Path(path), json.dumps(data, ensure_ascii=False, indent=2))
+        return True
     except OSError as e:
         _warn_write_failed(path, e)
+        return False
 
 
 def merge_delta(base: str, delta: dict) -> str:
@@ -170,26 +168,24 @@ def apply_overlay(overlay_path: Path) -> None:
 # ---------- 发现器（含懒式调度，复用 LatencyProber 思路） ----------
 
 
-def _reconcile(registry_line: str, live: list[FreeModel], adapter: Adapter | None = None) -> dict:
-    """相对 registry 原始行计算增量（幂等）：added / retired。
-
-    比较一律用"去 # 的裸名"：`_bare` 保留屏蔽标记（`_bare("#m2")` → `#m2`），
-    而在线清单是裸名，直接比会把人工屏蔽的模型当成"registry 里没有"塞进 added ——
-    落盘侧 merge_delta 有 lstrip 兜住，热同步侧（sync_free_nodes 只看当前池里的
-    profile，被屏蔽模型根本没有 profile）兜不住，屏蔽会被悄悄复活。
-
-    retired 只认**归本适配器管**的条目（见 _manages）：免费清单里没有的条目
-    不等于"已下架"——人工加进 registry 的付费模型从来不会出现在免费清单里，按旧写法
-    每轮都会被判成 retired、被从 env 与运行池里摘掉，且要连续 7 天才会被标 `#`。
-    """
+def _reconcile(
+    registry_line: str,
+    live: list[FreeModel],
+    adapter: Adapter | None = None,
+    previous: dict | None = None,
+) -> dict:
+    """相对 registry 与上一轮自动新增项计算当前快照，确保新增/下线都可撤销。"""
     items = _split_items(registry_line)
     registry_active = {_bare(i).lstrip("#") for i in items if not i.startswith("#")}
     registry_all = {_bare(i).lstrip("#") for i in items}
+    previous_added = {
+        _bare(a).lstrip("#") for a in ((previous or {}).get("added") or []) if isinstance(a, str)
+    }
     live_bare = {m.model for m in live}
     added = [_format_model(m) for m in live if m.model not in registry_all]
     retired = [
         m
-        for m in registry_active
+        for m in registry_active | previous_added
         if m not in live_bare and (adapter is None or _manages(adapter, m))
     ]
     return {"added": added, "retired": retired}
@@ -334,17 +330,15 @@ class FreeNodeDiscoverer:
     def run_once(self, clock: Any = None) -> dict:
         """同步跑一轮发现：逐站拉取 → 对账 → 写叠加层。返回摘要（不含密钥）。
 
-        写叠加层前**重读磁盘再合并**（2026-11-04 审计 P1）：进程内互斥由 _round_lock
-        保证，但每个 `mao call` 都会建池起发现轮——两个进程并发时各自以旧 overlay 为
-        基底整篇 save，后写者会把先写者**另一站**的增量整段抹掉（跨进程 lost update，
-        与 health/registry 已实现的写前重读同源，唯独这条写路径曾漏掉）。修法与
-        ledger 同思路：save 前重读、按站合并（added/retired 取并集）、集合签名没变
-        就不写。
+        写叠加层前持跨进程锁重读磁盘：每个成功抓取的站点以本轮最新快照替换自己的
+        added/retired，其它站点原样保留。这样模型重新上线会撤掉 retired，自动新增模型
+        下架会从 added 中消失，同时不会丢失其它进程刚写入的站点增量。
         """
         targets = self._targets()
         registry = load_model_registry(self.cfg.model_registry_path)
         report: dict[str, Any] = {"stations": {}, "updated": False}
         deltas: dict[str, dict] = {}
+        previous_overlay = load_overlay(self.overlay_path)
         for env_var, info in targets.items():
             adapter = self.adapters.get(info["discovery"])
             if adapter is None:
@@ -366,7 +360,9 @@ class FreeNodeDiscoverer:
             if not live:
                 report["stations"][env_var] = {"status": "skip", "reason": "no_valid_models"}
                 continue
-            deltas[env_var] = _reconcile(registry_line, live, adapter)
+            deltas[env_var] = _reconcile(
+                registry_line, live, adapter, previous_overlay.get(env_var)
+            )
             report["stations"][env_var] = {
                 "status": "ok",
                 "live": len({m.model for m in live}),
@@ -374,14 +370,18 @@ class FreeNodeDiscoverer:
                 "retired": deltas[env_var]["retired"],
             }
         if deltas:
-            disk = load_overlay(self.overlay_path)
-            for env_var, delta in deltas.items():
-                merged = _merge_deltas(disk.get(env_var), delta)
-                if _delta_signature(merged) != _delta_signature(disk.get(env_var)):
-                    disk[env_var] = merged
-                    report["updated"] = True
-            if report["updated"]:
-                save_overlay(self.overlay_path, disk)
+            try:
+                with file_lock(self.overlay_path):
+                    disk = load_overlay(self.overlay_path)
+                    changed = False
+                    for env_var, delta in deltas.items():
+                        if _delta_signature(delta) != _delta_signature(disk.get(env_var)):
+                            disk[env_var] = delta
+                            changed = True
+                    if changed:
+                        report["updated"] = save_overlay(self.overlay_path, disk)
+            except OSError as e:
+                _warn_write_failed(self.overlay_path, e)
         return report
 
     def refresh_now(self) -> dict:

@@ -15,14 +15,33 @@ _effective_timeout / _spawn / _run_parallel）约 100 行，与「派工 + 健�
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import queue
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, wait
 
-from .constants import ST_ERROR
+from .constants import ST_ERROR, ST_TIMEOUT
 from .llm import worst_case_per_request
 from .redact import safe_error_text
+
+_CANCEL_EVENT: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "mao_dispatch_cancel_event", default=None
+)
+
+
+class DispatchCancelled(Exception):
+    """当前派工已被整体限时放弃。"""
+
+
+def dispatch_cancel_event() -> threading.Event | None:
+    return _CANCEL_EVENT.get()
+
+
+def is_dispatch_cancelled() -> bool:
+    event = _CANCEL_EVENT.get()
+    return event is not None and event.is_set()
 
 
 class StationMemo:
@@ -71,6 +90,7 @@ class ParallelMixin:
         futs: dict[Future, str],
         timeout: float,
         on_done=None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, dict | None]:
         """等待一批 {Future: 工人名}，整体限时，返回 {工人: 结果 dict 或 None}。
 
@@ -113,6 +133,8 @@ class ParallelMixin:
                     except Exception:  # noqa: BLE001 - 回调异常不影响派工
                         pass
         for fut in pending:  # 超时：放弃等待（已启动的后台自行收尾）
+            if cancel_event is not None:
+                cancel_event.set()
             fut.cancel()
             out[fut_to_worker[fut]] = None
         return out
@@ -137,6 +159,42 @@ class ParallelMixin:
         if not stations:
             return max(1, min(cap, n))
         return self._station_parallel_cap(len(stations))
+
+    def _batch_waves(self, n: int, workers: list[str] | None = None) -> int:
+        """按全局槽位与各站串行队列估算批次数，避免站点分布偏斜时低估限时。"""
+        cap = max(1, min(max(1, self.cfg.max_workers), max(1, n)))
+        waves = max(1, -(-max(1, n) // cap))
+        if not workers:
+            return waves
+        profiles = getattr(self, "profiles", None) or {}
+        counts: dict[tuple[str, str], int] = {}
+        for name in workers:
+            profile = profiles.get(name)
+            if profile is not None:
+                station = profile.station_key
+                counts[station] = counts.get(station, 0) + 1
+        per_station = max(1, getattr(self, "_max_per_station", self.cfg.max_per_station))
+        return max(
+            waves,
+            max((max(1, -(-count // per_station)) for count in counts.values()), default=1),
+        )
+
+    def _station_ordered(self, workers: list[str]) -> list[str]:
+        """按站轮转入队，避免多个工作线程同时堵在同一站门而饿死其它站。"""
+        profiles = getattr(self, "profiles", None) or {}
+        buckets: dict[object, deque[str]] = {}
+        for name in workers:
+            profile = profiles.get(name)
+            key = profile.station_key if profile is not None else ("missing", name)
+            buckets.setdefault(key, deque()).append(name)
+        ordered: list[str] = []
+        while buckets:
+            for key in list(buckets):
+                bucket = buckets[key]
+                ordered.append(bucket.popleft())
+                if not bucket:
+                    del buckets[key]
+        return ordered
 
     def _effective_timeout(
         self, n: int, timeout: float | None, workers: list[str] | None = None
@@ -166,8 +224,7 @@ class ParallelMixin:
         # 链折算，预算低估约 fallback 倍——整站慢/整站 429 触发回退时，wait() 到点把还在
         # 回退的工人判 timeout 丢弃，后台线程仍打网络（额度白烧、结果拿不到）。
         chain = 1 + max(0, int(getattr(self, "_fallback_models", 0) or 0))
-        concurrency = self._batch_concurrency(max(1, n), workers)
-        batches = max(1, -(-max(1, n) // concurrency))
+        batches = self._batch_waves(max(1, n), workers)
         return batches * chain * worst + 30.0
 
     def _run_parallel(
@@ -194,7 +251,8 @@ class ParallelMixin:
         slots = min(len(workers), max(1, self.cfg.max_workers))
         jobs: queue.SimpleQueue = queue.SimpleQueue()
         futs: dict[concurrent.futures.Future, str] = {}
-        for w in workers:
+        cancel_event = threading.Event()
+        for w in self._station_ordered(workers):
             fut: concurrent.futures.Future = concurrent.futures.Future()
             futs[fut] = w
             jobs.put((w, fut))
@@ -209,11 +267,24 @@ class ParallelMixin:
                 w, fut = item
                 if not fut.set_running_or_notify_cancel():
                     continue  # 已被整体限时放弃 ⇒ 不打网络、不烧免费额度
+                token = _CANCEL_EVENT.set(cancel_event)
                 try:
                     fut.set_result(self.ask_result(w, prompt, system, memo=memo))
+                except DispatchCancelled:
+                    fut.set_result(
+                        {
+                            "worker": w,
+                            "ok": False,
+                            "status": ST_TIMEOUT,
+                            "answer": "",
+                            "error": "整体限时已放弃本次派工",
+                        }
+                    )
                 except BaseException as e:  # noqa: BLE001 - 异常必须进 future，不能杀线程
                     fut.set_exception(e)
+                finally:
+                    _CANCEL_EVENT.reset(token)
 
         for i in range(slots):
             threading.Thread(target=_worker_thread, daemon=True, name=f"mao-dispatch-{i}").start()
-        return self._wait_gather(futs, timeout, on_done=on_done)
+        return self._wait_gather(futs, timeout, on_done=on_done, cancel_event=cancel_event)

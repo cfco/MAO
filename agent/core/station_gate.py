@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # 仅类型标注用，运行期不引入依赖（避免 orchestrator <-> 本模块成环）
     from .llm import LLMClient
 
+from .parallelism import DispatchCancelled, is_dispatch_cancelled
+
 
 class StationGateMixin:
     """同站串行闸门能力，混入 WorkerPool 使用（本类不单独实例化）。"""
@@ -76,6 +78,8 @@ class StationGateMixin:
         - 毫秒只在门内计时：等同站前一个请求的排队时间不属于这个模型的延迟。
         """
         with self._station_gate(station):
+            if is_dispatch_cancelled():
+                raise DispatchCancelled
             t0 = time.monotonic()  # 只量真实请求往返（不含建连/排队），与探测同口径
             try:
                 return client.chat_once(messages), None, (time.monotonic() - t0) * 1000.0

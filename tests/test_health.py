@@ -392,7 +392,7 @@ def test_transient_failure_cools_down_but_not_quarantined_today(tmp_path, monkey
     assert not pool.health.quarantined("st:m1")
 
 
-def test_write_merges_records_from_another_process(tmp_path):
+def test_write_merges_records_from_another_process(tmp_path, monkeypatch):
     """并发多进程的记账不得互相覆盖（`get_health` 的共享只在进程内）。
 
     旧行为：`write()` 直接把自己那份内存账本整篇落盘。外部主常同时开多个 `mao call`
@@ -406,6 +406,8 @@ def test_write_merges_records_from_another_process(tmp_path):
     b = ModelHealth(store, None, 7)
     # 双方都在"空档案"上建好内存账本 —— 等价于两个进程几乎同时首次读盘
     assert not a.quarantined("w-a") and not b.quarantined("w-b")
+    # 模拟已运行一段时间、尚未刷新磁盘的旧进程；写盘合并必须独立于查询刷新。
+    monkeypatch.setattr(b, "_refresh_if_changed", lambda: None)
     a.record_failure("w-a", "m-a", "")
     b.record_failure("w-b", "m-b", "")
     keys = set(json.loads(store.read_text(encoding="utf-8")).get("models", {}))

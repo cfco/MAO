@@ -140,8 +140,12 @@ class WorkerPool(
         self._llm_timeout = self.cfg.as_float(
             self.cfg.llm_cfg.get("timeout", 120) or 120, "llm.timeout", 120.0, minimum=1.0
         )
+        raw_retries = self.cfg.llm_cfg.get("max_retries", 2)
         self._max_retries = self.cfg.as_int(
-            self.cfg.llm_cfg.get("max_retries", 2) or 2, "llm.max_retries", 2, minimum=0
+            2 if raw_retries is None or raw_retries == "" else raw_retries,
+            "llm.max_retries",
+            2,
+            minimum=0,
         )
         self._lock = threading.Lock()
         # 按 profile.name 缓存 LLMClient，避免每次派工都重建连接池
@@ -375,7 +379,7 @@ class WorkerPool(
 
     # ---------- 客户端缓存 ----------
 
-    def _client_for(self, p: AgentProfile) -> LLMClient:
+    def _client_for(self, p: AgentProfile, lease: bool = False) -> LLMClient:
         """按 profile.name 复用 LLMClient；首次访问时按工人配置创建并缓存。
         timeout / max_retries 从全局配置读取，保持与主智能体一致的重试策略。
 
@@ -383,33 +387,47 @@ class WorkerPool(
         不加锁会各建一个 LLMClient（多套连接池，其中一个被覆盖后无人引用）。
         缓存单走**独立的 _clients_lock**，不复用池记账锁 self._lock——LLMClient 构造要建
         httpx 客户端与 SSL 上下文（毫秒~几十毫秒级），压在 self._lock 里会让并发首派把
-        _record_result / health_status 这些纯内存记账一起串行化。
-        调用方（_lead）在调本方法时并未持有 self._lock，故不会自锁。
+        _record_result / health_status 这些纯内存记账一起串行化。lease=True 时在同一临界区
+        取得调用租约，避免热同步在取客户端与登记在飞之间把连接池当空闲关闭。
         """
         with self._clients_lock:
             client = self._clients.get(p.name)
-            if client is not None:
-                return client
-            client = LLMClient(
-                p.base_url,
-                p.api_key,
-                p.model,
-                timeout=self._llm_timeout,
-                max_retries=self._max_retries,
-            )
-            self._clients[p.name] = client
+            if client is not None and lease:
+                acquire = getattr(client, "acquire_call", None)
+                if callable(acquire) and not acquire():
+                    self._clients.pop(p.name, None)
+                    client = None
+            if client is None:
+                client = LLMClient(
+                    p.base_url,
+                    p.api_key,
+                    p.model,
+                    timeout=self._llm_timeout,
+                    max_retries=self._max_retries,
+                )
+                self._clients[p.name] = client
+                if lease:
+                    acquire = getattr(client, "acquire_call", None)
+                    if callable(acquire) and not acquire():
+                        raise RuntimeError("LLM 客户端已关闭")
             return client
 
-    def _probe_client_for(self, p: AgentProfile) -> LLMClient:
+    def _probe_client_for(self, p: AgentProfile, lease: bool = False) -> LLMClient:
         """延迟探测专用客户端：短超时（cfg.latency_probe_timeout）且**不重试**（max_retries=0）。
 
         与 _client_for 分开缓存、绝不复用同一实例：真实派工要容忍节点慢/抖动（120s + 重试），
         探测只求"最快摸一下在不在、快不快"。若让探测继承派工超时策略，一个卡住的节点会把一次
         测速拖成分钟级、白打多次请求，更会挂住同步 probe（bridge/MCP `latency probe:true`）整轮。
         同样走 _clients_lock（与建/取真实派工客户端一把锁），chat 在锁外发起，不会与派工自锁。
+        lease=True 时取客户端与登记在飞保持原子。
         """
         with self._clients_lock:
             client = self._probe_clients.get(p.name)
+            if client is not None and lease:
+                acquire = getattr(client, "acquire_call", None)
+                if callable(acquire) and not acquire():
+                    self._probe_clients.pop(p.name, None)
+                    client = None
             if client is None:
                 client = LLMClient(
                     p.base_url,
@@ -419,6 +437,10 @@ class WorkerPool(
                     max_retries=0,
                 )
                 self._probe_clients[p.name] = client
+                if lease:
+                    acquire = getattr(client, "acquire_call", None)
+                    if callable(acquire) and not acquire():
+                        raise RuntimeError("探测客户端已关闭")
             return client
 
     def _retire_worker_clients(

@@ -298,10 +298,13 @@ class LatencyMixin:
         # （非法端点、SSL 上下文失败都会抛），抛在 acquire 与 try 之间就等于漏掉一格站门
         # ——该站此后永远少一路并发，真实派工排在门上被永久饿死。
         try:
-            client = self._probe_client_for(p)
+            client = self._probe_client_for(p, lease=True)
         except Exception:  # noqa: BLE001 - 建不出探测客户端就跳过这个工人
             return None
         if not gate.acquire(timeout=_PROBE_GATE_WAIT):
+            release = getattr(client, "release_call", None)
+            if callable(release):
+                release()
             return None  # 该站正在跑真实请求 ⇒ 本轮让路，不污染样本也不挂住探测轮
         try:
             t0 = time.monotonic()
@@ -325,6 +328,9 @@ class LatencyMixin:
             return None
         finally:
             gate.release()
+            release = getattr(client, "release_call", None)
+            if callable(release):
+                release()
 
     def _probe_max_tokens_for(self, station: tuple[str, str]) -> int | None:
         """本站在探测请求里要不要带 max_tokens（0 / 已探明不支持 ⇒ None=不带）。"""
